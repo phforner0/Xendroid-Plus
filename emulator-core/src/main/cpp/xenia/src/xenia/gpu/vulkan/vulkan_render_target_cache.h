@@ -450,6 +450,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;
   EdramBufferUsage edram_buffer_usage_;
+  VkBuffer edram_snapshot_download_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory edram_snapshot_download_buffer_memory_ = VK_NULL_HANDLE;
+  bool edram_snapshot_download_mapped_ = false;
+  // Kept until shutdown so it outlives the copy it feeds - trace restore
+  // happens once per replay.
+  VkBuffer edram_snapshot_restore_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory edram_snapshot_restore_buffer_memory_ = VK_NULL_HANDLE;
   EdramBufferModificationStatus edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;
   VkDescriptorPool edram_storage_buffer_descriptor_pool_ = VK_NULL_HANDLE;
@@ -1271,6 +1278,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                          uint32_t dump_rows, uint32_t dump_pitch,
                          bool native_layout);
 
+  void DumpAllRenderTargetsToEdram() override;
+  bool BeginEdramSnapshotReadback() override;
+  const void* MapEdramSnapshotReadback() override;
+  void EndEdramSnapshotReadback() override;
+
+ public:
+  void RestoreEdramSnapshot(const void* snapshot);
+
+ private:
   bool gamma_render_target_as_unorm16_ = false;
   // render_target_7e3_as_r11g11b10, if the format is usable.
   bool color_7e3_as_r11g11b10_ = false;
