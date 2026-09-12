@@ -18,6 +18,14 @@ add_compile_options(-funwind-tables)
 # 16 KB max page size: required for Android 15+ on arm64.
 add_link_options(-Wl,-z,max-page-size=16384)
 
+# GPU trace capture in Release (XENIA_ENABLE_GPU_TRACE, read by xenia/ too).
+# The trace writer is a member of the command processor, so the JNI code here
+# needs the same definition as the core, or the two disagree on its layout.
+option(XENIA_ENABLE_GPU_TRACE "Enable GPU trace capture in Release" OFF)
+if(XENIA_ENABLE_GPU_TRACE)
+  add_compile_definitions(XE_OPTION_GPU_TRACE=1)
+endif()
+
 add_library(hardware_ProcessorInfo SHARED hardware_ProcessorInfo.cpp)
 target_link_libraries(hardware_ProcessorInfo PRIVATE vulkan)
 
