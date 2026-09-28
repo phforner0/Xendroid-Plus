@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <atomic>
 #include <ranges>
 
 #include "xenia/kernel/kernel_state.h"
@@ -1058,23 +1059,27 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        uint32_t extended_error, uint32_t length,
                                        X_HANDLE thread_handle) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
-  XOverlappedSetResult(ptr, result);
+  // Read before the result, after which a caller polling it may reuse the
+  // overlapped for its next request.
+  const X_HANDLE event_handle = XOverlappedGetEvent(ptr);
+  const uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
+  // Result last, so a caller polling it for completion reads a valid length.
   XOverlappedSetExtendedError(ptr, extended_error);
   XOverlappedSetLength(ptr, length);
+  std::atomic_thread_fence(std::memory_order_release);
+  XOverlappedSetResult(ptr, result);
   // The event is left unsignaled when there is a completion routine.
-  X_HANDLE event_handle = XOverlappedGetEvent(ptr);
-  if (event_handle && !XOverlappedGetCompletionRoutine(ptr)) {
+  if (event_handle && !routine) {
     auto ev = object_table()->LookupObject<XEvent>(event_handle);
     assert_not_null(ev);
     if (ev) {
       ev->Set(0, false);
     }
   }
-  if (XOverlappedGetCompletionRoutine(ptr)) {
+  if (routine) {
     auto thread = object_table()->LookupObject<XThread>(thread_handle);
     if (thread) {
       // Queue APC on the thread that requested the overlapped operation.
-      uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
       thread->EnqueueApc(routine, result, length, overlapped_ptr);
     }
   }
