@@ -1417,8 +1417,10 @@ void KeEnterCriticalRegion_entry() {
 DECLARE_XBOXKRNL_EXPORT2(KeEnterCriticalRegion, kThreading, kImplemented,
                          kHighFrequency);
 
-void KeLeaveCriticalRegion_entry() {
+void KeLeaveCriticalRegion_entry(const ppc_context_t& ctx) {
   XThread::GetCurrentThread()->LeaveCriticalRegion();
+  // Kernel APCs the region held off run as it ends.
+  xeProcessKernelApcs(ctx);
 }
 DECLARE_XBOXKRNL_EXPORT2(KeLeaveCriticalRegion, kThreading, kImplemented,
                          kHighFrequency);
@@ -1632,8 +1634,9 @@ bool xeProcessKernelApcs(PPCContext* ctx) {
   }
   auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
   auto current_thread = ctx->TranslateVirtual(kpcr->prcb_data.current_thread);
-  // Masked at APC_LEVEL and above, and never nested.
-  if (kpcr->current_irql >= 1 || current_thread->executing_kernel_apc) {
+  // Masked at APC_LEVEL and above or in a critical region, and never nested.
+  if (kpcr->current_irql >= 1 || current_thread->apc_disable_count ||
+      current_thread->executing_kernel_apc) {
     return false;
   }
   if (current_thread->apc_lists[0].empty(ctx)) {
