@@ -386,9 +386,13 @@ void XeCryptRc4Key_entry(pointer_t<XECRYPT_RC4_STATE> rc4_ctx, lpvoid_t key,
     rc4_ctx->S[x] = (uint8_t)x;
   }
 
+  // A key of no bytes has nothing to schedule and would divide by zero.
+  if (!key_size) {
+    return;
+  }
   uint32_t idx = 0;
   for (uint32_t x = 0; x < 0x100; x++) {
-    idx = (idx + rc4_ctx->S[x] + key[x % 0x10]) % 0x100;
+    idx = (idx + rc4_ctx->S[x] + key[x % key_size]) % 0x100;
     uint8_t temp = rc4_ctx->S[idx];
     rc4_ctx->S[idx] = rc4_ctx->S[x];
     rc4_ctx->S[x] = temp;
@@ -469,6 +473,12 @@ void XeCryptShaFinal_entry(pointer_t<XECRYPT_SHA_STATE> sha_state,
   std::copy_n(digest, std::min<size_t>(xe::countof(digest), out_size),
               static_cast<uint8_t*>(out));
   std::copy_n(sha.getDigest(), xe::countof(sha_state->state), sha_state->state);
+  // The console pads in place, so the last block it compressed is left in the
+  // context buffer, not the message tail. Only shows up when a title finalizes
+  // the same context twice and the padding needed a second block, where the
+  // tail no longer survives the first call.
+  std::copy_n(sha.getBlock(), xe::countof(sha_state->buffer),
+              sha_state->buffer);
 }
 DECLARE_XBOXKRNL_EXPORT1(XeCryptShaFinal, kNone, kImplemented);
 

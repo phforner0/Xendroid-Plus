@@ -269,9 +269,12 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
     while (instr) {
       // After a guest call, check for longjmp on the next real instruction.
       // Skip SOURCE_OFFSET because the return address from the call would
-      // point past the check, so it would never execute.
+      // point past the check, so it would never execute. With debug info on a
+      // COMMENT precedes the SOURCE_OFFSET, so skip that too.
       if (synchronize_stack_on_next_instruction_) {
-        if (instr->GetOpcodeNum() != hir::OPCODE_SOURCE_OFFSET) {
+        const hir::Opcode opcode_num = instr->GetOpcodeNum();
+        if (opcode_num != hir::OPCODE_SOURCE_OFFSET &&
+            opcode_num != hir::OPCODE_COMMENT) {
           synchronize_stack_on_next_instruction_ = false;
           EnsureSynchronizedGuestAndHostStack();
         }
@@ -326,6 +329,11 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
   // ========================================================================
   L(*epilog_label_);
   epilog_label_ = nullptr;
+  // A call as the last instruction leaves the check unconsumed.
+  if (synchronize_stack_on_next_instruction_) {
+    synchronize_stack_on_next_instruction_ = false;
+    EnsureSynchronizedGuestAndHostStack();
+  }
   // FTrace: log the guest return value (r3) on normal return.
   if (IsTracingFunc()) {
     mov(x1, static_cast<uint64_t>(current_guest_function_));
@@ -739,6 +747,7 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
 void A64Emitter::CallNative(void* fn) { CallNativeSafe(fn); }
 
 void A64Emitter::CallNativeSafe(void* fn) {
+  ForgetFpcrMode();
   // GuestToHostThunk: x0=target function, x1/x2=args (set by caller).
   // The thunk rearranges: saves x0 in x9, sets x0=context, calls x9.
   mov(x0, reinterpret_cast<uint64_t>(fn));
