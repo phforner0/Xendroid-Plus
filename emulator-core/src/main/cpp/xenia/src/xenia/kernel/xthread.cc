@@ -64,6 +64,7 @@ namespace kernel {
 const uint32_t XAPC::kSize;
 const uint32_t XAPC::kDummyKernelRoutine;
 const uint32_t XAPC::kDummyRundownRoutine;
+const uint32_t XAPC::kOwnedKernelRoutine;
 
 using namespace xe::literals;
 
@@ -835,22 +836,38 @@ void XThread::LeaveCriticalRegion() {
   auto apc_disable_count = ++kthread->apc_disable_count;
 }
 
-void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context,
-                         uint32_t arg1, uint32_t arg2) {
+cpu::ppc::PPCContext* XThread::ApcQueueContext() {
   // Most APC queue sites run on a guest thread and can use the caller's bound
   // PPC context. Host timer callbacks may run without a bound guest
   // ThreadState, so fall back to the target thread context in that case.
   auto* queue_thread_state = cpu::ThreadState::Get();
-  auto* queue_context = queue_thread_state ? queue_thread_state->context()
-                                           : thread_state_->context();
-  uint32_t success =
-      xboxkrnl::xeNtQueueApcThread(this->handle(), normal_routine,
-                                   normal_context, arg1, arg2, queue_context);
+  return queue_thread_state ? queue_thread_state->context()
+                            : thread_state_->context();
+}
+
+void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context,
+                         uint32_t arg1, uint32_t arg2) {
+  uint32_t success = xboxkrnl::xeNtQueueApcThread(
+      this->handle(), normal_routine, normal_context, arg1, arg2,
+      ApcQueueContext());
 
   if (success != X_STATUS_SUCCESS) {
     XELOGE("EnqueueApc: queue to tid={:08X} failed ({:08X})", handle(),
            success);
   }
+}
+
+bool XThread::InsertOwnedApc(uint32_t apc_ptr, uint32_t arg1, uint32_t arg2) {
+  auto* context = ApcQueueContext();
+  return xboxkrnl::xeInsertQueueApcAndWake(
+             this, context->TranslateVirtual<XAPC*>(apc_ptr), arg1, arg2,
+             context) != 0;
+}
+
+void XThread::RemoveOwnedApc(uint32_t apc_ptr) {
+  auto* context = ApcQueueContext();
+  xboxkrnl::xeKeRemoveQueueApc(context->TranslateVirtual<XAPC*>(apc_ptr),
+                               context);
 }
 
 bool XThread::HasPendingUserApc() {
@@ -1070,6 +1087,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
   assert_true(cpu_index < 6);
 
   X_KPCR& pcr = *memory()->TranslateVirtual<X_KPCR*>(pcr_address_);
+  const uint8_t previous_cpu = pcr.prcb_data.current_cpu;
   pcr.prcb_data.current_cpu = cpu_index;
 
   if (is_guest_thread()) {
@@ -1088,6 +1106,11 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
     // there no good reason why we need to log this... we don't perfectly
     // emulate the 360's scheduler in any way
     // XELOGW("Too few processor cores - scheduling will be wonky");
+  }
+
+  // The ready queues are per CPU, so a queued thread has to move.
+  if (cpu_index != previous_cpu && GuestScheduler::enabled()) {
+    kernel_state()->guest_scheduler()->MigrateForAffinity(this);
   }
 }
 
