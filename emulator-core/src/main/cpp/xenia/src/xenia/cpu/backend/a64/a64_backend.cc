@@ -53,6 +53,8 @@ DEFINE_bool(a64_enable_host_guest_stack_synchronization, true,
             "impact, but fixes crashes in games that use setjmp/longjmp.",
             "a64");
 
+DECLARE_bool(record_mmio_access_exceptions);
+
 DEFINE_bool(a64_fpu_nan_fixup, false,
             "Emulate PPC NaN propagation on scalar FPU arithmetic (add, sub, "
             "mul, div, fused multiply-add): the first NaN operand by "
@@ -200,8 +202,9 @@ HostToGuestThunk A64HelperEmitter::EmitHostToGuestThunk() {
   // x21 = virtual_membase (loaded from context)
   ldr(x21, ptr(x20, static_cast<int32_t>(
                         offsetof(ppc::PPCContext, virtual_membase))));
-  // Restore the guest scalar FPCR on every host->guest entry so host-side
-  // work done before the call can't leak a stale rounding / non-IEEE mode.
+  // Keep the host FPCR for the return, and enter in the guest's scalar mode.
+  mrs(x12, 3, 3, 4, 4, 0);  // mrs x12, FPCR
+  str(x12, ptr(sp, static_cast<uint32_t>(StackLayout::THUNK_HOST_FPCR)));
   ldr(w11,
       ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
   msr(3, 3, 4, 4, 0, x11);
@@ -215,6 +218,15 @@ HostToGuestThunk A64HelperEmitter::EmitHostToGuestThunk() {
 
   // Call the guest function.
   blr(x9);
+
+  // Host code after the guest returns runs in the host's FPCR, not the guest's.
+  Xbyak_aarch64::Label host_fpcr_restored;
+  ldr(x11, ptr(sp, static_cast<uint32_t>(StackLayout::THUNK_HOST_FPCR)));
+  mrs(x12, 3, 3, 4, 4, 0);  // mrs x12, FPCR
+  cmp(x11, x12);
+  b(Xbyak_aarch64::EQ, host_fpcr_restored);
+  msr(3, 3, 4, 4, 0, x11);
+  L(host_fpcr_restored);
 
   code_offsets.epilog = getSize();
 
@@ -320,6 +332,15 @@ GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunk() {
   stp(x29, x30, ptr(sp, 0x1C0));
 
   code_offsets.body = getSize();
+
+  // Host C code runs with the AAPCS64 default FPCR (round to nearest, no
+  // flush-to-zero), not the guest's scalar mode: mtfsf can put rounding
+  // controls or FPSCR.NI (FZ) in fpcr_fpu, which host code must not inherit.
+  Xbyak_aarch64::Label host_fpcr_ready;
+  mrs(x11, 3, 3, 4, 4, 0);  // mrs x11, FPCR
+  cbz(x11, host_fpcr_ready);
+  msr(3, 3, 4, 4, 0, xzr);
+  L(host_fpcr_ready);
 
   // Call host function.
   // AAPCS64: x0=first arg. We set x0=context (from x20).
@@ -752,11 +773,15 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
         for (auto* entry : processor->FindFunctionsWithAddress(
                  static_cast<uint32_t>(target_address))) {
           auto* afunc = static_cast<A64Function*>(entry);
+          // Landing on a function's first instruction would skip its prolog.
+          // (Comparing host addresses never caught it: the first guest
+          // instruction maps past the host prolog.)
+          if (afunc->address() == static_cast<uint32_t>(target_address)) {
+            continue;
+          }
           host_address = afunc->MapGuestAddressToMachineCode(
               static_cast<uint32_t>(target_address));
-          if (host_address &&
-              afunc->machine_code() !=
-                  reinterpret_cast<const uint8_t*>(host_address)) {
+          if (host_address) {
             auto* backend = static_cast<A64Backend*>(processor->backend());
             auto* backend_context =
                 backend->BackendContextForGuestContext(guest_context);
@@ -894,6 +919,11 @@ A64Backend::~A64Backend() {
   }
 }
 
+static void ForwardMMIOAccessForRecording(void* context, void* hostaddr) {
+  reinterpret_cast<A64Backend*>(context)
+      ->RecordMMIOExceptionForGuestInstruction(hostaddr);
+}
+
 bool A64Backend::Initialize(Processor* processor) {
   if (!Backend::Initialize(processor)) {
     return false;
@@ -968,6 +998,14 @@ bool A64Backend::Initialize(Processor* processor) {
 
   // Register exception handler for MMIO access from JIT code.
   ExceptionHandler::Install(ExceptionCallbackThunk, this);
+
+  // Lets the memory system tell us which guest instructions faulted on MMIO,
+  // so they get recompiled into a direct call instead of taking the signal
+  // handler on every access.
+  if (cvars::record_mmio_access_exceptions) {
+    processor->memory()->SetMMIOExceptionRecordingCallback(
+        ForwardMMIOAccessForRecording, this);
+  }
 
   return true;
 }

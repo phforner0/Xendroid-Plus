@@ -33,7 +33,7 @@
 #include "xenia/ui/host_text_input.h"
 #include "xenia/ui/imgui_host_notification.h"
 
-#include "third_party/crypto/TinySHA1.hpp"
+#include "third_party/mbedtls/include/mbedtls/sha1.h"
 
 DEFINE_bool(apply_title_update, true, "Apply title updates.", "Kernel");
 DEFINE_bool(allow_incompatible_title_update, true,
@@ -447,11 +447,6 @@ object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
   // Waits for a debugger client, if desired.
   emulator()->processor()->PreLaunch();
 
-  // Resume the thread now.
-  // If the debugger has requested a suspend this will just decrement the
-  // suspend count without resuming it until the debugger wants.
-  thread->Resume();
-
   return thread;
 }
 
@@ -807,10 +802,9 @@ bool KernelState::IsPatchSignatureProper(
 
   // Compare hash inside delta descriptor to base XEX signature
   uint8_t digest[0x14];
-  sha1::SHA1 s;
-  s.processBytes(title_module->xex_module()->xex_security_info()->rsa_signature,
-                 0x100);
-  s.finalize(digest);
+  const auto* signature = reinterpret_cast<const uint8_t*>(
+      title_module->xex_module()->xex_security_info()->rsa_signature);
+  mbedtls_sha1(signature, 0x100, digest);
 
   if (memcmp(digest, patch_header->digest_source, 0x14) != 0) {
     XELOGW(
