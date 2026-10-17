@@ -81,7 +81,10 @@ void AndroidShutdown() {
 }
 #endif
 
-size_t page_size() { return getpagesize(); }
+size_t page_size() {
+  static const size_t value = static_cast<size_t>(getpagesize());
+  return value;
+}
 size_t allocation_granularity() { return page_size(); }
 
 uint32_t ToPosixProtectFlags(PageAccess access) {

@@ -151,7 +151,8 @@ bool VertexFetchInMemexportRange(const RegisterFile& regs,
       if (vfetch_constant.type != xenos::FetchConstantType::kVertex) {
         continue;
       }
-      if (IsMemexportRange(vfetch_constant.address << 2,
+      // Physical, like the vertex buffer the draw binds (mirror windows).
+      if (IsMemexportRange(xenos::CpuToGpu(vfetch_constant.address << 2),
                            vfetch_constant.size << 2)) {
         return true;
       }

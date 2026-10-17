@@ -1611,6 +1611,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
 
+  // Host viewport of the previous draw, reused while the inputs it was derived
+  // from stay the same.
+  draw_util::GetViewportInfoArgs previous_viewport_info_args_{};
+  draw_util::ViewportInfo previous_viewport_info_{};
+
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
 
