@@ -22,8 +22,8 @@
 namespace xe {
 namespace kernel {
 
-XEvent::XEvent(KernelState* kernel_state)
-    : XObject(kernel_state, kObjectType) {}
+XEvent::XEvent(KernelState* kernel_state, bool host_object)
+    : XObject(kernel_state, kObjectType, host_object) {}
 
 XEvent::~XEvent() = default;
 

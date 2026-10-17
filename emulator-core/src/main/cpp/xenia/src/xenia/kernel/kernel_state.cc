@@ -758,8 +758,8 @@ const object_ref<UserModule> KernelState::LoadTitleUpdate(
   X_RESULT open_status = content_manager()->OpenContent(
       "UPDATE", 0, *title_update, content_license, disc_number);
 
-  std::string mount_path = "";
-  if (!file_system()->FindSymbolicLink(kDefaultGameSymbolicLink, mount_path)) {
+  const std::string& mount_path = title_mount_path_;
+  if (mount_path.empty()) {
     return nullptr;
   }
 
@@ -1194,7 +1194,13 @@ bool KernelState::Save(ByteStream* stream) {
   for (auto object : objects) {
     auto prev_offset = stream->offset();
 
-    if (object->is_host_object() || object->type() == XObject::Type::Thread) {
+    // A user module is a host object only to stay out of the title's handle
+    // numbering, so it still saves.
+    bool user_module = object->type() == XObject::Type::Module &&
+                       static_cast<XModule*>(object.get())->module_type() ==
+                           XModule::ModuleType::kUserModule;
+    if ((object->is_host_object() && !user_module) ||
+        object->type() == XObject::Type::Thread) {
       // Don't save host objects or save XThreads again
       num_objects--;
       continue;

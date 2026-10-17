@@ -22,7 +22,7 @@ class XSemaphore : public XObject {
  public:
   static const XObject::Type kObjectType = XObject::Type::Semaphore;
 
-  explicit XSemaphore(KernelState* kernel_state);
+  explicit XSemaphore(KernelState* kernel_state, bool host_object = false);
   ~XSemaphore() override;
 
   [[nodiscard]] bool Initialize(int32_t initial_count, int32_t maximum_count);
