@@ -9,7 +9,9 @@
 
 #include "xenia/kernel/xsocket.h"
 
+#include <atomic>
 #include <cstring>
+#include <future>
 #include <optional>
 #include <thread>
 
@@ -55,10 +57,28 @@ class IoContextRunner {
 
 }  // namespace
 
+static std::atomic<bool> io_context_started = false;
+
 // Shared io_context for all sockets
 static asio::io_context& GetIoContext() {
   static IoContextRunner runner;
+  io_context_started = true;
   return runner.get();
+}
+
+void DrainSocketIo() {
+  if (!io_context_started) {
+    return;
+  }
+  // The I/O thread runs handlers in the order they were queued, but a wait
+  // the reactor completed along with another may be queued after this is, so
+  // this goes around the queue twice.
+  std::promise<void> drained;
+  asio::io_context& io_context = GetIoContext();
+  asio::post(io_context, [&io_context, &drained]() {
+    asio::post(io_context, [&drained]() { drained.set_value(); });
+  });
+  drained.get_future().wait();
 }
 
 // Translate socket options to native

@@ -221,6 +221,10 @@ class XSocket : public XObject {
   uint32_t selected_event_flags_ = 0;
 };
 
+// Waits for the socket I/O thread to run the handlers queued so far, such as
+// those of the waits that closing sockets cancelled.
+void DrainSocketIo();
+
 }  // namespace kernel
 }  // namespace xe
 
