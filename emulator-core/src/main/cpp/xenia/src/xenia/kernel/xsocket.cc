@@ -24,6 +24,7 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xevent.h"
+#include "xenia/kernel/xsocket_options.h"
 #include "xenia/kernel/xthread.h"
 
 namespace xe {
@@ -381,16 +382,10 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  // SO_BROADCAST
-  if (level == 0xFFFF && optname == 0x0020) {
-    broadcast_socket_ = true;
-  }
-
-  // SO_SNDTIMEO / SO_RCVTIMEO, a big-endian DWORD of milliseconds. Kept for
-  // the cooperative retry loop, which never sees the host option take effect.
-  if (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006) &&
-      optlen >= sizeof(uint32_t)) {
-    uint32_t timeout_ms = xe::load_and_swap<uint32_t>(optval_ptr);
+  // SO_SNDTIMEO / SO_RCVTIMEO in milliseconds. Kept for the cooperative retry
+  // loop, which never sees the host option take effect.
+  if (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006)) {
+    uint32_t timeout_ms = SocketOptionValue(optval_ptr, optlen);
     if (optname == 0x1006) {
       recv_timeout_ms_ = timeout_ms;
     } else {
