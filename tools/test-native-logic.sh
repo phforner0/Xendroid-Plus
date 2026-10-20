@@ -3,7 +3,8 @@
 # schedule, the pipeline cache file store, the guest vblank pacer, the native crash
 # record (written from a real fault handler), the changed-settings lines, the guest
 # frame stats, the adaptive audio buffer, the audio drivers' block processing,
-# the XEX header and title update patch bounds and the socket option values.
+# the XEX header and title update patch bounds, the socket option values and
+# the XNet startup parameters.
 # They need only a C++20 compiler.
 # With XENDROID_NDK, also host threads: APCs alerted at once to several threads.
 #
@@ -25,7 +26,7 @@ else
     dl=(-ldl)   # dladdr/dl_iterate_phdr before glibc 2.34
 fi
 flags=(-std=c++20 -O1 -Wall -I "$cpp" -I "$cpp/xenia" -I "$cpp/xenia/src" -I "$test/stubs")
-for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test changed_settings_test frame_stats_test audio_buffer_tuner_test audio_block_renderer_test xex_header_test socket_option_test; do
+for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test changed_settings_test frame_stats_test audio_buffer_tuner_test audio_block_renderer_test xex_header_test socket_option_test xnet_startup_test; do
     "${cxx[@]}" "${flags[@]}" "$test/$name.cc" -o "$build/$name"
 done
 # C01: the crash record is a source file of its own (signal-handler code).
@@ -39,6 +40,7 @@ done
 "$build/audio_block_renderer_test"
 "$build/xex_header_test"
 "$build/socket_option_test"
+"$build/xnet_startup_test"
 "$build/crash_record_test" "$build/crash-record-scratch"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
