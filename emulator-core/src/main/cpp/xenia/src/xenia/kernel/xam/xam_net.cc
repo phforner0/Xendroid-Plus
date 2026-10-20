@@ -609,6 +609,15 @@ dword_result_t NetDll_XNetGetEthernetLinkStatus_entry(dword_t caller) {
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetGetEthernetLinkStatus, kNetworking, kStub);
 
+// No System Link broadcast ever reaches a title here, so none is from another
+// version.
+dword_result_t NetDll_XNetGetBroadcastVersionStatus_entry(dword_t caller,
+                                                          dword_t reset) {
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_XNetGetBroadcastVersionStatus, kNetworking,
+                    kImplemented);
+
 dword_result_t NetDll_XNetDnsLookup_entry(dword_t caller, lpstring_t host,
                                           dword_t event_handle,
                                           lpdword_t pdns) {
