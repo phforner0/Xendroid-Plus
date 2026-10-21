@@ -245,7 +245,7 @@ class ContentManager {
   bool ContentExists(const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT WriteContentHeaderFile(const uint64_t xuid,
                                   XCONTENT_AGGREGATE_DATA data);
-  X_RESULT ReadContentHeaderFile(const std::string_view file_name,
+  X_RESULT ReadContentHeaderFile(const std::filesystem::path& package_path,
                                  const uint64_t xuid, const uint32_t title_id,
                                  XContentType content_type,
                                  XCONTENT_AGGREGATE_DATA& data) const;
@@ -278,9 +278,6 @@ class ContentManager {
   std::filesystem::path ResolvePackagePath(const uint64_t xuid,
                                            const XCONTENT_AGGREGATE_DATA& data,
                                            const uint32_t disc_number = -1);
-  std::filesystem::path ResolvePackageHeaderPath(
-      const std::string_view file_name, uint64_t xuid, uint32_t title_id,
-      const XContentType content_type) const;
 
   std::unordered_set<uint32_t> FindPublisherTitleIds(
       const uint64_t xuid,
