@@ -310,10 +310,10 @@ ObjectTable::ObjectTableEntry* ObjectTable::LookupTableInLock(X_HANDLE handle) {
   const bool is_host_object = XObject::is_handle_host_object(handle);
   uint32_t slot = GetHandleSlot(handle, is_host_object);
   if (is_host_object) {
-    if (slot <= host_table_capacity_) {
+    if (slot < host_table_capacity_) {
       return &host_table_[slot];
     }
-  } else if (slot <= table_capacity_) {
+  } else if (slot < table_capacity_) {
     return &table_[slot];
   }
 
@@ -483,9 +483,9 @@ X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object) {
   const bool is_host_object = XObject::is_handle_host_object(handle);
   uint32_t slot = GetHandleSlot(handle, is_host_object);
   uint32_t capacity = is_host_object ? host_table_capacity_ : table_capacity_;
-  assert_true(capacity >= slot);
+  assert_true(capacity > slot);
 
-  if (capacity >= slot) {
+  if (capacity > slot) {
     auto& entry = is_host_object ? host_table_[slot] : table_[slot];
     entry.object = object;
     object->Retain();
