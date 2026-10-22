@@ -39,30 +39,32 @@ static int content_device_id_ = 0;
 ContentPackage::ContentPackage(KernelState* kernel_state,
                                const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
-                               const std::filesystem::path& package_path)
+                               const std::filesystem::path& package_path,
+                               const std::filesystem::path& mount_path)
     : kernel_state_(kernel_state),
       root_name_(root_name),
+      package_path_(package_path),
       license_(cvars::license_mask) {
   device_path_ = fmt::format("\\Device\\Content\\{0}\\", ++content_device_id_);
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  if (std::filesystem::is_directory(package_path)) {
+  if (std::filesystem::is_directory(mount_path)) {
     auto device = std::make_unique<vfs::HostPathDevice>(device_path_,
-                                                        package_path, false);
+                                                        mount_path, false);
     mounted_ = device->Initialize();
     fs->RegisterDevice(std::move(device));
   } else {
     // A title can install content by copying the package file itself, so a
     // package is either an extracted directory or a container.
     auto device = vfs::XContentContainerDevice::CreateContentDevice(
-        device_path_, package_path);
+        device_path_, mount_path);
     if (device && device->Initialize()) {
       license_ = device->license_mask();
       mounted_ = true;
       fs->RegisterDevice(std::move(device));
     } else {
-      XELOGE("{}: Cannot mount content container {}", __func__, package_path);
+      XELOGE("{}: Cannot mount content container {}", __func__, mount_path);
     }
   }
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
@@ -386,16 +388,20 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContentODD(
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, const uint64_t xuid,
     const XCONTENT_AGGREGATE_DATA& data, const uint32_t disc_number) {
-  std::filesystem::path package_path;
-  if (ResolvePackagePath(xuid, data, package_path, disc_number) ||
-      !std::filesystem::exists(package_path)) {
+  std::filesystem::path mount_path;
+  if (ResolvePackagePath(xuid, data, mount_path, disc_number) ||
+      !std::filesystem::exists(mount_path)) {
     return nullptr;
   }
 
   auto global_lock = global_critical_region_.Acquire();
 
-  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name,
-                                                  data, package_path);
+  // Open content is matched by its package, which for a disc is the package
+  // holding the discNNN directory mounted.
+  const std::filesystem::path package_path =
+      disc_number != -1 ? mount_path.parent_path() : mount_path;
+  auto package = std::make_unique<ContentPackage>(
+      kernel_state_, root_name, data, package_path, mount_path);
   if (!package->is_mounted()) {
     return nullptr;
   }
@@ -783,14 +789,12 @@ X_RESULT ContentManager::DeleteContent(const uint64_t xuid,
                                        const XCONTENT_AGGREGATE_DATA& data) {
   auto global_lock = global_critical_region_.Acquire();
 
-  if (IsContentOpen(data)) {
-    // TODO(Gliniak): Get real error code for this case.
-    return X_ERROR_ACCESS_DENIED;
-  }
-
   std::filesystem::path package_path;
   if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
     return result;
+  }
+  if (IsContentOpen(package_path)) {
+    return X_ERROR_SHARING_VIOLATION;
   }
   if (std::filesystem::remove_all(package_path) > 0) {
     return X_ERROR_SUCCESS;
@@ -808,12 +812,15 @@ std::filesystem::path ContentManager::ResolveGameUserContentPath(
          title_id;
 }
 
-bool ContentManager::IsContentOpen(const XCONTENT_AGGREGATE_DATA& data) const {
-  return std::any_of(
-      open_packages_.cbegin(), open_packages_.cend(),
-      [data](std::pair<string_key_insensitive, ContentPackage*> content) {
-        return data == content.second->GetPackageContentData();
-      });
+bool ContentManager::IsContentOpen(
+    const std::filesystem::path& package_path) const {
+  // A name in another case, with the shared bit or for another user can reach
+  // the same package so open ones are matched by their host files.
+  return std::ranges::any_of(open_packages_, [&](const auto& content) {
+    std::error_code ec;
+    return std::filesystem::equivalent(package_path,
+                                       content.second->package_path(), ec);
+  });
 }
 
 void ContentManager::CloseOpenedFilesFromContent(
