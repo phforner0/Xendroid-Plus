@@ -1050,12 +1050,13 @@ void KernelState::BroadcastNotification(XNotificationID id, uint32_t data) {
 }
 
 void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
-  CompleteOverlappedEx(overlapped_ptr, result, result, 0);
+  CompleteOverlappedEx(overlapped_ptr, result, result, 0,
+                       XThread::GetCurrentThreadHandle());
 }
 
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
-                                       uint32_t extended_error,
-                                       uint32_t length) {
+                                       uint32_t extended_error, uint32_t length,
+                                       X_HANDLE thread_handle) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, result);
   XOverlappedSetExtendedError(ptr, extended_error);
@@ -1069,7 +1070,6 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
     }
   }
   if (XOverlappedGetCompletionRoutine(ptr)) {
-    X_HANDLE thread_handle = XOverlappedGetContext(ptr);
     auto thread = object_table()->LookupObject<XThread>(thread_handle);
     if (thread) {
       // Queue APC on the thread that requested the overlapped operation.
@@ -1092,9 +1092,8 @@ void KernelState::CompleteOverlappedImmediateEx(uint32_t overlapped_ptr,
                                                 X_RESULT result,
                                                 uint32_t extended_error,
                                                 uint32_t length) {
-  auto ptr = memory()->TranslateVirtual(overlapped_ptr);
-  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
-  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length,
+                       XThread::GetCurrentThreadHandle());
 }
 
 void KernelState::CompleteOverlappedDeferred(
@@ -1140,7 +1139,7 @@ void KernelState::CompleteOverlappedDeferredEx(
     std::function<void()> post_callback) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
-  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  const X_HANDLE thread_handle = XThread::GetCurrentThreadHandle();
   X_HANDLE event_handle = XOverlappedGetEvent(ptr);
   if (event_handle) {
     auto ev = object_table()->LookupObject<XObject>(event_handle);
@@ -1152,7 +1151,7 @@ void KernelState::CompleteOverlappedDeferredEx(
   }
   auto global_lock = global_critical_region_.Acquire();
   dispatch_queue_.push_back([this, completion_callback, overlapped_ptr,
-                             pre_callback, post_callback]() {
+                             thread_handle, pre_callback, post_callback]() {
     if (pre_callback) {
       pre_callback();
     }
@@ -1160,7 +1159,8 @@ void KernelState::CompleteOverlappedDeferredEx(
     xe::threading::Sleep(kDeferredOverlappedDelayMillis);
     uint32_t extended_error, length;
     auto result = completion_callback(extended_error, length);
-    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+    CompleteOverlappedEx(overlapped_ptr, result, extended_error, length,
+                         thread_handle);
     if (post_callback) {
       post_callback();
     }
