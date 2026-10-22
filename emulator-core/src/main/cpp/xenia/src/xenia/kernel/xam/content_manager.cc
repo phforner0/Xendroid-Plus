@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xam/content_manager.h"
 
+#include <algorithm>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
@@ -131,9 +133,53 @@ static std::filesystem::path ResolveNameInsensitive(
   return {};
 }
 
-std::filesystem::path ContentManager::ResolvePackagePath(
-    const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
-    const uint32_t disc_number) {
+// The error a package's file name fails with in FATX, if any.
+static X_RESULT CheckFileName(const std::string_view name) {
+  // FATX refuses "." and ".." and these characters in any component.
+  constexpr std::string_view kInvalidCharacters = "\"*+,/:;<=>?|";
+  size_t component_start = 0;
+  for (size_t i = 0; i <= name.size(); ++i) {
+    if (i < name.size() && name[i] != '\\') {
+      if (uint8_t(name[i]) < 0x20 ||
+          kInvalidCharacters.find(name[i]) != std::string_view::npos) {
+        return X_ERROR_INVALID_NAME;
+      }
+      continue;
+    }
+    const std::string_view component =
+        name.substr(component_start, i - component_start);
+    if (component == "." || component == "..") {
+      return X_ERROR_INVALID_NAME;
+    }
+    component_start = i + 1;
+  }
+  // A package is a file in FATX so a name with a separator in it names none.
+  // Neither does a name with a byte past ASCII.
+  if (name.empty() || name.find('\\') != std::string_view::npos ||
+      std::any_of(name.begin(), name.end(),
+                  [](const char c) { return uint8_t(c) >= 0x80; })) {
+    return X_ERROR_PATH_NOT_FOUND;
+  }
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT ContentManager::ResolvePackagePath(const uint64_t xuid,
+                                            const XCONTENT_AGGREGATE_DATA& data,
+                                            std::filesystem::path& path,
+                                            const uint32_t disc_number) {
+  const std::string file_name = xe::string_util::trim(data.file_name());
+  if (const X_RESULT result = CheckFileName(file_name)) {
+    return result;
+  }
+  // The host has to keep the name as it is, which Windows doesn't for one
+  // ending in a dot.
+  const std::filesystem::path folder_name = xe::to_path(file_name);
+  std::error_code ec;
+  if (std::filesystem::absolute(root_path_ / folder_name, ec) !=
+      std::filesystem::absolute(root_path_, ec) / folder_name) {
+    return X_ERROR_INVALID_NAME;
+  }
+
   // Content path:
   // content_root/title_id/content_type/data_file_name/
   auto get_package_path = [&, data, disc_number](const uint32_t title_id) {
@@ -148,11 +194,10 @@ std::filesystem::path ContentManager::ResolvePackagePath(
 
     auto package_root =
         ResolvePackageRoot(used_xuid, title_id, data.content_type);
-    std::string final_name = xe::string_util::trim(data.file_name());
-    std::filesystem::path package_path = package_root / xe::to_path(final_name);
+    std::filesystem::path package_path = package_root / folder_name;
 
     if (!std::filesystem::exists(package_path)) {
-      auto existing = ResolveNameInsensitive(package_root, final_name);
+      auto existing = ResolveNameInsensitive(package_root, file_name);
       if (!existing.empty()) {
         package_path = existing;
       }
@@ -174,12 +219,20 @@ std::filesystem::path ContentManager::ResolvePackagePath(
       if (!std::filesystem::exists(package_path)) {
         continue;
       }
-      return package_path;
+      path = package_path;
+      return X_ERROR_SUCCESS;
     }
   }
 
   // Default handling for current title
-  return get_package_path(data.title_id);
+  path = get_package_path(data.title_id);
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT ContentManager::CheckPackageName(const uint64_t xuid,
+                                          const XCONTENT_AGGREGATE_DATA& data) {
+  std::filesystem::path path;
+  return ResolvePackagePath(xuid, data, path);
 }
 
 static std::filesystem::path PackageHeaderPath(
@@ -326,8 +379,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContentODD(
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, const uint64_t xuid,
     const XCONTENT_AGGREGATE_DATA& data, const uint32_t disc_number) {
-  auto package_path = ResolvePackagePath(xuid, data, disc_number);
-  if (!std::filesystem::exists(package_path)) {
+  std::filesystem::path package_path;
+  if (ResolvePackagePath(xuid, data, package_path, disc_number) ||
+      !std::filesystem::exists(package_path)) {
     return nullptr;
   }
 
@@ -343,8 +397,8 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 
 bool ContentManager::ContentExists(const uint64_t xuid,
                                    const XCONTENT_AGGREGATE_DATA& data) {
-  auto path = ResolvePackagePath(xuid, data);
-  return std::filesystem::exists(path);
+  std::filesystem::path path;
+  return !ResolvePackagePath(xuid, data, path) && std::filesystem::exists(path);
 }
 
 X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
@@ -356,7 +410,11 @@ X_RESULT ContentManager::WriteContentHeaderFile(const uint64_t xuid,
     data.xuid = xuid;
   }
 
-  auto header_path = PackageHeaderPath(ResolvePackagePath(xuid, data));
+  std::filesystem::path package_path;
+  if (ResolvePackagePath(xuid, data, package_path)) {
+    return X_STATUS_NO_SUCH_FILE;
+  }
+  auto header_path = PackageHeaderPath(package_path);
   auto parent_path = header_path.parent_path();
 
   if (!std::filesystem::exists(parent_path)) {
@@ -443,7 +501,10 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name,
     return X_ERROR_ALREADY_EXISTS;
   }
 
-  auto package_path = ResolvePackagePath(xuid, data);
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
+  }
   if (std::filesystem::exists(package_path)) {
     // Exists, must not!
     return X_ERROR_ALREADY_EXISTS;
@@ -474,10 +535,10 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
   // title's own saves are first, if it can (else it opens read-only). That is
   // file I/O: before the global lock, and off the guest's dispatch thread.
   if (data.content_type == XContentType::kSavedGame) {
-    const std::filesystem::path save_path =
-        ResolvePackagePath(xuid, data, disc_number);
+    std::filesystem::path save_path;
     std::error_code ec;
-    if (std::filesystem::is_regular_file(save_path, ec)) {
+    if (!ResolvePackagePath(xuid, data, save_path, disc_number) &&
+        std::filesystem::is_regular_file(save_path, ec)) {
       kernel_state_->guest_scheduler()->RunBlockingHostCall(
           [this, &save_path]() { UnpackPackageFile(save_path); });
     }
@@ -490,7 +551,11 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name,
     return X_ERROR_ALREADY_EXISTS;
   }
 
-  auto package_path = ResolvePackagePath(xuid, data, disc_number);
+  std::filesystem::path package_path;
+  if (const X_RESULT result =
+          ResolvePackagePath(xuid, data, package_path, disc_number)) {
+    return result;
+  }
   if (!std::filesystem::exists(package_path)) {
     // Does not exist, must be created.
     return X_ERROR_FILE_NOT_FOUND;
@@ -637,7 +702,10 @@ X_RESULT ContentManager::GetContentThumbnail(
     std::vector<uint8_t>* buffer) {
   auto global_lock = global_critical_region_.Acquire();
 
-  auto package_path = ResolvePackagePath(xuid, data);
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
+  }
   auto thumb_path = package_path / vfs::kPackageThumbnailFileName;
   if (std::filesystem::exists(thumb_path)) {
     auto file = xe::filesystem::OpenFile(thumb_path, "rb");
@@ -676,7 +744,10 @@ X_RESULT ContentManager::SetContentThumbnail(
     const uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
     std::vector<uint8_t> buffer) {
   auto global_lock = global_critical_region_.Acquire();
-  auto package_path = ResolvePackagePath(xuid, data);
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
+  }
   std::error_code ec;
   if (std::filesystem::exists(package_path, ec) &&
       !std::filesystem::is_directory(package_path, ec)) {
@@ -709,7 +780,10 @@ X_RESULT ContentManager::DeleteContent(const uint64_t xuid,
     return X_ERROR_ACCESS_DENIED;
   }
 
-  auto package_path = ResolvePackagePath(xuid, data);
+  std::filesystem::path package_path;
+  if (const X_RESULT result = ResolvePackagePath(xuid, data, package_path)) {
+    return result;
+  }
   if (std::filesystem::remove_all(package_path) > 0) {
     return X_ERROR_SUCCESS;
   } else {
