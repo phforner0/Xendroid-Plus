@@ -728,7 +728,7 @@ X_RESULT ContentManager::GetContentThumbnail(
 
   // A deleted package leaves its header behind.
   if (!std::filesystem::exists(package_path)) {
-    return X_ERROR_FILE_NOT_FOUND;
+    return X_ERROR_PATH_NOT_FOUND;
   }
 
   // Upstream canary moves the thumbnail into the header file.
@@ -759,20 +759,18 @@ X_RESULT ContentManager::SetContentThumbnail(
     return result;
   }
   std::error_code ec;
-  if (std::filesystem::exists(package_path, ec) &&
-      !std::filesystem::is_directory(package_path, ec)) {
+  if (!std::filesystem::exists(package_path, ec)) {
+    return X_ERROR_PATH_NOT_FOUND;
+  }
+  if (!std::filesystem::is_directory(package_path, ec)) {
     // A package kept as one container file carries its thumbnail in its
     // header and is mounted read-only, so there is nowhere to write one.
     XELOGW("{}: {} is a container file, thumbnail not written", __func__,
            package_path);
     return X_ERROR_SUCCESS;
   }
-  std::filesystem::create_directories(package_path, ec);
-  if (!std::filesystem::is_directory(package_path, ec)) {
-    return X_ERROR_FILE_NOT_FOUND;
-  }
-  auto thumb_path = package_path / vfs::kPackageThumbnailFileName;
-  auto file = xe::filesystem::OpenFile(thumb_path, "wb");
+  auto file = xe::filesystem::OpenFile(
+      package_path / vfs::kPackageThumbnailFileName, "wb");
   if (!file) {
     return X_ERROR_ACCESS_DENIED;
   }
@@ -797,7 +795,7 @@ X_RESULT ContentManager::DeleteContent(const uint64_t xuid,
   if (std::filesystem::remove_all(package_path) > 0) {
     return X_ERROR_SUCCESS;
   } else {
-    return X_ERROR_FILE_NOT_FOUND;
+    return X_ERROR_PATH_NOT_FOUND;
   }
 }
 
