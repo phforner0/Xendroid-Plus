@@ -1082,7 +1082,7 @@ dword_result_t XamUserGetSubscriptionType_entry(dword_t user_index,
 
   auto user = kernel_state()->xam_state()->GetUserProfile(user_index);
   if (!user) {
-    return X_ERROR_INVALID_PARAMETER;
+    return X_E_NO_SUCH_USER;
   }
 
   *subscription_ptr = user->GetSubscriptionTier();
