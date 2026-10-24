@@ -71,10 +71,11 @@ DEFINE_int32(
     "Diagnostics - measures how much GPU time the emulation of Xenos math and "
     "texture semantics costs in pixel shaders. Bit mask, pixel shaders only, "
     "read when shaders are translated (startup): 1 - no Shader Model 3 "
-    "'0 * anything = 0' multiplication emulation; 2 - no 21-bit precision "
-    "rounding after exp/log/sqrt/rsq/rcp; 4 - texture fetches ignore the "
-    "signed/biased/gamma component signs (WRONG COLORS, measurement only); 8 - "
-    "allow floating-point contraction (fused multiply-add).",
+    "'0 * anything = 0' multiplication emulation; 2 - no effect since "
+    "2026-10-30 (pixel shaders take the host's exp/log/sqrt/rsq/rcp); 4 - "
+    "texture fetches ignore the signed/biased/gamma component signs (WRONG "
+    "COLORS, measurement only); 8 - allow floating-point contraction (fused "
+    "multiply-add).",
     "GPU");
 
 DEFINE_int32(
@@ -83,14 +84,15 @@ DEFINE_int32(
     "time. Bit mask, read when shaders are translated (startup): 1 - no "
     "Shader Model 3 '0 * anything = 0' in multiplications (titles relying on "
     "0 * infinity or 0 * NaN giving 0 may show black or white pixels, and "
-    "zero products keep their IEEE sign); 2 - no rounding to the 21 mantissa "
-    "bits of the Xenos after exp, log, sqrt, rsq and rcp; 8 - allow fused "
-    "multiply-add (results may differ in the last bits between shaders, so "
-    "multipass effects repeating a calculation may not match exactly; no "
-    "change in the code Turnip generates). 11 (all) measured -6% GPU time in "
-    "the Forza Horizon main pass on Adreno 825 with no visible difference. "
-    "The same bits as spirv_ps_math_experiment, without its texture sign bit "
-    "(4).",
+    "zero products keep their IEEE sign); 2 - no effect since 2026-10-30, "
+    "when pixel shaders started taking the host's exp, log, sqrt, rsq and "
+    "rcp (it skipped rounding them to the 21 mantissa bits of the Xenos); 8 - "
+    "allow fused multiply-add (results may differ in the last bits between "
+    "shaders, so multipass effects repeating a calculation may not match "
+    "exactly; no change in the code Turnip generates). 11 (all) measured -6% "
+    "GPU time in the Forza Horizon main pass on Adreno 825 with no visible "
+    "difference. The same bits as spirv_ps_math_experiment, without its "
+    "texture sign bit (4).",
     "GPU");
 
 DEFINE_int32(
@@ -109,8 +111,8 @@ DEFINE_int32(
     "translated (startup): 1 - no Shader Model 3 '0 * anything = 0' in "
     "multiplications (the same results for finite operands, only the sign of "
     "a zero product may differ - positions computed by different shaders "
-    "still match); 2 - no rounding to the 21 mantissa bits of the Xenos after "
-    "exp, log, sqrt, rsq and rcp; 8 - allow fused multiply-add. 2 and 8 change "
+    "still match); 2 - the host's exp, log, sqrt, rsq and rcp instead of the "
+    "Xenos' ones, bit for bit; 8 - allow fused multiply-add. 2 and 8 change "
     "results, so the same position computed by different shaders may stop "
     "matching between passes (depth fighting).",
     "GPU");
@@ -457,6 +459,7 @@ void SpirvShaderTranslator::Reset() {
   texture_exp_adjust_zero_spec_constant_ = spv::NoResult;
 
   main_interface_.clear();
+  var_main_estimate_coefficients_.fill(spv::NoResult);
   var_main_registers_ = spv::NoResult;
   var_main_memexport_address_ = spv::NoResult;
   for (size_t memexport_eM_index = 0;
