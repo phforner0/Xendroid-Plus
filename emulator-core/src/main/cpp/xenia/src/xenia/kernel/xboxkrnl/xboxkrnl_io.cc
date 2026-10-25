@@ -37,13 +37,17 @@ struct CreateOptions {
   static constexpr uint32_t FILE_RANDOM_ACCESS = 0x00000800;
 };
 
-dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
+// IoCreateFile option that opens the directory holding the path's last
+// component.
+constexpr uint32_t kIoOpenTargetDirectory = 0x4;
+
+dword_result_t IoCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
                                   pointer_t<X_OBJECT_ATTRIBUTES> object_attrs,
                                   pointer_t<X_IO_STATUS_BLOCK> io_status_block,
                                   lpqword_t allocation_size_ptr,
                                   dword_t file_attributes, dword_t share_access,
                                   dword_t creation_disposition,
-                                  dword_t create_options) {
+                                  dword_t create_options, dword_t options) {
   uint64_t allocation_size = 0;  // is this correct???
   if (allocation_size_ptr) {
     allocation_size = *allocation_size_ptr;
@@ -92,12 +96,29 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   // Attempt open (or create).
   vfs::File* vfs_file;
   vfs::FileAction file_action;
-  X_STATUS result = kernel_state()->file_system()->OpenFile(
-      root_entry, target_path,
-      vfs::FileDisposition((uint32_t)creation_disposition), desired_access,
-      (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
-      (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file,
-      &file_action);
+  X_STATUS result;
+  if (options & kIoOpenTargetDirectory) {
+    result = kernel_state()->file_system()->OpenFile(
+        root_entry, xe::utf8::find_base_guest_path(target_path),
+        vfs::FileDisposition::kOpen, desired_access, true, false, &vfs_file,
+        &file_action);
+    if (result == X_STATUS_OBJECT_NAME_NOT_FOUND) {
+      result = X_STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+    if (XSUCCEEDED(result)) {
+      file_action = vfs_file->entry()->GetChild(
+                        xe::utf8::find_name_from_guest_path(target_path))
+                        ? vfs::FileAction::kExists
+                        : vfs::FileAction::kDoesNotExist;
+    }
+  } else {
+    result = kernel_state()->file_system()->OpenFile(
+        root_entry, target_path,
+        vfs::FileDisposition((uint32_t)creation_disposition), desired_access,
+        (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+        (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0,
+        &vfs_file, &file_action);
+  }
   object_ref<XFile> file = nullptr;
 
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
@@ -120,6 +141,20 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   *handle_out = handle;
 
   return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(IoCreateFile, kFileSystem, kImplemented);
+
+dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
+                                  pointer_t<X_OBJECT_ATTRIBUTES> object_attrs,
+                                  pointer_t<X_IO_STATUS_BLOCK> io_status_block,
+                                  lpqword_t allocation_size_ptr,
+                                  dword_t file_attributes, dword_t share_access,
+                                  dword_t creation_disposition,
+                                  dword_t create_options) {
+  return IoCreateFile_entry(handle_out, desired_access, object_attrs,
+                            io_status_block, allocation_size_ptr,
+                            file_attributes, share_access, creation_disposition,
+                            create_options, 0);
 }
 DECLARE_XBOXKRNL_EXPORT1(NtCreateFile, kFileSystem, kImplemented);
 
