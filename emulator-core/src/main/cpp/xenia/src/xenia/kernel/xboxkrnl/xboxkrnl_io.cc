@@ -121,7 +121,8 @@ dword_result_t IoCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   }
   object_ref<XFile> file = nullptr;
 
-  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+  // A failed open leaves the handle and the information 0.
+  X_HANDLE handle = 0;
   if (XSUCCEEDED(result)) {
     // If true, desired_access SYNCHRONIZE flag must be set.
     bool synchronous =
@@ -135,7 +136,8 @@ dword_result_t IoCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
 
   if (io_status_block) {
     io_status_block->status = result;
-    io_status_block->information = (uint32_t)file_action;
+    io_status_block->information =
+        XSUCCEEDED(result) ? uint32_t(file_action) : 0;
   }
 
   *handle_out = handle;
