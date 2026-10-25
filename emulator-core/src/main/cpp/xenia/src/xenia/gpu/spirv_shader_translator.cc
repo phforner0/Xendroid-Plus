@@ -111,10 +111,12 @@ DEFINE_int32(
     "translated (startup): 1 - no Shader Model 3 '0 * anything = 0' in "
     "multiplications (the same results for finite operands, only the sign of "
     "a zero product may differ - positions computed by different shaders "
-    "still match); 2 - the host's exp, log, sqrt, rsq and rcp instead of the "
-    "Xenos' ones, bit for bit; 8 - allow fused multiply-add. 2 and 8 change "
-    "results, so the same position computed by different shaders may stop "
-    "matching between passes (depth fighting).",
+    "still match); 2 - the host's exp, log, sqrt, rsq and rcp and its "
+    "rounding of sums and products to nearest, instead of the Xenos' (its "
+    "exact ops, and alu_round_toward_zero); 8 - allow fused multiply-add "
+    "(which also turns alu_round_toward_zero off). 2 and 8 change results, so "
+    "the same position computed by different shaders may stop matching "
+    "between passes (depth fighting).",
     "GPU");
 
 DEFINE_bool(
@@ -337,6 +339,8 @@ SpirvShaderTranslator::Features::Features(
           vulkan_device->properties().shaderDenormFlushToZeroFloat32),
       rounding_mode_rte_float32(
           vulkan_device->properties().shaderRoundingModeRTEFloat32),
+      rounding_mode_rtz_float32(
+          vulkan_device->properties().shaderRoundingModeRTZFloat32),
       fragment_shader_sample_interlock(
           vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(
@@ -533,7 +537,7 @@ void SpirvShaderTranslator::StartTranslation() {
   if (features_.spirv_version < spv::Spv_1_4) {
     if (features_.signed_zero_inf_nan_preserve_float32 ||
         features_.denorm_flush_to_zero_float32 ||
-        features_.rounding_mode_rte_float32) {
+        features_.rounding_mode_rte_float32 || RoundsTowardZeroInHardware()) {
       builder_->addExtension("SPV_KHR_float_controls");
     }
   }
@@ -1339,8 +1343,12 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     builder_->addExecutionMode(function_main_,
                                spv::ExecutionModeSignedZeroInfNanPreserve, 32);
   }
-  if (features_.rounding_mode_rte_float32 &&
-      !cvars::spirv_disable_rounding_mode_rte) {
+  if (RoundsTowardZeroInHardware()) {
+    builder_->addCapability(spv::CapabilityRoundingModeRTZ);
+    builder_->addExecutionMode(function_main_,
+                               spv::ExecutionModeRoundingModeRTZ, 32);
+  } else if (features_.rounding_mode_rte_float32 &&
+             !cvars::spirv_disable_rounding_mode_rte) {
     builder_->addCapability(spv::CapabilityRoundingModeRTE);
     builder_->addExecutionMode(function_main_,
                                spv::ExecutionModeRoundingModeRTE, 32);
