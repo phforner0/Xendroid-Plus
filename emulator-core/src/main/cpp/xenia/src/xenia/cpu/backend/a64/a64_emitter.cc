@@ -62,6 +62,10 @@ extern uint64_t ResolveFunction(void* raw_context, uint64_t target_address);
 extern uint64_t ResolveDynamicCall(void* raw_context, uint64_t target_address);
 extern uint64_t ResolveDirectDynamicCall(void* raw_context,
                                          uint64_t target_address);
+extern uint64_t ResolveCachedReturnSiteCall(void* raw_context,
+                                            uint64_t target_address);
+extern uint64_t ResolveCachedReturnSiteTail(void* raw_context,
+                                            uint64_t target_address);
 extern uint64_t ResolveDynamicTailCall(void* raw_context,
                                        uint64_t target_address);
 
@@ -857,6 +861,7 @@ void A64Emitter::EmitDynamicCallLookup(bool tail, bool direct) {
   const bool direct_call = direct && !tail;
   Label miss;
   Label done;
+  Label check_kind;
   ldr(x14, ptr(x19, static_cast<uint32_t>(
                         offsetof(A64BackendContext, dynamic_call_cache))));
   cbz(x14, miss);
@@ -870,17 +875,26 @@ void A64Emitter::EmitDynamicCallLookup(bool tail, bool direct) {
   cmp(w15, w16);
   b(NE, miss);
   if (!direct_call) {
-    // An entry a direct call cached skips the return site checks a branch
-    // needs (kA64DynamicCallAny is 0).
+    static_assert(kA64DynamicCallAny == 0);
     ldr(w15, ptr(x14, static_cast<uint32_t>(
                           offsetof(A64DynamicCallCacheEntry, kind))));
-    cbnz(w15, miss);
+    cbnz(w15, check_kind);
   }
   ldr(x9, ptr(x14, static_cast<uint32_t>(
                        offsetof(A64DynamicCallCacheEntry, host_address))));
   // An entry the cache was initialized with holds no address.
   cbz(x9, miss);
   b(done);
+  if (!direct_call) {
+    L(check_kind);
+    cmp(w15, uint32_t(kA64DynamicCallReturnSite));
+    b(NE, miss);
+    mov(w1, w16);
+    CallNativeSafe(reinterpret_cast<void*>(tail ? ResolveCachedReturnSiteTail
+                                                : ResolveCachedReturnSiteCall));
+    mov(x9, x0);
+    b(done);
+  }
 
   L(miss);
   // The host call can clobber x16, so hand the address over as its argument.

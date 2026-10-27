@@ -72,6 +72,9 @@ enum A64DynamicCallCacheKind : uint32_t {
   // Cached by a direct call, which skips the return site checks a branch to
   // the same address needs.
   kA64DynamicCallDirectOnly = 1,
+  // The function entered at a return site. A branch takes it only when no
+  // live frame returns there and MayResolveLongjmp rules out a longjmp.
+  kA64DynamicCallReturnSite = 2,
 };
 // A resolved guest address that has no indirection slot.
 struct A64DynamicCallCacheEntry {
@@ -79,7 +82,7 @@ struct A64DynamicCallCacheEntry {
   uint32_t kind;
   uint64_t host_address;
 };
-constexpr uint32_t kA64DynamicCallCacheSize = 4096;
+constexpr uint32_t kA64DynamicCallCacheSize = 16384;
 // EmitDynamicCallLookup indexes and loads these itself.
 static_assert(sizeof(A64DynamicCallCacheEntry) == 16);
 static_assert(offsetof(A64DynamicCallCacheEntry, kind) == 4);

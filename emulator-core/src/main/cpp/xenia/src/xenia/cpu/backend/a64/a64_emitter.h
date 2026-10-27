@@ -124,9 +124,9 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   void CallExtern(const hir::Instr* instr, const Function* function);
   void CallNative(void* fn);
   void CallNativeSafe(void* fn);
-  // Loads the host address for the guest address in w16 into x9.
-  // A direct bl, |direct| without |tail|, takes any entry, and other lookups
-  // only those a branch may take.
+  // Loads the host address for the guest address in w16 into x9. A direct bl,
+  // |direct| without |tail|, takes any entry. Other lookups take Any entries
+  // and check a return site's for a live frame.
   void EmitDynamicCallLookup(bool tail, bool direct = false);
   void SetReturnAddress(uint64_t value);
 
