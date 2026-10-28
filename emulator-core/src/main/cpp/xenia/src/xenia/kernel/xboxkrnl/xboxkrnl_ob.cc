@@ -325,8 +325,12 @@ dword_result_t ObReferenceObjectByName_entry(pointer_t<X_ANSI_STRING> name,
   X_STATUS result =
       kernel_state()->object_table()->GetObjectByName(name_str, &handle);
   if (XSUCCEEDED(result)) {
-    return ObReferenceObjectByHandle_entry(handle, object_type_ptr,
-                                           out_object_ptr);
+    result = ObReferenceObjectByHandle_entry(handle, object_type_ptr,
+                                             out_object_ptr);
+    // The reference is ObReferenceObjectByHandle's, not the lookup's.
+    kernel_state()->object_table()->ReleaseHandle(handle);
+  } else if (out_object_ptr.guest_address()) {
+    *out_object_ptr = 0;
   }
 
   return result;
