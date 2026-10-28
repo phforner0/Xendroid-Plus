@@ -76,7 +76,8 @@ spv::Id SpirvShaderTranslator::ScalarEstimate(ScalarEstimateOp op,
                                               spv::Id value) {
   EnsureBuildPointAvailable();
 
-  if (is_pixel_shader() || (math_relaxations_ & kMathRelaxationPrecision)) {
+  if (!alu_op_result_rounding_sensitive_ ||
+      (math_relaxations_ & kMathRelaxationPrecision)) {
     switch (op) {
       case ScalarEstimateOp::kRcp:
         return builder_->createNoContractionBinOp(spv::OpFDiv, type_float_,
@@ -570,10 +571,13 @@ bool SpirvShaderTranslator::RoundsTowardZero() const {
   return cvars::alu_round_toward_zero && is_vertex_shader() &&
          !(math_relaxations_ &
            (kMathRelaxationPrecision | kMathRelaxationContraction)) &&
-         !features_.allow_float_contraction;
+         !features_.allow_float_contraction &&
+         (features_.rounding_mode_rtz_float32 ||
+          alu_op_result_rounding_sensitive_);
 }
 
 bool SpirvShaderTranslator::RoundsTowardZeroInHardware() const {
+  // Whatever the operation, since RoundsTowardZero doesn't look at it then.
   return RoundsTowardZero() && features_.rounding_mode_rtz_float32;
 }
 
@@ -683,13 +687,20 @@ void SpirvShaderTranslator::ProcessAluInstruction(
   // allow for multipass rendering (in addition to the Invariant decoration on
   // outputs).
 
+  const Shader& shader = current_shader();
+  uint32_t instruction_address = current_instruction_address();
+
   // Whether the instruction has changed the predicate, and it needs to be
   // checked again later.
   bool predicate_written_vector = false;
+  alu_op_result_rounding_sensitive_ =
+      shader.IsAluVectorResultRoundingSensitive(instruction_address);
   spv::Id vector_result = ProcessVectorAluOperation(
       instr, memexport_eM_potentially_written_before, predicate_written_vector);
 
   bool predicate_written_scalar = false;
+  alu_op_result_rounding_sensitive_ =
+      shader.IsAluScalarResultRoundingSensitive(instruction_address);
   spv::Id scalar_result = ProcessScalarAluOperation(
       instr, memexport_eM_potentially_written_before, predicate_written_scalar);
   if (scalar_result != spv::NoResult) {
