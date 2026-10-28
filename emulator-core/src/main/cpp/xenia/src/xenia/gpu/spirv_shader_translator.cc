@@ -116,16 +116,21 @@ DEFINE_int32(
     "GPU");
 
 DEFINE_bool(
-    spirv_fast_precision_rounding, true,
+    spirv_fast_precision_rounding, false,
     "Round results of exp, log, sqrt, rsq and rcp to the 21 mantissa bits of "
     "the Xenos with an add of half the kept unit in the last place and a "
     "mask, instead of computing both roundings and selecting (5 instead of 12 "
     "Adreno instructions each, -6% pixel shader instructions on the Forza "
-    "Horizon shaders). Same results for every input, including infinity, NaN "
-    "and the finite values that must not round up to infinity; read when "
-    "shaders are translated (startup). On for every title since 2026-10-05.",
+    "Horizon shaders). The same arithmetic for every input, including "
+    "infinity, NaN and the finite values that must not round up to infinity; "
+    "read when shaders are translated (startup). Off except for the Forza "
+    "titles it was measured with (game_quirks): on for every title from "
+    "2026-10-05, it turned Prototype's lit scene black on Turnip (Adreno 825 "
+    "and 830) - the ground, buildings and people, while the same shaders with "
+    "the select draw it (frame dump and runtime A/B, POCO F7, 2026-10-28).",
     "GPU");
 UPDATE_from_bool(spirv_fast_precision_rounding, 2026, 10, 5, 12, false);
+UPDATE_from_bool(spirv_fast_precision_rounding, 2026, 10, 28, 22, true);
 
 DEFINE_bool(
     spirv_texture_sign_branch, true,
