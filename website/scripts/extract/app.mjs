@@ -54,7 +54,8 @@ export function extractApp(root) {
   const globalConfig = find(a, /get_global_config_file\(\)\s*\{\s*return new File\(Application\.get_app_data_dir\(\),"([\w.-]+)"\)/, 'o arquivo da config global');
   const driverSource = find('app/src/main/java/xendroid/compose/driver/DriverSources.kt', /const val DEFAULT = "([\w./-]+)"/, 'a fonte padrão de drivers');
   const driverMax = find('app/src/main/java/xendroid/compose/driver/DriverSources.kt', /const val MAX = (\d+)/, 'o limite de fontes de drivers');
-  const gameConfig = find('app/src/main/java/xendroid/compose/settings/ConfigStore.kt', /fun perGameConfigDir\(\): File = File\(globalConfigFile\(\)\.parentFile, "(\w+)"\)[\s\S]*?File\(perGameConfigDir\(\), "\$\{titleId\.uppercase\(\)\}\.config\.toml"\)/, 'o caminho da config por jogo');
+  // A pasta e o nome do arquivo numa expressão só (até a 0.1.0) ou a pasta em perGameConfigDir().
+  const gameConfig = find('app/src/main/java/xendroid/compose/settings/ConfigStore.kt', /File\(globalConfigFile\(\)\.parentFile, "(\w+)"\)(?:, "\$\{titleId\.uppercase\(\)\}\.config\.toml"\)|[\s\S]*?File\(perGameConfigDir\(\), "\$\{titleId\.uppercase\(\)\}\.config\.toml"\))/, 'o caminho da config por jogo');
 
   const v = f => (f ? f.value : null);
   const pkg = v(appId) && v(releaseSuffix) ? v(appId) + v(releaseSuffix) : null;
