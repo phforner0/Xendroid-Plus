@@ -29,7 +29,11 @@ object LogRedactor {
         Regex("(?i)\\b(?:xuid|guid)\\b\\s*[:=]?\\s*(?:0x)?$HEX16\\b") to "[xuid]",
         Regex("(?i)(?<=content[/\\\\])[a-f0-9]{16}(?=[/\\\\])") to "[xuid]",
         Regex("(?<![\\w.])(?:\\d{1,3}\\.){3}\\d{1,3}(?![\\w.])") to "[ip]",
-        Regex("(?i)(?<![\\w:])(?:[a-f0-9]{1,4}:){2,}[a-f0-9]{0,4}(?![\\w:])") to "[ip]",
+        // MAC addresses, then IPv6: 4 or more colon-separated groups (a trailing ":port" or ":"
+        // included), or shortened by "::". Not 3 groups: logcat's clock times (13:43:48.620).
+        Regex("(?i)(?<![\\w:])[a-f0-9]{2}(?::[a-f0-9]{2}){5}(?!\\w|:[a-f0-9])") to "[mac]",
+        Regex("(?i)(?<![\\w:])(?:[a-f0-9]{1,4}:){3,}[a-f0-9]{0,4}(?![\\w:])") to "[ip]",
+        Regex("(?i)(?<![\\w:])(?:[a-f0-9]{1,4}(?::[a-f0-9]{1,4}){0,6}::(?:[a-f0-9]{1,4}(?::[a-f0-9]{1,4}){0,6})?|::[a-f0-9]{1,4}(?::[a-f0-9]{1,4}){0,6})(?!\\w|:[a-f0-9])") to "[ip]",
         Regex("(?i)\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b") to "[email]",
     )
 
@@ -43,6 +47,12 @@ object SanitizedSessionExport {
     private const val MAX_ENTRY_CHARS = 4L * 1024 * 1024
     private const val MAX_TOTAL_CHARS = 32L * 1024 * 1024
     private const val MAX_LINE_CHARS = 8192
+    /** The start an xe.log too long to share whole keeps ahead of its end: bytes of a file,
+     *  characters of an archived entry (the same for the mostly ASCII logs). */
+    internal const val HEAD_SIZE = 256 * 1024
+    /** How far an archived entry is read looking for its end; sessions shelve 64 MB at most. */
+    private const val MAX_ARCHIVED_ENTRY_CHARS = 96L * 1024 * 1024
+    private const val MIDDLE_OMITTED = "[log middle omitted]\n"
     private val allowedName = Regex("(?:(?:previous-[0-9-]+-)?(?:xe\\.log|logcat\\.txt)|logcat-current\\.txt|context\\.json|exit-info\\.txt|exit-trace-\\d+\\.txt)")
 
     fun create(
@@ -68,29 +78,43 @@ object SanitizedSessionExport {
                             // The archive is size-capped above and the entry count bounds the work.
                             if (entry.isDirectory || !allowedName.matches(entry.name)) continue
                             zip.putNextEntry(ZipEntry("sessions/${archive.nameWithoutExtension}/${entry.name}"))
-                            val limit = minOf(remaining, MAX_ENTRY_CHARS)
-                            val consumed = writeRedacted(source, zip, limit)
-                            remaining -= consumed
+                            val (text, complete) = archivedText(source, minOf(remaining, MAX_ENTRY_CHARS).toInt(),
+                                keepStart = entry.name.endsWith("xe.log"))
+                            writeRedacted(text.byteInputStream(), zip, Long.MAX_VALUE)
+                            remaining -= text.length
                             zip.closeEntry()
                             written++
-                            // nextEntry drains the previous entry. Stop instead when it exceeded
-                            // the limit: don't decompress the rest of a potentially hostile ZIP.
-                            if (consumed == limit) break
+                            // nextEntry drains the previous entry. Stop instead when one was too
+                            // long to read to its end: don't decompress the rest of a potentially
+                            // hostile ZIP.
+                            if (!complete) break
                         }
                     }
                 }
                 current.forEach { (file, name) ->
                     if (!file.isFile || !allowedName.matches(name) || remaining <= 0) return@forEach
                     zip.putNextEntry(ZipEntry("current/$name"))
+                    var limit = minOf(remaining, MAX_ENTRY_CHARS)
+                    // An xe.log too long to share whole keeps its start too: it opens with the
+                    // config, the GPU and driver and the game's own settings, which a verbose
+                    // run (kernel calls logged) pushes out of the end. Measured in bytes like
+                    // the end's skip, so the end never repeats a line of it.
+                    if (name.endsWith("xe.log") && file.length() > limit && limit > 2 * HEAD_SIZE) {
+                        val start = startOf(file)
+                        writeRedacted(start.inputStream(), zip, Long.MAX_VALUE)
+                        zip.write(MIDDLE_OMITTED.toByteArray(Charsets.UTF_8))
+                        remaining -= start.size
+                        limit -= start.size
+                    }
                     FileInputStream(file).use { source ->
-                        val skip = (file.length() - MAX_ENTRY_CHARS).coerceAtLeast(0)
+                        val skip = (file.length() - limit).coerceAtLeast(0)
                         if (skip > 0) {
                             source.skip(skip)
                             // Tail snapshots can begin mid-line; drop it rather than leaking a
                             // token suffix that no complete-line pattern could recognize.
                             while (source.read().let { it >= 0 && it != '\n'.code }) { }
                         }
-                        remaining -= writeRedacted(source, zip, minOf(remaining, MAX_ENTRY_CHARS))
+                        remaining -= writeRedacted(source, zip, limit)
                     }
                     zip.closeEntry()
                     written++
@@ -102,6 +126,57 @@ object SanitizedSessionExport {
         } finally {
             temporary.delete()
         }
+    }
+
+    /** A file's first [HEAD_SIZE] bytes, up to their last whole line. */
+    private fun startOf(file: File): ByteArray {
+        val bytes = ByteArray(HEAD_SIZE)
+        var count = 0
+        FileInputStream(file).use { input ->
+            while (count < bytes.size) {
+                val n = input.read(bytes, count, bytes.size - count)
+                if (n < 0) break
+                count += n
+            }
+        }
+        while (count > 0 && bytes[count - 1] != '\n'.code.toByte()) count--
+        return bytes.copyOf(count)
+    }
+
+    /**
+     * An archived entry's text in at most [limit] characters: whole when it fits, else its end
+     * from a whole line, after its start up to a whole line when [keepStart]. A ZIP entry can't
+     * seek, so the end is kept in a ring as the entry is read; reading stops at
+     * [MAX_ARCHIVED_ENTRY_CHARS], and then the second value is false.
+     */
+    private fun archivedText(input: InputStream, limit: Int, keepStart: Boolean): Pair<String, Boolean> {
+        val reader = InputStreamReader(input, Charsets.UTF_8).buffered()
+        val startCap = if (keepStart && limit > 2 * HEAD_SIZE) HEAD_SIZE else 0
+        val start = StringBuilder()
+        val ring = CharArray(limit - startCap)
+        var first = 0
+        var size = 0
+        var dropped = false
+        var complete = true
+        var read = 0L
+        while (true) {
+            val c = reader.read()
+            if (c < 0) break
+            if (++read > MAX_ARCHIVED_ENTRY_CHARS) { complete = false; dropped = true; break }
+            when {
+                start.length < startCap -> start.append(c.toChar())
+                size < ring.size -> ring[(first + size++) % ring.size] = c.toChar()
+                else -> { ring[first] = c.toChar(); first = (first + 1) % ring.size; dropped = true }
+            }
+        }
+        val end = buildString(size) { for (i in 0 until size) append(ring[(first + i) % ring.size]) }
+        if (!dropped) return (start.toString() + end) to complete
+        // Both sides of the cut end at whole lines: a part of a line could keep part of a value
+        // that no pattern recognizes any more.
+        val newline = end.indexOf('\n')
+        val keptEnd = if (newline < 0) "" else end.substring(newline + 1)
+        if (startCap == 0) return keptEnd to complete
+        return (start.substring(0, start.lastIndexOf('\n') + 1) + MIDDLE_OMITTED + keptEnd) to complete
     }
 
     /** Read one character at a time from a buffered reader to bound long lines and ZIP bombs. */
