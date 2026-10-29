@@ -379,6 +379,16 @@ static const Quirk kQuirks[] = {
      "its CPU reads what the GPU writes with memory export"},
     {0x53510823, "memexport_await_fences", true,
      "the output is in guest memory when the GPU signals"},
+    // Forza Motorsport 4 resolves its car shadow's 16-bit fixed depth moments
+    // as signed integers with an exponent bias of +10 and samples them as
+    // integers times 2^-15 (num_format integer, exponent adjust -15). Packed
+    // as unsigned fractions they saturated, and sampled normalized they came
+    // out 2^15 times too small: everything under the car was in shadow, a
+    // black square.
+    {0x4D530910, "resolve_fixed16_bias_copies_integers", true,
+     "the car shadow's depth moments resolve as integers"},
+    {0x4D530910, "texture_integer_num_format", true,
+     "the car shadow samples its depth moments as integers"},
 };
 
 // Same path/priority as a per-game config file.
