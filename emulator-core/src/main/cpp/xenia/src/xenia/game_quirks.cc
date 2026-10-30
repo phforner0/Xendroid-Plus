@@ -379,6 +379,15 @@ static const Quirk kQuirks[] = {
      "its CPU reads what the GPU writes with memory export"},
     {0x53510823, "memexport_await_fences", true,
      "the output is in guest memory when the GPU signals"},
+    // Naruto: Rise of a Ninja: its worker thread 0x18 starts (8265BB68) by
+    // calling the routine at +0xEC of its object. When it ran on its
+    // creator's CPU right after its creation, the object held the thread's id
+    // but not yet the routine, and the call to address 0 crashed the game a
+    // few seconds after boot: 5 of 11 launches with cooperative fibers. As
+    // host threads, none in 5 launches, and 30 fps in 82% of a 6.5 minute
+    // session (POCO F7, 2026-10-29).
+    {0x555307E5, "guest_scheduler", false,
+     "a new thread calls its routine before its creator stores it"},
 };
 
 // Same path/priority as a per-game config file.
