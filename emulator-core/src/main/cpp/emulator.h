@@ -49,7 +49,7 @@ namespace ae{
     extern void flush_gpu_caches();
     // The diagnostic build's "Capture frame" (XENIA_ENABLE_GPU_TRACE): the
     // next whole frame goes to <storage root>/traces/<title>_<frame>.xtr,
-    // which Xenia Edge's trace viewer replays. available() is false in a
+    // in Xenia Edge's trace format. available() is false in a
     // normal build, and request() fails there and before the GPU runs.
     extern bool frame_trace_available();
     extern bool request_frame_trace();

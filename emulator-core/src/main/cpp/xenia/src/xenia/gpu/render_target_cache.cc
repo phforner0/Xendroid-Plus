@@ -2123,6 +2123,10 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
 bool RenderTargetCache::InitializeTraceSubmitDownloads() {
   if (IsDrawResolutionScaled()) {
     // Scaled EDRAM has no 1:1 mapping to a guest snapshot.
+    XELOGW(
+        "GPU trace: no EDRAM snapshot with a draw resolution scale above 1; "
+        "capture at 1x for a trace that starts from the frame's render "
+        "targets");
     return false;
   }
   if (GetPath() == Path::kHostRenderTargets) {

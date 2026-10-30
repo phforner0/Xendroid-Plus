@@ -203,8 +203,9 @@ that a normal build leaves out (`-DXENIA_ENABLE_GPU_TRACE=ON`; its hooks cost
 0.4–0.6% CPU, measured by upstream). The in-game menu then offers **Capture frame**
 beside Screenshot: the next whole frame's GPU commands go to `traces/<title>_<frame>.xtr`
 in the app's storage, and the log says when it is written. The file is in Xenia
-Edge's trace format, with the EDRAM and the frame's textures, for its trace viewer
-and dump on the desktop. Build it for a bug report, not for players.
+Edge's trace format, with the EDRAM (at a draw resolution scale of 1 only) and the
+frame's textures, for its trace viewer and dump on the desktop. Build it for a bug
+report, not for players.
 
 ## Windows notes
 
