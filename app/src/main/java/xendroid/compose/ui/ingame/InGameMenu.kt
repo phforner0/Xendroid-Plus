@@ -674,6 +674,7 @@ internal fun InGameAction.title(): String = stringResource(
         InGameAction.MARK_SCENE -> R.string.menu_t_mark
         InGameAction.SHARE_LOGS -> R.string.menu_share_logs
         InGameAction.SCREENSHOT -> R.string.menu_t_screenshot
+        InGameAction.CAPTURE_FRAME -> R.string.menu_t_capture_frame
         InGameAction.RESUME -> R.string.menu_continue
         InGameAction.QUIT -> R.string.menu_exit_game
         InGameAction.MORE_OPTIONS -> R.string.menu_fewer_options

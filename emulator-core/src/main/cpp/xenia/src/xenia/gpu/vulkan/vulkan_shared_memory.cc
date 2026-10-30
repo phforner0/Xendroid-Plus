@@ -634,7 +634,8 @@ bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {
           download_page_count << page_size_log2(),
           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
           ui::vulkan::util::MemoryPurpose::kReadback, trace_download_buffer_,
-          trace_download_buffer_memory_)) {
+          trace_download_buffer_memory_,
+          &trace_download_buffer_memory_type_)) {
     XELOGE(
         "Shared memory: Failed to create a {} KB GPU-written memory download "
         "buffer for frame tracing",
@@ -686,12 +687,17 @@ void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
   void* download_mapping;
   if (dfn.vkMapMemory(device, trace_download_buffer_memory_, 0, VK_WHOLE_SIZE,
                       0, &download_mapping) == VK_SUCCESS) {
+    // Readback memory may be cached without being coherent on mobile GPUs.
+    ui::vulkan::util::InvalidateMappedMemoryRange(
+        vulkan_device, trace_download_buffer_memory_,
+        trace_download_buffer_memory_type_);
     uint32_t download_buffer_offset = 0;
     for (const auto& download_range : trace_download_ranges()) {
       trace_writer_.WriteMemoryRead(
           download_range.first, download_range.second,
           reinterpret_cast<const uint8_t*>(download_mapping) +
               download_buffer_offset);
+      download_buffer_offset += download_range.second;
     }
     dfn.vkUnmapMemory(device, trace_download_buffer_memory_);
   } else {

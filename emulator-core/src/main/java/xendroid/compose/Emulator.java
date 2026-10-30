@@ -68,6 +68,10 @@ public class Emulator extends xendroid.emulator.Emulator{
     public native long[] audio_run_stats();
     // File that receives a fatal error's message before the process aborts; null turns it off.
     public native void set_fatal_report_path(String path);
+    // The diagnostic build's "Capture frame": whether this build has the GPU trace writer, and
+    // a request for the next whole frame in <storage root>/traces (false when it can't).
+    public native boolean frame_trace_available();
+    public native boolean request_frame_trace();
     // Player slots P2-P4 (P1 keeps key_event): input, controller connect/disconnect, and the
     // guest's rumble per slot P1..P4 (left motor << 16 | right motor).
     public native void key_event_slot(int slot, int key_code, boolean pressed, int value);

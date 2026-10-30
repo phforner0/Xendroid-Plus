@@ -187,6 +187,21 @@ class CommandProcessor {
   static constexpr uint32_t kTilingBandMaxCallDepth = 16;
   std::array<uint32_t, kTilingBandMaxCallDepth> ib_call_sites_{};
   uint32_t ib_call_depth_ = 0;
+
+  // The last packets read, for the log when one can't be executed: a command
+  // stream gone out of step otherwise only shows where it ended up, not the
+  // packet that took it there.
+  struct RecentPacket {
+    uint32_t address;  // Guest physical address of the header.
+    uint32_t header;
+    uint32_t depth;  // 0 in the primary buffer, n inside n indirect ones.
+  };
+  static constexpr uint32_t kRecentPacketCount = 64;
+  std::array<RecentPacket, kRecentPacketCount> recent_packets_{};
+  uint32_t recent_packets_read_ = 0;
+  // Logs those packets and the dwords around the last one, for the buffer
+  // being read.
+  void LogUnexecutablePacket(bool primary);
   uint32_t tiling_band_call_depth_ = 0;
   // merge_tiling_bands_log: per band sequence, the draws looked at, the ones
   // skipped as drawn in an earlier band, and the ones in a later band the
@@ -241,6 +256,8 @@ class CommandProcessor {
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
   virtual void ClearReadbackBuffers();
+
+  TraceWriter& trace_writer() { return trace_writer_; }
 
   // Get cached readback resolve mode (avoids string parsing every frame)
   ReadbackResolveMode GetReadbackResolveMode() const {

@@ -170,6 +170,10 @@
     <string name="menu_screenshot_note">The game\'s picture, without the menu or the HUD, saved to Pictures/Xendroid+</string>
     <string name="host_screenshot_saved">Screenshot saved to Pictures/Xendroid+</string>
     <string name="host_screenshot_failed">Couldn\'t save the screenshot</string>
+    <string name="menu_t_capture_frame">Capture frame</string>
+    <string name="menu_capture_frame_note">The next frame\'s GPU commands, to the traces folder, for a bug report (diagnostic build)</string>
+    <string name="host_frame_trace_requested">Frame capture requested: the next frame goes to the traces folder (the log says when it is written)</string>
+    <string name="host_frame_trace_failed">Couldn\'t capture the frame (see the log)</string>
     <string name="xd_hud_charge">Charge</string>
     <string name="xd_hud_battery_time">Battery time</string>
     <string name="menu_chip_charge">Charge</string>

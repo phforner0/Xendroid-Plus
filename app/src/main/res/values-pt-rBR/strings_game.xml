@@ -170,6 +170,10 @@
     <string name="menu_screenshot_note">A imagem do jogo, sem o menu e o HUD, salva em Imagens/Xendroid+</string>
     <string name="host_screenshot_saved">Captura salva em Imagens/Xendroid+</string>
     <string name="host_screenshot_failed">Não foi possível salvar a captura</string>
+    <string name="menu_t_capture_frame">Capturar quadro</string>
+    <string name="menu_capture_frame_note">Os comandos de GPU do próximo quadro, na pasta traces, para um relato de bug (build de diagnóstico)</string>
+    <string name="host_frame_trace_requested">Captura pedida: o próximo quadro vai para a pasta traces (o log diz quando fica pronto)</string>
+    <string name="host_frame_trace_failed">Não foi possível capturar o quadro (veja o log)</string>
     <string name="xd_hud_charge">Carga</string>
     <string name="xd_hud_battery_time">Autonomia</string>
     <string name="menu_chip_charge">Carga</string>

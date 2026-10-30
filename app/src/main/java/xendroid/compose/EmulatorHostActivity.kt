@@ -2985,7 +2985,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         menuPaused.value = session.isPaused()
         fpsLimitState.intValue = session.fpsLimit()
         presentationState.value = session.presentationState()
-        menuState.value = menuState.value.show(pausedHere)
+        menuState.value = menuState.value.copy(frameTrace = session.frameTraceAvailable()).show(pausedHere)
         menuStatus.value = runCatching { buildMenuStatus() }.getOrDefault(emptyList())
         refreshFpsConfig()
         refreshDriverLine()
@@ -3183,6 +3183,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                     1 -> "2×1"; 2 -> "1×2"; 3 -> "2×2"; else -> stringResource(R.string.menu_shading_rate_full) },
                 own = xendroid.compose.core.GpuLiveOption.SHADING_RATE.key in own, note = stringResource(R.string.menu_shading_rate_note)),
             InGameAction.SCREENSHOT to MenuValue(text = stringResource(R.string.menu_screenshot_note)),
+            InGameAction.CAPTURE_FRAME to MenuValue(text = stringResource(R.string.menu_capture_frame_note)),
             InGameAction.SUSTAINED_PERFORMANCE to MenuValue(on = sustainedMode.value, enabled = sustainedAvailable.value,
                 text = if (!sustainedAvailable.value) unavailable else null),
             InGameAction.PERFORMANCE_HINTS to MenuValue(on = performanceHints.requested, text = performanceHintsLabel.value),
@@ -3316,6 +3317,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             InGameAction.MSAA_4X_AS_2X -> toggleGpuLive(xendroid.compose.core.GpuLiveOption.MSAA_4X_AS_2X)
             InGameAction.CUTOUT_TRANSPARENCY -> toggleGpuLive(xendroid.compose.core.GpuLiveOption.ALPHA_TO_COVERAGE_AS_TEST)
             InGameAction.SCREENSHOT -> takeScreenshot()
+            InGameAction.CAPTURE_FRAME -> captureFrame()
             InGameAction.SUSTAINED_PERFORMANCE -> {
                 val enabled = !sustainedMode.value
                 sustainedAvailable.value = sustainedPerformance(this, enabled)
@@ -3902,6 +3904,16 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                     getString(if (saved) R.string.host_screenshot_saved else R.string.host_screenshot_failed), Toast.LENGTH_SHORT).show()
             }
         }, android.os.Handler(mainLooper))
+    }
+
+    /** The diagnostic build's "Capture frame": the menu closes and the game's next frame goes to a
+     *  trace in the traces folder (the core logs when it is written). */
+    private fun captureFrame() {
+        closeMenuAndResume()
+        val requested = session.requestFrameTrace()
+        recordEvent("trace", if (requested) "frame trace requested" else "frame trace refused")
+        Toast.makeText(this, getString(if (requested) R.string.host_frame_trace_requested else R.string.host_frame_trace_failed),
+            Toast.LENGTH_LONG).show()
     }
 
     private fun saveScreenshot(bitmap: android.graphics.Bitmap) {

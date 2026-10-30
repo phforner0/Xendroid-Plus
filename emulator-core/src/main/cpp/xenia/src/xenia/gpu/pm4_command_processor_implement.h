@@ -109,6 +109,7 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
       } else {
         // Return up a level if we encounter a bad packet.
         XELOGE("**** INDIRECT RINGBUFFER: Failed to execute packet.");
+        COMMAND_PROCESSOR::LogUnexecutablePacket(false);
         assert_always();
         break;
       }
@@ -355,6 +356,8 @@ bool COMMAND_PROCESSOR::ExecutePacket() {
 #endif
   const uint32_t packet = reader_.ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
+  recent_packets_[recent_packets_read_++ % kRecentPacketCount] = {
+      COMMAND_PROCESSOR::GuestReadPtrOffset(-4), packet, ib_call_depth_};
 
   XE_LIKELY_IF(packet && packet != 0x0BADF00D) {
     XE_LIKELY_IF((packet != 0xCDCDCDCD)) {
@@ -759,15 +762,25 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         if (trace_state_ == TraceState::kSingleFrame) {
           trace_state_ = TraceState::kDisabled;
           trace_writer_.Close();
+          XELOGI("GPU trace: frame written");
         }
       } else if (trace_state_ == TraceState::kSingleFrame) {
         // New trace request - we only start tracing at the beginning of a
         // frame.
-        uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
+        auto executable_module = kernel_state_->GetExecutableModule();
+        uint32_t title_id =
+            executable_module ? executable_module->title_id() : 0;
         auto file_name = fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
         auto path = trace_frame_path_ / file_name;
-        trace_writer_.Open(path, title_id);
-        InitializeTrace();
+        if (trace_writer_.Open(path, title_id)) {
+          XELOGI("GPU trace: capturing frame {} to {}", counter_ - 1,
+                 xe::path_to_utf8(path));
+          InitializeTrace();
+        } else {
+          // Not left pending, which would try again at every swap.
+          XELOGE("GPU trace: can't write {}", xe::path_to_utf8(path));
+          trace_state_ = TraceState::kDisabled;
+        }
       }
     }
 #endif
@@ -1997,6 +2010,7 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
     if (!COMMAND_PROCESSOR::ExecutePacket()) {
       // This probably should be fatal - but we're going to continue anyways.
       XELOGE("**** PRIMARY RINGBUFFER: Failed to execute packet.");
+      COMMAND_PROCESSOR::LogUnexecutablePacket(true);
       assert_always();
       break;
     }

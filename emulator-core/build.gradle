@@ -49,6 +49,12 @@ android {
                     cFlags '-O2', '-DNDEBUG', '-g', '-fno-strict-aliasing'
                     cppFlags '-O2', '-DNDEBUG', '-g', '-fno-strict-aliasing'
                 }
+                // Diagnostic build: XENDROID_GPU_TRACE=true keeps the GPU trace
+                // writer (0.4-0.6% CPU in its hooks, measured by upstream), and
+                // the in-game menu offers "Capture frame".
+                if (System.getenv('XENDROID_GPU_TRACE') == 'true') {
+                    arguments '-DXENIA_ENABLE_GPU_TRACE=ON'
+                }
                 if (System.getenv('USE_CCACHE') == 'true') {
                     arguments '-DCMAKE_C_COMPILER_LAUNCHER=ccache',
                               '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache'

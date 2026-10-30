@@ -155,6 +155,7 @@ class VulkanSharedMemory : public SharedMemory {
   // Created temporarily, only for downloading.
   VkBuffer trace_download_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory trace_download_buffer_memory_ = VK_NULL_HANDLE;
+  uint32_t trace_download_buffer_memory_type_ = UINT32_MAX;
   void ResetTraceDownload();
 };
 
