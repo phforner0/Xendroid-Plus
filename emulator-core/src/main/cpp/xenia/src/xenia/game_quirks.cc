@@ -384,7 +384,10 @@ static const Quirk kQuirks[] = {
     // integers times 2^-15 (num_format integer, exponent adjust -15). Packed
     // as unsigned fractions they saturated, and sampled normalized they came
     // out 2^15 times too small: everything under the car was in shadow, a
-    // black square.
+    // black square. With both, a race start shows the car's own shadow and no
+    // square; with the integer fetch switched off at run time the square is
+    // back (runtime A/B, POCO F7, 2026-10-30, without the accurate resolve
+    // options).
     {0x4D530910, "resolve_fixed16_bias_copies_integers", true,
      "the car shadow's depth moments resolve as integers"},
     {0x4D530910, "texture_integer_num_format", true,
