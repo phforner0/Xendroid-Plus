@@ -1510,6 +1510,82 @@ uint32_t CommandProcessor::GuestReadPtrOffset(int32_t offset) const {
                   offset);
 }
 
+void CommandProcessor::LogUnexecutablePacket(bool primary) {
+  // A few times a run: past that, it is the same stream going wrong again.
+  static std::atomic<uint32_t> logs_left{4};
+  uint32_t left = logs_left.load(std::memory_order_relaxed);
+  do {
+    if (!left) {
+      return;
+    }
+  } while (!logs_left.compare_exchange_weak(left, left - 1,
+                                            std::memory_order_relaxed));
+  const uint32_t buffer_start = uint32_t(
+      reinterpret_cast<uintptr_t>(reader_.buffer()) -
+      reinterpret_cast<uintptr_t>(memory_->physical_membase()));
+  const uint32_t buffer_end = buffer_start + uint32_t(reader_.capacity());
+  const uint32_t packet_count =
+      std::min(recent_packets_read_, kRecentPacketCount);
+  XELOGE(
+      "PM4: unexecutable packet in the {} buffer {:08X}-{:08X} (indirect depth "
+      "{}), read pointer {:08X}, {} bytes left. The last {} packets, oldest "
+      "first (address, depth, header, then type 3: opcode count [P if "
+      "predicated], type 0: register count, type 1: two registers):",
+      primary ? "primary" : "indirect", buffer_start, buffer_end,
+      ib_call_depth_, GuestReadPtrOffset(), reader_.read_count(),
+      packet_count);
+  for (uint32_t i = recent_packets_read_ - packet_count;
+       i != recent_packets_read_; ++i) {
+    const RecentPacket& packet = recent_packets_[i % kRecentPacketCount];
+    const uint32_t header = packet.header;
+    std::string decoded;
+    switch (header >> 30) {
+      case 3:
+        decoded = fmt::format("type 3: {:02X} {}{}", (header >> 8) & 0x7F,
+                              ((header >> 16) & 0x3FFF) + 1,
+                              (header & 1) ? " P" : "");
+        break;
+      case 0:
+        decoded = fmt::format("type 0: {:04X} {}", header & 0x7FFF,
+                              ((header >> 16) & 0x3FFF) + 1);
+        break;
+      case 1:
+        decoded = fmt::format("type 1: {:03X} {:03X}", header & 0x7FF,
+                              (header >> 11) & 0x7FF);
+        break;
+      default:
+        decoded = "type 2";
+        break;
+    }
+    XELOGE("PM4:   {:08X} {} {:08X} {}", packet.address, packet.depth, header,
+           decoded);
+  }
+  // The dwords around the last packet's header, as the guest wrote them.
+  if (packet_count) {
+    const uint32_t last =
+        recent_packets_[(recent_packets_read_ - 1) % kRecentPacketCount]
+            .address;
+    // Only within the page of the header, which was read, so committed: past
+    // an overflowing count the next page may not be.
+    const uint32_t page = last & ~uint32_t(0xFFF);
+    const uint32_t first_dword =
+        std::max({buffer_start, page, last >= 64 ? last - 64 : 0}) &
+        ~uint32_t(3);
+    const uint32_t end_dword = std::min({buffer_end, page + 0x1000, last + 68});
+    for (uint32_t row = first_dword; row < end_dword; row += 32) {
+      std::string line = fmt::format("PM4:   {:08X}:", row);
+      for (uint32_t address = row; address < std::min(row + 32, end_dword);
+           address += 4) {
+        const uint32_t value =
+            xe::load_and_swap<uint32_t>(memory_->TranslatePhysical(address));
+        line += address == last ? fmt::format(" [{:08X}]", value)
+                                : fmt::format(" {:08X}", value);
+      }
+      XELOGE("{}", line);
+    }
+  }
+}
+
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;

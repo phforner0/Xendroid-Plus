@@ -109,6 +109,7 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
       } else {
         // Return up a level if we encounter a bad packet.
         XELOGE("**** INDIRECT RINGBUFFER: Failed to execute packet.");
+        COMMAND_PROCESSOR::LogUnexecutablePacket(false);
         assert_always();
         break;
       }
@@ -355,6 +356,8 @@ bool COMMAND_PROCESSOR::ExecutePacket() {
 #endif
   const uint32_t packet = reader_.ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
+  recent_packets_[recent_packets_read_++ % kRecentPacketCount] = {
+      COMMAND_PROCESSOR::GuestReadPtrOffset(-4), packet, ib_call_depth_};
 
   XE_LIKELY_IF(packet && packet != 0x0BADF00D) {
     XE_LIKELY_IF((packet != 0xCDCDCDCD)) {
@@ -1997,6 +2000,7 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
     if (!COMMAND_PROCESSOR::ExecutePacket()) {
       // This probably should be fatal - but we're going to continue anyways.
       XELOGE("**** PRIMARY RINGBUFFER: Failed to execute packet.");
+      COMMAND_PROCESSOR::LogUnexecutablePacket(true);
       assert_always();
       break;
     }
