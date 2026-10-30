@@ -95,6 +95,26 @@ const std::map<uint32_t, int> supported_socket_options = {
 // Translate socket TCP options to native
 const std::map<uint32_t, int> supported_tcp_options = {{0x0001, TCP_NODELAY}};
 
+// Whether an option above is a BOOL or an int, which the guest gives
+// big-endian and the host takes as its own int.
+static bool IsIntSocketOption(uint32_t level, uint32_t optname) {
+  if (level == 0xFFFF) {
+    return optname == 0x0004 || optname == 0x0020 || optname == 0x1001 ||
+           optname == 0x1002;
+  }
+  return level == 0x6 && optname == 0x0001;
+}
+
+// The fewest bytes a value of such an option, or of SO_SNDTIMEO and
+// SO_RCVTIMEO, takes: a BOOL may be one byte, an int or a DWORD is four, and
+// a shorter value fails with WSAEFAULT.
+static uint32_t SocketOptionMinLength(uint32_t level, uint32_t optname) {
+  return level == 0xFFFF && (optname == 0x1001 || optname == 0x1002 ||
+                             optname == 0x1005 || optname == 0x1006)
+             ? 4
+             : 1;
+}
+
 // Translate ioctl commands to native
 const std::map<uint32_t, uint32_t> supported_controls = {
     {0x8004667E, FIONBIO}, {0x4004667F, FIONREAD}};
@@ -300,6 +320,21 @@ X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_INVALID_HANDLE;
   }
 
+  if ((IsIntSocketOption(level, optname) ||
+       (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006))) &&
+      *optlen < SocketOptionMinLength(level, optname)) {
+    last_error_ = uint32_t(X_WSAError::X_WSAEFAULT);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  // SetOption keeps SO_SNDTIMEO and SO_RCVTIMEO off the host socket.
+  if (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006)) {
+    StoreSocketOptionValue(
+        optval_ptr, *optlen,
+        optname == 0x1006 ? recv_timeout_ms_ : send_timeout_ms_);
+    return X_STATUS_SUCCESS;
+  }
+
   // Map Xbox socket levels to native
   int native_level = level;
   if (supported_levels.contains(level)) {
@@ -321,6 +356,18 @@ X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
   if (native_handle_val == -1) {
     last_error_ = AsioErrorToWSAError(asio::error::not_socket);
     return X_STATUS_INVALID_HANDLE;
+  }
+
+  if (IsIntSocketOption(level, optname)) {
+    int int_value = 0;
+    socklen_t int_length = sizeof(int_value);
+    if (getsockopt(native_handle_val, native_level, native_optname, &int_value,
+                   &int_length) < 0) {
+      last_error_ = HostSocketError();
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    StoreSocketOptionValue(optval_ptr, *optlen, uint32_t(int_value));
+    return X_STATUS_SUCCESS;
   }
 
   int ret = getsockopt(native_handle_val, native_level, native_optname,
@@ -354,6 +401,26 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_SUCCESS;
   }
 
+  if ((IsIntSocketOption(level, optname) ||
+       (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006))) &&
+      optlen < SocketOptionMinLength(level, optname)) {
+    last_error_ = uint32_t(X_WSAError::X_WSAEFAULT);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  // SO_SNDTIMEO / SO_RCVTIMEO in milliseconds. Kept for the cooperative retry
+  // loop, which never sees the host option take effect, and kept off the host:
+  // a POSIX host wants a timeval and refuses the guest's DWORD.
+  if (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006)) {
+    uint32_t timeout_ms = SocketOptionValue(optval_ptr, optlen);
+    if (optname == 0x1006) {
+      recv_timeout_ms_ = timeout_ms;
+    } else {
+      send_timeout_ms_ = timeout_ms;
+    }
+    return X_STATUS_SUCCESS;
+  }
+
   // Map Xbox socket levels to native
   int native_level = level;
   if (supported_levels.contains(level)) {
@@ -374,23 +441,22 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_INVALID_HANDLE;
   }
 
+  // A host other than Windows refuses a one-byte BOOL.
+  int int_value = 0;
+  const void* native_optval = optval_ptr;
+  socklen_t native_optlen = optlen;
+  if (IsIntSocketOption(level, optname)) {
+    int_value = int(SocketOptionValue(optval_ptr, optlen));
+    native_optval = &int_value;
+    native_optlen = sizeof(int_value);
+  }
+
   int ret = setsockopt(native_handle_val, native_level, native_optname,
-                       static_cast<char*>(optval_ptr), optlen);
+                       static_cast<const char*>(native_optval), native_optlen);
   if (ret < 0) {
     last_error_ = HostSocketError();
     XELOGE("XSocket::SetOption: failed with error {:08X}", last_error_);
     return X_STATUS_UNSUCCESSFUL;
-  }
-
-  // SO_SNDTIMEO / SO_RCVTIMEO in milliseconds. Kept for the cooperative retry
-  // loop, which never sees the host option take effect.
-  if (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006)) {
-    uint32_t timeout_ms = SocketOptionValue(optval_ptr, optlen);
-    if (optname == 0x1006) {
-      recv_timeout_ms_ = timeout_ms;
-    } else {
-      send_timeout_ms_ = timeout_ms;
-    }
   }
 
   return X_STATUS_SUCCESS;
