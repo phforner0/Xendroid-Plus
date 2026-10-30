@@ -61,6 +61,7 @@
 #include "xenia/ui/imgui_host_notification.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/windowed_app_context.h"
+#include "xenia/vfs/content_install_standalone.h"
 #include "xenia/vfs/device.h"
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/disc_zarchive_device.h"
@@ -2485,6 +2486,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     XELOGE("Failed to load user module {}", path);
     return X_STATUS_NOT_SUPPORTED;
   }
+
+  // Before the title update and the title's content are looked up.
+  vfs::RenameUnusablePackages(content_root_, module->title_id());
 
   X_RESULT result = kernel_state_->ApplyTitleUpdate(module);
   if (XFAILED(result)) {

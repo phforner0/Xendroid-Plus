@@ -17,6 +17,7 @@
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
+#include "xenia/vfs/fatx_package_name.h"
 #include "xenia/vfs/virtual_file_system.h"
 #include "xenia/xbox.h"
 
@@ -110,7 +111,12 @@ X_STATUS InstallContentPackageStandalone(
   } else {
     xuid = 0ull;
     place_title_id = device->title_id();
-    leaf = src_path.filename().string();
+    // The file's name, as far as the content calls take it.
+    leaf = FatxPackageName(src_path.filename().string());
+    if (leaf != src_path.filename().string()) {
+      XELOGI("InstallContentPackageStandalone: {} installs as {}",
+             src_path.filename().string(), leaf);
+    }
     write_header = true;
   }
 
@@ -521,6 +527,83 @@ X_STATUS DeleteInstalledContent(const std::filesystem::path& content_root,
   std::filesystem::remove(header_path, header_ec);
 
   return X_STATUS_SUCCESS;
+}
+
+void RenameUnusablePackages(const std::filesystem::path& content_root,
+                            uint32_t title_id) {
+  const std::filesystem::path title_root =
+      content_root / fmt::format("{:016X}/{:08X}", uint64_t(0), title_id);
+  std::error_code ec;
+  if (!std::filesystem::is_directory(title_root, ec)) {
+    return;
+  }
+  std::vector<std::filesystem::path> type_roots;
+  for (std::filesystem::directory_iterator it(title_root, ec), end;
+       !ec && it != end; it.increment(ec)) {
+    const std::string type_name = it->path().filename().string();
+    if (type_name.size() == 8 &&
+        type_name.find_first_not_of("0123456789ABCDEFabcdef") ==
+            std::string::npos) {
+      type_roots.push_back(it->path());
+    }
+  }
+  for (const std::filesystem::path& type_root : type_roots) {
+    std::vector<std::string> names;
+    for (std::filesystem::directory_iterator it(type_root, ec), end;
+         !ec && it != end; it.increment(ec)) {
+      names.push_back(it->path().filename().string());
+    }
+    ec.clear();
+    const std::filesystem::path headers_root =
+        title_root / "Headers" / type_root.filename();
+    for (const std::string& name : names) {
+      const std::string fatx_name = FatxPackageName(name);
+      if (name.starts_with(".xd-") || fatx_name == name) {
+        continue;
+      }
+      const std::filesystem::path target = type_root / fatx_name;
+      if (std::filesystem::exists(target, ec) || ec) {
+        XELOGW("Content {} keeps its name: {} is taken", name, fatx_name);
+        ec.clear();
+        continue;
+      }
+      std::filesystem::rename(type_root / name, target, ec);
+      if (ec) {
+        XELOGE("Content {} cannot take the name {}: {}", name, fatx_name,
+               ec.message());
+        ec.clear();
+        continue;
+      }
+      XELOGI("Content {} renamed to {}, a name the content calls take", name,
+             fatx_name);
+      const std::filesystem::path header_path =
+          headers_root / (fatx_name + ".header");
+      std::filesystem::rename(headers_root / (name + ".header"), header_path,
+                              ec);
+      if (ec) {
+        ec.clear();
+        continue;
+      }
+      // A header the installer wrote holds the package's name too. One in
+      // the container format names it by where it is.
+      auto container =
+          XContentContainerDevice::ReadContainerHeader(header_path);
+      if (container && container->content_header.is_magic_valid()) {
+        continue;
+      }
+      FILE* file = xe::filesystem::OpenFile(header_path, "r+b");
+      if (!file) {
+        continue;
+      }
+      kernel::xam::XCONTENT_AGGREGATE_DATA data;
+      if (fread(&data, 1, sizeof(data), file) == sizeof(data)) {
+        data.set_file_name(fatx_name);
+        fseek(file, 0, SEEK_SET);
+        fwrite(&data, 1, sizeof(data), file);
+      }
+      fclose(file);
+    }
+  }
 }
 
 }  // namespace vfs

@@ -44,6 +44,7 @@
 #include "xenia/vfs/xex_metadata.h"                   // ExtractXexMetadata(path)
 #include "xenia/vfs/stfs_metadata.h"                  // ExtractStfsMetadata(path)
 #include "xenia/vfs/content_install_standalone.h"     // InstallContentPackageStandalone
+#include "xenia/vfs/fatx_package_name.h"              // FatxPackageName
 #include "xenia/kernel/xam/profile_standalone.h"       // CreateStandaloneProfile / ListStandaloneProfiles / RenameStandaloneProfile
 
 #include <cstdio>
@@ -1627,9 +1628,10 @@ static jint j_install_disc_content(JNIEnv* env, jobject self, jstring discPath,
 
 // public native ContentInfo content_header(String srcPath);
 // Header-only probe of an STFS/SVOD package: title_id, content_type,
-// content_size, display_name, icon. Returns null for a non-CON/unreadable
-// container. ExtractStfsMetadata carries content_type, which the existing
-// GameInfo bridge drops -- hence the dedicated ContentInfo class.
+// content_size, display_name, icon, and the folder name install_content gives
+// it. Returns null for a non-CON/unreadable container. ExtractStfsMetadata
+// carries content_type, which the existing GameInfo bridge drops -- hence the
+// dedicated ContentInfo class.
 static jobject j_content_header(JNIEnv* env, jobject self, jstring srcPath) {
     if (!srcPath) return nullptr;
     const char* sp = env->GetStringUTFChars(srcPath, nullptr);
@@ -1648,6 +1650,7 @@ static jobject j_content_header(JNIEnv* env, jobject self, jstring srcPath) {
     jfieldID fid_size = env->GetFieldID(cls, "contentSize", "J");
     jfieldID fid_name = env->GetFieldID(cls, "displayName", "Ljava/lang/String;");
     jfieldID fid_icon = env->GetFieldID(cls, "icon", "[B");
+    jfieldID fid_package = env->GetFieldID(cls, "packageName", "Ljava/lang/String;");
 
     jobject info = env->NewObject(cls, ctor);
     env->SetIntField(info, fid_title_id, (jint)meta->title_id);
@@ -1668,6 +1671,9 @@ static jobject j_content_header(JNIEnv* env, jobject self, jstring srcPath) {
             env->SetObjectField(info, fid_icon, icon);
         }
     }
+    const std::string package_name =
+            xe::vfs::FatxPackageName(p.filename().string());
+    env->SetObjectField(info, fid_package, env->NewStringUTF(package_name.c_str()));
     return info;
 }
 

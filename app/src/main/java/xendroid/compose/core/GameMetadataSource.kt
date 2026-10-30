@@ -1,6 +1,7 @@
 package xendroid.compose.core
 
 import android.util.Log
+import java.io.File
 import xendroid.compose.Emulator
 import xendroid.compose.data.GameFormat
 
@@ -67,13 +68,15 @@ class GameMetadataSource {
     }
 
     /** Parsed STFS/SVOD content-package header: title id (8-char hex, null when 0),
-     *  content type (raw, e.g. 0x2 for DLC), payload size, display name, icon. */
+     *  content type (raw, e.g. 0x2 for DLC), payload size, display name, icon, and the
+     *  folder name the native installer gives the package (the file's, kept to FATX's). */
     data class ContentMeta(
         val titleId: String?,
         val contentType: Int,
         val contentSize: Long,
         val displayName: String,
         val iconPng: ByteArray?,
+        val packageName: String,
     )
 
     /** Header-only probe of a content package (CON/LIVE/PIRS) from a real path.
@@ -88,6 +91,7 @@ class GameMetadataSource {
                 contentSize = info.contentSize,
                 displayName = info.displayName ?: "",
                 iconPng = info.icon?.takeIf { it.isNotEmpty() },
+                packageName = info.packageName ?: File(path).name,
             )
         } catch (t: RuntimeException) {
             Log.w("GameMetadataSource", "content header read failed for $path", t)
