@@ -258,7 +258,8 @@ std::unique_ptr<xe::ui::Surface> AndroidWindow::CreateSurfaceImpl(xe::ui::Surfac
 }
 
 void AndroidWindow::RequestPaintImpl() {
-    XELOGI("Requesting Android window paint...");
+    // Every frame: at info level it was over a quarter of a long session's log.
+    XELOGD("Requesting Android window paint...");
     AndroidWindowedAppContext* context=static_cast<AndroidWindowedAppContext*>(&app_context());
     context->request_paint();
 }
