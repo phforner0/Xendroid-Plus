@@ -10851,7 +10851,8 @@ bool VulkanRenderTargetCache::BeginEdramSnapshotReadback() {
             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             ui::vulkan::util::MemoryPurpose::kReadback,
             edram_snapshot_download_buffer_,
-            edram_snapshot_download_buffer_memory_)) {
+            edram_snapshot_download_buffer_memory_,
+            &edram_snapshot_download_buffer_memory_type_)) {
       XELOGE(
           "VulkanRenderTargetCache: Failed to create the EDRAM snapshot "
           "download buffer");
@@ -10890,6 +10891,10 @@ const void* VulkanRenderTargetCache::MapEdramSnapshotReadback() {
     return nullptr;
   }
   edram_snapshot_download_mapped_ = true;
+  // Readback memory may be cached without being coherent on mobile GPUs.
+  ui::vulkan::util::InvalidateMappedMemoryRange(
+      vulkan_device, edram_snapshot_download_buffer_memory_,
+      edram_snapshot_download_buffer_memory_type_);
   return download_mapping;
 }
 

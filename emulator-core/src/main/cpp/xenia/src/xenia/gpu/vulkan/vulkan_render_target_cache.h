@@ -452,6 +452,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   EdramBufferUsage edram_buffer_usage_;
   VkBuffer edram_snapshot_download_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory edram_snapshot_download_buffer_memory_ = VK_NULL_HANDLE;
+  uint32_t edram_snapshot_download_buffer_memory_type_ = UINT32_MAX;
   bool edram_snapshot_download_mapped_ = false;
   // Kept until shutdown so it outlives the copy it feeds - trace restore
   // happens once per replay.
