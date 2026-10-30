@@ -181,21 +181,20 @@ struct XNetStartupParams {
   uint8_t cfgQosSrvMaxSimultaneousResponses;
   uint8_t cfgQosPairWaitTimeInSeconds;
 };
-static_assert_size(XNetStartupParams, 0xD);
-
-XNetStartupParams xnet_startup_params = {0};
+static_assert_size(XNetStartupParams, kStartupParamsSize);
 
 dword_result_t NetDll_XNetStartup_entry(dword_t caller,
                                         pointer_t<XNetStartupParams> params) {
   XELOGI("NetDll_XNetStartup: caller={}, params={:08X}", caller.value(),
          params.guest_address());
 
-  if (params) {
-    assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
-    std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
-  }
-
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  std::span<const uint8_t> given;
+  if (params) {
+    given = {reinterpret_cast<const uint8_t*>(params.host_address()),
+             sizeof(XNetStartupParams)};
+  }
+  xam->StartXNet(false, given);
 
   /*
   if (!xam->xnet()) {
@@ -223,6 +222,7 @@ DECLARE_XAM_EXPORT1(NetDll_XNetStartupEx, kNetworking, kImplemented);
 
 dword_result_t NetDll_XNetCleanup_entry(dword_t caller, lpvoid_t params) {
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  xam->CleanupXNet(false);
   // auto xnet = xam->xnet();
   // xam->set_xnet(nullptr);
 
@@ -238,13 +238,18 @@ dword_result_t NetDll_XNetGetOpt_entry(dword_t one, dword_t option_id,
                                        lpdword_t buffer_size) {
   assert_true(one == 1);
   switch (option_id) {
-    case 1:
+    case 1: {
       if (*buffer_size < sizeof(XNetStartupParams)) {
         *buffer_size = sizeof(XNetStartupParams);
         return uint32_t(X_WSAError::X_WSAEMSGSIZE);
       }
-      std::memcpy(buffer_ptr, &xnet_startup_params, sizeof(XNetStartupParams));
+      const auto params = kernel_state()
+                              ->GetKernelModule<XamModule>("xam.xex")
+                              ->xnet_startup_params();
+      std::memcpy(buffer_ptr, params.data(), params.size());
+      *buffer_size = sizeof(XNetStartupParams);
       return 0;
+    }
     default:
       XELOGE("NetDll_XNetGetOpt: option {} unimplemented",
              static_cast<uint32_t>(option_id));
@@ -278,6 +283,8 @@ dword_result_t NetDll_WSAStartup_entry(dword_t caller, word_t version,
   // TODO(benvanik): abstraction layer needed.
   XELOGI("NetDll_WSAStartup: version={:04X}, data_ptr={:08X}", version.value(),
          data_ptr.guest_address());
+
+  kernel_state()->GetKernelModule<XamModule>("xam.xex")->StartXNet(true, {});
 
   int ret = 0;
 
@@ -328,7 +335,8 @@ dword_result_t NetDll_WSAStartupEx_entry(dword_t caller, word_t version,
 DECLARE_XAM_EXPORT1(NetDll_WSAStartupEx, kNetworking, kImplemented);
 
 dword_result_t NetDll_WSACleanup_entry(dword_t caller) {
-  // This does nothing. Xenia needs WSA running.
+  // Host WSA keeps running, Xenia needs it.
+  kernel_state()->GetKernelModule<XamModule>("xam.xex")->CleanupXNet(true);
   return 0;
 }
 DECLARE_XAM_EXPORT1(NetDll_WSACleanup, kNetworking, kImplemented);
@@ -436,7 +444,7 @@ DECLARE_XAM_EXPORT2(NetDll_WSAWaitForMultipleEvents, kNetworking, kImplemented,
                     kBlocking);
 
 dword_result_t NetDll_WSACreateEvent_entry() {
-  XEvent* ev = new XEvent(kernel_state());
+  auto ev = object_ref<XEvent>(new XEvent(kernel_state()));
   ev->Initialize(true, false);
   return ev->handle();
 }
@@ -601,6 +609,15 @@ dword_result_t NetDll_XNetGetEthernetLinkStatus_entry(dword_t caller) {
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetGetEthernetLinkStatus, kNetworking, kStub);
 
+// No System Link broadcast ever reaches a title here, so none is from another
+// version.
+dword_result_t NetDll_XNetGetBroadcastVersionStatus_entry(dword_t caller,
+                                                          dword_t reset) {
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_XNetGetBroadcastVersionStatus, kNetworking,
+                    kImplemented);
+
 dword_result_t NetDll_XNetDnsLookup_entry(dword_t caller, lpstring_t host,
                                           dword_t event_handle,
                                           lpdword_t pdns) {
@@ -696,13 +713,13 @@ dword_result_t NetDll_socket_entry(dword_t caller, dword_t af, dword_t type,
     return -1;
   }
 
-  XSocket* socket = new XSocket(kernel_state());
+  auto socket = object_ref<XSocket>(new XSocket(kernel_state()));
   X_STATUS result = socket->Initialize(XSocket::AddressFamily((uint32_t)af),
                                        XSocket::Type((uint32_t)type),
                                        XSocket::Protocol((uint32_t)protocol));
 
   if (XFAILED(result)) {
-    socket->Release();
+    socket->ReleaseHandle();
 
     XThread::SetLastError(socket->GetLastWSAError());
     XELOGE("NetDll_socket: failed with error {:08X}",
@@ -722,8 +739,6 @@ dword_result_t NetDll_closesocket_entry(dword_t caller, dword_t socket_handle) {
     return -1;
   }
 
-  // TODO: Absolutely delete this object. It is no longer valid after calling
-  // closesocket.
   socket->Close();
   socket->ReleaseHandle();
   return 0;
@@ -760,6 +775,10 @@ dword_result_t NetDll_setsockopt_entry(dword_t caller, dword_t socket_handle,
     return -1;
   }
 
+  if (!optval_ptr) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAEFAULT));
+    return -1;
+  }
   X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
   if (XFAILED(status)) {
     XThread::SetLastError(socket->GetLastWSAError());

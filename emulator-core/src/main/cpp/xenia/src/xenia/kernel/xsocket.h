@@ -197,8 +197,6 @@ class XSocket : public XObject {
   bool bound_ = false;  // Explicitly bound to an IP address?
   uint16_t bound_port_ = 0;
 
-  bool broadcast_socket_ = false;
-
   // The guest's own FIONBIO/WSAEventSelect choice, tracked separately from the
   // socket's live flag because RunCooperatively toggles that one itself.
   bool guest_non_blocking_ = false;
@@ -220,6 +218,10 @@ class XSocket : public XObject {
   object_ref<XEvent> selected_event_;
   uint32_t selected_event_flags_ = 0;
 };
+
+// Waits for the socket I/O thread to run the handlers queued so far, such as
+// those of the waits that closing sockets cancelled.
+void DrainSocketIo();
 
 }  // namespace kernel
 }  // namespace xe
