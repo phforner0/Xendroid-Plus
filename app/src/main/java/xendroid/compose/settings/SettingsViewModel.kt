@@ -36,7 +36,8 @@ class SettingsViewModel(
     fun reloadGameValues() {
         val index = gameIndex ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { index.read() }.onSuccess { _gameValues.value = it }
+            // Read through the native config: load it first, as load() does.
+            runCatching { EmulatorRuntime.ensureLoaded(); index.read() }.onSuccess { _gameValues.value = it }
                 .onFailure { Log.w("SettingsViewModel", "Reading the games' own settings failed", it) }
         }
     }

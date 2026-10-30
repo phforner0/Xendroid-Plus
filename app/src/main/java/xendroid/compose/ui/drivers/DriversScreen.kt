@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
@@ -29,6 +30,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -229,6 +233,14 @@ fun DriversScreen(
     val toast = LocalXdToast.current
     val values by global.values.collectAsStateWithLifecycle()
     val gameValues by global.gameValues.collectAsStateWithLifecycle()
+    // A game's settings opened from here may have changed its driver: read the games' values
+    // again on return, so the badges and the removal warning name it.
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner, global) {
+        val observer = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_RESUME) global.reloadGameValues() }
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
+    }
     val state = remember(global) { DriversState(context, global, scope, toast) }
     LaunchedEffect(state) { state.refresh() }
     val current = values[KEY]?.raw.orEmpty()

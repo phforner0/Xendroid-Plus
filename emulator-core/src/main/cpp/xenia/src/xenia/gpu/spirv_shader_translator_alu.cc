@@ -102,6 +102,9 @@ spv::Id SpirvShaderTranslator::ReduceFloatPrecision(spv::Id value,
     // A result that became infinity can only come from a finite value that
     // must not round up (an infinity or NaN input can't end up as exactly
     // infinity this way), so it takes the truncated value instead.
+    // Identical bits for every class of input on the CPU, yet Turnip draws
+    // Prototype's lit scene black with this form and right with the one below
+    // (also without the preamble), hence off by default.
     spv::Id rounded_bits = builder_->createBinOp(
         spv::OpBitwiseAnd, type_uint_,
         builder_->createBinOp(spv::OpIAdd, type_uint_, value_bits,

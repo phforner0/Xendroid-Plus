@@ -10,15 +10,18 @@ class ConfigStore(private val appContext: Context, private val fileOverride: Fil
     /** The live, editable config the emulator reads at boot. */
     fun globalConfigFile(): File = fileOverride ?: Application.get_global_config_file()
 
+    /** <app_data_dir>/config, the folder of the games' own files. The app_data_dir is the
+     *  parent of the global config file (Application.get_app_data_dir() is package-private;
+     *  its public sibling get_global_config_file() lives in it). */
+    fun perGameConfigDir(): File = File(globalConfigFile().parentFile, "config")
+
     /** <app_data_dir>/config/<TITLE_ID>.config.toml — exactly the path native
-     *  config::LoadGameConfig reads (config.cc:309-311). The app_data_dir is the
-     *  parent of the global config file (Application.get_app_data_dir() is
-     *  package-private; its public sibling get_global_config_file() lives in it). */
+     *  config::LoadGameConfig reads (config.cc:309-311). */
     fun perGameConfigFile(titleId: String): File {
         require(titleId.matches(Regex("(?i)[0-9a-f]{8}")) && titleId != "00000000") {
             "Invalid game Title ID"
         }
-        return File(File(globalConfigFile().parentFile, "config"), "${titleId.uppercase()}.config.toml")
+        return File(perGameConfigDir(), "${titleId.uppercase()}.config.toml")
     }
 
     /** Read-only sparse snapshot. Missing means empty; malformed input is never erased. */

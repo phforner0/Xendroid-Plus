@@ -188,6 +188,8 @@ object SessionLogs {
             if (len > maxBytes) {
                 input.skip(len - maxBytes)
                 zip.write("[truncated: shelved last $maxBytes of $len bytes]\n".toByteArray())
+                // The tail begins mid-line: drop it, as the share export does with its tails.
+                while (input.read().let { it >= 0 && it != '\n'.code }) { }
             }
             input.copyTo(zip)
         }
