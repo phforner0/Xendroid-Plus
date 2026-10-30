@@ -11,7 +11,6 @@
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
-#include "xenia/xbox.h"
 
 #include <assert.h>
 #include <dirent.h>
@@ -300,20 +299,6 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
   }
   closedir(dir);
   return std::move(result);
-}
-
-bool SetAttributes(const std::filesystem::path& path, uint64_t attributes) {
-  struct stat st;
-  if (stat(path.c_str(), &st) != 0) {
-    return false;
-  }
-  mode_t mode = st.st_mode;
-  if (attributes & X_FILE_ATTRIBUTE_READONLY) {
-    mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
-  } else {
-    mode |= S_IWUSR;
-  }
-  return chmod(path.c_str(), mode) == 0;
 }
 
 }  // namespace filesystem

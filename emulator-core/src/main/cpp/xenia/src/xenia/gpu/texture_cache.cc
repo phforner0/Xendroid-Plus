@@ -680,17 +680,23 @@ void TextureCache::Texture::GetSubresourceRange(uint32_t index,
 }
 
 TextureCache::Texture::~Texture() {
-  for (uint32_t i = 0; i < subresource_count_; ++i) {
-    if (subresource_watch_handles_[i]) {
-      texture_cache().shared_memory().UnwatchMemoryRange(
-          subresource_watch_handles_[i]);
+  {
+    // A watch fired by a guest thread unlinks its range and clears the handle
+    // under the global lock, so check the handles under it too, or a stale
+    // range would be unlinked twice, corrupting the watch free lists.
+    auto global_lock = xe::global_critical_region::Acquire();
+    for (uint32_t i = 0; i < subresource_count_; ++i) {
+      if (subresource_watch_handles_[i]) {
+        texture_cache().shared_memory().UnwatchMemoryRange(
+            subresource_watch_handles_[i]);
+      }
     }
-  }
-  if (mips_watch_handle_) {
-    texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
-  }
-  if (base_watch_handle_) {
-    texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
+    if (mips_watch_handle_) {
+      texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
+    }
+    if (base_watch_handle_) {
+      texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
+    }
   }
 
   // Only remove from usage list if we were added to it (track_usage=true).

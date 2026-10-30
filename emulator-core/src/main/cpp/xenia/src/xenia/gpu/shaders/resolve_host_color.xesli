@@ -629,8 +629,8 @@ void XeResolveHostColorFullLoad8RedSamples(
     param_next_after_texture_xe
     param_texture_xe(xe_resolve_host_color_source)) {
   // D3D maps A8 to k_8 with LOW_BLUE, selecting alpha (see
-  // XeResolveUnpack32bpp8ScalarSamples). k_8_A and k_8_B are still unknown, so
-  // they keep the red/blue swap.
+  // XeResolveUnpack32bpp8ScalarSamples). GetResolveInfo hands k_8_A and k_8_B
+  // over as k_8, so they select alpha the same way.
   bool source_alpha =
       resolve_info.dest_swap && resolve_info.dest_format == kXenosFormat_8;
   bool source_blue = resolve_info.dest_swap && !source_alpha;

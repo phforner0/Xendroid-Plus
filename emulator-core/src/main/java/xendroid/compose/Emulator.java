@@ -232,6 +232,7 @@ public class Emulator extends xendroid.emulator.Emulator{
         public long contentSize;  // payload bytes (be u64 from the metadata header)
         public String displayName;
         public byte[] icon;
+        public String packageName;  // the folder install_content gives it
     }
 
     public static class ContentItem {

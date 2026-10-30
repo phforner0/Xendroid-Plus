@@ -124,15 +124,22 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   void CallExtern(const hir::Instr* instr, const Function* function);
   void CallNative(void* fn);
   void CallNativeSafe(void* fn);
-  // Loads the host address for the guest address in w16 into x9.
-  // A direct bl, |direct| without |tail|, takes any entry, and other lookups
-  // only those a branch may take.
+  // Loads the host address for the guest address in w16 into x9. A direct bl,
+  // |direct| without |tail|, takes any entry. Other lookups take Any entries
+  // and check a return site's for a live frame.
   void EmitDynamicCallLookup(bool tail, bool direct = false);
+  // Jumps to the dynamic blr target in x9 on the caller's frame, or falls
+  // through when the records don't allow that.
+  void EmitDropCallingFrame();
   void SetReturnAddress(uint64_t value);
 
   // Backend context register = x19.
   // Points to A64BackendContext (immediately before PPCContext in memory).
   const Xbyak_aarch64::XReg& GetBackendCtxReg() const { return x19; }
+  // Operand for an A64BackendContext field; offset comes from offsetof.
+  Xbyak_aarch64::AdrUimm BackendCtxPtr(size_t offset) const {
+    return Xbyak_aarch64::ptr(x19, static_cast<uint32_t>(offset));
+  }
   // Context register = x20.
   const Xbyak_aarch64::XReg& GetContextReg() const { return x20; }
   // Memory base register = x21.

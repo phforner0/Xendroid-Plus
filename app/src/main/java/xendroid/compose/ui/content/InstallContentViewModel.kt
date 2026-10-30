@@ -106,7 +106,7 @@ class InstallContentViewModel(
         if (meta.contentType == ContentPaths.PROFILE_CONTENT_TYPE)
             return PreCheck.Ok(name, label)
         if (meta.titleId == null) return PreCheck.Ok(name, label)
-        val pkgDir = File(ContentPaths.contentDir(meta.titleId, meta.contentType), src.name)
+        val pkgDir = File(ContentPaths.contentDir(meta.titleId, meta.contentType), meta.packageName)
         return if (pkgDir.exists()) PreCheck.Overwrite(name) else PreCheck.Ok(name, label)
     }
 
