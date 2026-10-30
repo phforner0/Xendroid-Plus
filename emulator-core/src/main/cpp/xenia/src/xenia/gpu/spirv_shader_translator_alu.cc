@@ -22,7 +22,6 @@
 #include "xenia/gpu/spirv_compatibility.h"
 
 DECLARE_bool(spirv_multiply_zero_test_on_bits);
-DECLARE_bool(spirv_fast_precision_rounding);
 
 namespace xe {
 namespace gpu {

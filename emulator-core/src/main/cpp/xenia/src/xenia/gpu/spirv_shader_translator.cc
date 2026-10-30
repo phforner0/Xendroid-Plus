@@ -120,23 +120,6 @@ DEFINE_int32(
     "GPU");
 
 DEFINE_bool(
-    spirv_fast_precision_rounding, false,
-    "Round results of exp, log, sqrt, rsq and rcp to the 21 mantissa bits of "
-    "the Xenos with an add of half the kept unit in the last place and a "
-    "mask, instead of computing both roundings and selecting (5 instead of 12 "
-    "Adreno instructions each, -6% pixel shader instructions on the Forza "
-    "Horizon shaders). The same arithmetic for every input, including "
-    "infinity, NaN and the finite values that must not round up to infinity; "
-    "read when shaders are translated (startup). Off except for the Forza "
-    "titles it was measured with (game_quirks): on for every title from "
-    "2026-10-05, it turned Prototype's lit scene black on Turnip (Adreno 825 "
-    "and 830) - the ground, buildings and people, while the same shaders with "
-    "the select draw it (frame dump and runtime A/B, POCO F7, 2026-10-28).",
-    "GPU");
-UPDATE_from_bool(spirv_fast_precision_rounding, 2026, 10, 5, 12, false);
-UPDATE_from_bool(spirv_fast_precision_rounding, 2026, 10, 28, 22, true);
-
-DEFINE_bool(
     spirv_texture_sign_branch, true,
     "Convert gamma texture components to linear only inside a branch on "
     "whether any component of the fetch is gamma (a uniform condition), "
@@ -149,7 +132,7 @@ DEFINE_bool(
     "per fetch, so this pays off unless most fetched textures are gamma (see "
     "the TexSigns lines of pm4_bin_trace). Same results; read when shaders "
     "are translated (startup). On for every title since 2026-10-05 (exact; "
-    "Forza Horizon +3% fps with spirv_fast_precision_rounding).",
+    "Forza Horizon +3% fps with the fast 21-bit rounding of the time).",
     "GPU");
 UPDATE_from_bool(spirv_texture_sign_branch, 2026, 10, 5, 11, false);
 
