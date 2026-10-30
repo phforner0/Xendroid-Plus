@@ -73,6 +73,23 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
+    resolve_fixed16_bias_copies_integers, false,
+    "Full resolves of a 16-bit fixed render target (k_16_16, k_16_16_16_16) "
+    "to the same format as signed integers with an exponent bias of 10 or "
+    "more write its fixed-point integers (10 fractional bits) scaled by "
+    "2^(bias - 10), which is what Xenia Edge's resolve shaders write (here, "
+    "accurate_resolve_number_formats with resolve_copy_dest_number_packing, "
+    "which keep doing it when on), without the cost those put in every "
+    "resolve shader. From one sample the bits are the same; an average of "
+    "samples ending in a negative half rounds up, where those round away "
+    "from zero. Otherwise such destinations are packed as unsigned "
+    "fractions, which saturates them. Forza Motorsport 4 resolves its car "
+    "shadow's depth moments that way (game_quirks); saturated, the shadow "
+    "under the car was a black square. No effect with "
+    "snorm16_render_target_full_range off.",
+    "GPU");
+
+DEFINE_bool(
     gamma_decode_pwl_resolve, true,
     "During 8_8_8_8_GAMMA MSAA color resolves, average the samples in linear "
     "space instead of averaging the encoded PWL gamma values directly.\n"
@@ -914,21 +931,6 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
       // format, the draw can still be performed.
       continue;
     }
-    // TODO(Triang3l): Remove the unresearched format logging when it's known
-    // how exactly these formats need to be handled (most importantly what
-    // components need to be stored and in which order).
-    switch (stream.format) {
-      case xenos::ColorFormat::k_8_A:
-      case xenos::ColorFormat::k_8_B:
-      case xenos::ColorFormat::k_8_8_8_8_A:
-        XELOGW(
-            "Memexport done to an unresearched format {}, report the game to "
-            "Xenia developers!",
-            FormatInfo::GetName(format_info.format));
-        break;
-      default:
-        break;
-    }
     uint32_t stream_size_bytes =
         stream.index_count * (format_info.bits_per_pixel >> 3);
     // Mask to physical like the shader - the guest may use a mirror window.
@@ -1229,25 +1231,16 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     dest_format = DepthRenderTargetToTextureFormat(rb_depth_info.depth_format);
   } else {
     dest_format = xenos::TextureFormat(rb_copy_dest_info.copy_dest_format);
-    // For development feedback - not much known about these formats currently.
-    xenos::TextureFormat dest_closest_format;
     switch (dest_format) {
       case xenos::TextureFormat::k_8_A:
       case xenos::TextureFormat::k_8_B:
-        dest_closest_format = xenos::TextureFormat::k_8;
+        dest_format = xenos::TextureFormat::k_8;
         break;
       case xenos::TextureFormat::k_8_8_8_8_A:
-        dest_closest_format = xenos::TextureFormat::k_8_8_8_8;
+        dest_format = xenos::TextureFormat::k_8_8_8_8;
         break;
       default:
-        dest_closest_format = dest_format;
-    }
-    if (dest_format != dest_closest_format) {
-      XELOGW(
-          "Resolving to format {}, which is untested - treating like {}. "
-          "Report the game to Xenia developers!",
-          FormatInfo::GetName(dest_format),
-          FormatInfo::GetName(dest_closest_format));
+        break;
     }
   }
 
@@ -1495,13 +1488,44 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
   // Override with the depth format to make sure the shader doesn't have any
   // reason to try to do k_8_8_8_8 packing.
   info_out.copy_dest_info.copy_dest_format = xenos::ColorFormat(dest_format);
+  // With resolve_fixed16_bias_copies_integers, a 16-bit fixed render target
+  // resolved to the same 16-bit format as signed integers with an exponent
+  // bias of 10 or more gets its fixed-point integers (10 fractional bits)
+  // scaled by 2^(bias - 10), through the EDRAM encoding: what Xenia Edge's
+  // resolve shaders write, and the accurate ones here with
+  // resolve_copy_dest_number_packing, which then do it themselves. From one
+  // sample the scaled values are integers and the bits are the same; an
+  // average of samples ending in a negative half rounds up, where those round
+  // away from zero. Forza Motorsport 4 renders its
+  // car shadow's depth moments with a +5 render target bias (the clear, 1, is
+  // the largest), resolves them as signed integers with +10 and samples the
+  // texture as integers times 2^-15; packed as unsigned fractions, every texel
+  // was 0xFFFF and the shadow under the car a black square. Not with the
+  // truncated -1...1 host formats, whose values already lack the range.
+  bool copies_fixed16_integers = false;
+  if (cvars::resolve_fixed16_bias_copies_integers &&
+      !(cvars::accurate_resolve_number_formats &&
+        cvars::resolve_copy_dest_number_packing) &&
+      !is_depth && exp_bias >= 10 &&
+      rb_copy_dest_info.copy_dest_number ==
+          xenos::SurfaceNumberFormat::kSignedInteger) {
+    auto source_format =
+        xenos::ColorRenderTargetFormat(color_edram_info.format);
+    copies_fixed16_integers =
+        (source_format == xenos::ColorRenderTargetFormat::k_16_16 &&
+         dest_format == xenos::TextureFormat::k_16_16 &&
+         !fixed_rg16_truncated_to_minus_1_to_1) ||
+        (source_format == xenos::ColorRenderTargetFormat::k_16_16_16_16 &&
+         dest_format == xenos::TextureFormat::k_16_16_16_16 &&
+         !fixed_rgba16_truncated_to_minus_1_to_1);
+  }
   if (!cvars::resolve_copy_dest_number_packing) {
     // A title asking for another number format than the one packed is told
     // which settings would honour it - Crysis 3 lost its lighting to that,
     // resolving 7e3 to unsigned integer destinations with exponent biases.
     const xenos::SurfaceNumberFormat requested_number =
         rb_copy_dest_info.copy_dest_number;
-    if (!is_depth &&
+    if (!is_depth && !copies_fixed16_integers &&
         requested_number !=
             xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction &&
         requested_number != xenos::SurfaceNumberFormat::kFloat) {
@@ -1520,6 +1544,13 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     // format test below, so a raw copy stays eligible exactly as it used to.
     info_out.copy_dest_info.copy_dest_number =
         xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction;
+  }
+  if (copies_fixed16_integers) {
+    info_out.copy_dest_info.copy_dest_format = xenos::ColorFormat(
+        dest_format == xenos::TextureFormat::k_16_16
+            ? xenos::TextureFormat::k_16_16_EDRAM
+            : xenos::TextureFormat::k_16_16_16_16_EDRAM);
+    exp_bias -= 10;
   }
   // Handle k_16_16 and k_16_16_16_16 range.
   info_out.copy_dest_info.copy_dest_exp_bias = exp_bias;
