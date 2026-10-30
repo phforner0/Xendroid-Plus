@@ -22,12 +22,15 @@
 
 #include "xenia/apu/nop/nop_audio_system.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
 #include "xenia/config.h"
 #include "xenia/emulator.h"
 #include "xenia/patcher/patcher.h"
+#include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
+#include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/null/null_graphics_system.h"
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #include "xenia/hid/nop/nop_hid.h"
@@ -870,6 +873,33 @@ namespace ae{
         // (GraphicsSystem::FlushPipelineCache is not present on this baseline).
         // gs->FlushPipelineCache(/*timeout_ms=*/1500);
         (void)gs;
+    }
+    bool frame_trace_available(){
+        return XE_ENABLE_TRACE_WRITER_INSTRUMENTATION == 1;
+    }
+    bool request_frame_trace(){
+#if XE_ENABLE_TRACE_WRITER_INSTRUMENTATION == 1
+        if(!g_windowed_app_ref || !g_windowed_app_ref->emu) return false;
+        xe::Emulator* e = g_windowed_app_ref->emu.get();
+        xe::gpu::GraphicsSystem* gs = e->graphics_system();
+        xe::gpu::CommandProcessor* cp = gs ? gs->command_processor() : nullptr;
+        if(!cp) return false;
+        // Made here, where a failure is a return value: the trace writer's own
+        // create_directories throws on the GPU thread when it fails.
+        std::filesystem::path dir = e->storage_root() / "traces";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if(ec){
+            XELOGE("GPU trace: can't create {}: {}", xe::path_to_utf8(dir), ec.message());
+            return false;
+        }
+        // The request's state belongs to the GPU thread; the trace starts at
+        // its next swap and ends at the one after.
+        cp->CallInThread([cp, dir]() { cp->RequestFrameTrace(dir); });
+        return true;
+#else
+        return false;
+#endif
     }
     bool is_paused(){
         if(!g_windowed_app_ref || !g_windowed_app_ref->emu) return false;

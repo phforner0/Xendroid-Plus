@@ -762,6 +762,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         if (trace_state_ == TraceState::kSingleFrame) {
           trace_state_ = TraceState::kDisabled;
           trace_writer_.Close();
+          XELOGI("GPU trace: frame written");
         }
       } else if (trace_state_ == TraceState::kSingleFrame) {
         // New trace request - we only start tracing at the beginning of a
@@ -771,8 +772,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
             executable_module ? executable_module->title_id() : 0;
         auto file_name = fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
         auto path = trace_frame_path_ / file_name;
-        trace_writer_.Open(path, title_id);
-        InitializeTrace();
+        if (trace_writer_.Open(path, title_id)) {
+          XELOGI("GPU trace: capturing frame {} to {}", counter_ - 1,
+                 xe::path_to_utf8(path));
+          InitializeTrace();
+        } else {
+          // Not left pending, which would try again at every swap.
+          XELOGE("GPU trace: can't write {}", xe::path_to_utf8(path));
+          trace_state_ = TraceState::kDisabled;
+        }
       }
     }
 #endif

@@ -1291,6 +1291,9 @@ static jlongArray j_presenter_work(JNIEnv* env, jobject thiz) {
     if (array) env->SetLongArrayRegion(array, 0, 3, values);
     return array;
 }
+// The diagnostic build's "Capture frame" (ae::request_frame_trace).
+static jboolean j_frame_trace_available(JNIEnv* env, jobject thiz) { return ae::frame_trace_available(); }
+static jboolean j_request_frame_trace(JNIEnv* env, jobject thiz) { return ae::request_frame_trace(); }
 // The in-game menu's GPU options (gpu_live_options.h), from the command
 // processor's next frame.
 static void j_set_live_option(JNIEnv* env, jobject thiz, jint option, jint value) {
@@ -2079,6 +2082,8 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"set_slot_connected", "(IZLjava/lang/String;)V", (void *) j_set_slot_connected}
             ,{"rumble_state", "()[J", (void *) j_rumble_state}
             ,{"set_fatal_report_path", "(Ljava/lang/String;)V", (void *) j_set_fatal_report_path}
+            ,{"frame_trace_available", "()Z", (void *) j_frame_trace_available}
+            ,{"request_frame_trace", "()Z", (void *) j_request_frame_trace}
             ,{"presenter_work", "()[J", (void *) j_presenter_work}
             ,{"set_frame_generation", "(ZIF)V", (void *) j_set_frame_generation}
             ,{"presentation_state", "()[J", (void *) j_presentation_state}

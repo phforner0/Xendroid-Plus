@@ -102,6 +102,9 @@ enum class InGameAction(val kind: RowKind) {
     SHARE_LOGS(RowKind.BUTTON), RESUME(RowKind.BUTTON), QUIT(RowKind.BUTTON),
     /** The game's picture as it is on screen, without the menu or the HUD, saved to Pictures. */
     SCREENSHOT(RowKind.BUTTON),
+    /** The next frame's GPU commands to a trace (.xtr), for Xenia Edge's trace viewer; only in
+     *  the diagnostic build ([InGameMenuState.frameTrace]). */
+    CAPTURE_FRAME(RowKind.BUTTON),
 
     /** U01: shows or hides the category's advanced options (it stays where it is in the list). */
     MORE_OPTIONS(RowKind.BUTTON),
@@ -144,7 +147,8 @@ val inGamePageGroups: Map<InGamePage, List<MenuGroup>> = mapOf(
         MenuGroup(R.string.menu_group_sound, listOf(InGameAction.VOLUME, InGameAction.MUTE)),
         MenuGroup(R.string.menu_group_game_changes, listOf(InGameAction.AUTO_SAVE, InGameAction.UNDO_SESSION, InGameAction.MAKE_GLOBAL)),
         MenuGroup(R.string.menu_group_menu, listOf(InGameAction.PAUSE_ON_OPEN)),
-        MenuGroup(R.string.menu_group_session, listOf(InGameAction.SCREENSHOT, InGameAction.MARK_SCENE, InGameAction.SHARE_LOGS,
+        MenuGroup(R.string.menu_group_session, listOf(InGameAction.SCREENSHOT, InGameAction.CAPTURE_FRAME,
+            InGameAction.MARK_SCENE, InGameAction.SHARE_LOGS,
             InGameAction.RESUME, InGameAction.QUIT)),
     ),
 )
@@ -184,6 +188,8 @@ data class InGameMenuState(
     val logSelection: Int = 0,
     /** Developer interface (L02); Player hides [developerActions]. */
     val developer: Boolean = true,
+    /** The core has the GPU trace writer (the diagnostic build); otherwise no [InGameAction.CAPTURE_FRAME]. */
+    val frameTrace: Boolean = false,
     /** U01: categories whose "More options" are open. */
     val advanced: Set<InGamePage> = emptySet(),
     /** Round 2: the chip under the controller's cursor in a [RowKind.MULTI] row. */
@@ -193,7 +199,7 @@ data class InGameMenuState(
      *  their groups, then [InGameAction.MORE_OPTIONS] when the category has advanced ones, then
      *  those (still in their groups) when open. */
     fun actions(page: InGamePage = this.page): List<InGameAction> {
-        val shown = inGamePageActions.getValue(page).filter { developer || it !in developerActions }
+        val shown = inGamePageActions.getValue(page).filter(::isShown)
         val (more, common) = shown.partition { it in advancedActions }
         if (more.isEmpty()) return common
         return common + InGameAction.MORE_OPTIONS + if (page in advanced) more else emptyList()
@@ -201,7 +207,10 @@ data class InGameMenuState(
 
     /** How many advanced options the category holds (for the "More options" label). */
     fun advancedCount(page: InGamePage = this.page): Int =
-        inGamePageActions.getValue(page).count { it in advancedActions && (developer || it !in developerActions) }
+        inGamePageActions.getValue(page).count { it in advancedActions && isShown(it) }
+
+    private fun isShown(action: InGameAction): Boolean =
+        (developer || action !in developerActions) && (frameTrace || action != InGameAction.CAPTURE_FRAME)
 
     /** Opens or closes the category's advanced options; the toggle keeps its place and selection. */
     fun toggleAdvanced(): InGameMenuState {

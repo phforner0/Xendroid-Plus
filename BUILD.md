@@ -196,6 +196,16 @@ On low-RAM Linux hosts set `XENDROID_NINJA_JOBS=2`. Keep `JAVA_HOME` on persiste
 storage; `/tmp` downloads disappear when WSL restarts. Copying sources to ext4
 before building avoids the heavy NTFS/WSL compilation penalty.
 
+### Diagnostic build (GPU frame capture)
+
+`XENDROID_GPU_TRACE=true ./gradlew :app:assembleRelease` keeps the GPU trace writer
+that a normal build leaves out (`-DXENIA_ENABLE_GPU_TRACE=ON`; its hooks cost
+0.4–0.6% CPU, measured by upstream). The in-game menu then offers **Capture frame**
+beside Screenshot: the next whole frame's GPU commands go to `traces/<title>_<frame>.xtr`
+in the app's storage, and the log says when it is written. The file is in Xenia
+Edge's trace format, with the EDRAM and the frame's textures, for its trace viewer
+and dump on the desktop. Build it for a bug report, not for players.
+
 ## Windows notes
 
 The vendored `xenia/third_party` tree is deep; combined with Gradle's

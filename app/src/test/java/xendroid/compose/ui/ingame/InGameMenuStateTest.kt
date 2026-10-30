@@ -92,6 +92,19 @@ class InGameMenuStateTest {
         assertTrue(InGameAction.MORE_OPTIONS in InGameMenuState().actions(InGamePage.SYSTEM))
     }
 
+    @Test fun captureFrameOnlyShowsInTheDiagnosticBuild() {
+        val normal = InGameMenuState().show(pause = true).actions(InGamePage.SESSION)
+        assertTrue(InGameAction.CAPTURE_FRAME !in normal)
+        assertTrue(InGameAction.SCREENSHOT in normal)
+        // In both interface modes, beside the screenshot.
+        for (developer in listOf(true, false)) {
+            val diagnostic = InGameMenuState(developer = developer, frameTrace = true).show(pause = true)
+                .actions(InGamePage.SESSION)
+            assertEquals(diagnostic.indexOf(InGameAction.SCREENSHOT) + 1, diagnostic.indexOf(InGameAction.CAPTURE_FRAME))
+            assertEquals(normal.size + 1, diagnostic.size)
+        }
+    }
+
     /** Round 2: a row of chips (the HUD's metrics) has a cursor of its own for ←→. */
     @Test fun aChipCursorMovesWithinItsRowAndStartsOverElsewhere() {
         val row = InGameMenuState().show(pause = true).copy(page = InGamePage.HUD).on(InGameAction.HUD_METRICS)

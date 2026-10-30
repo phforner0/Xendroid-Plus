@@ -193,6 +193,10 @@ class EmulatorSession {
     fun shaderCompileStats(): LongArray? = if (booted) core.shader_compile_stats() else null
     /** {backend, blocks played, blocks concealed, device xruns} since the process started; null before boot. */
     fun audioRunStats(): LongArray? = if (booted) core.audio_run_stats() else null
+    /** The diagnostic build's "Capture frame": whether the core has the GPU trace writer. */
+    fun frameTraceAvailable(): Boolean = booted && core.frame_trace_available()
+    /** The next whole frame the GPU runs, to <storage root>/traces; false when it can't. */
+    fun requestFrameTrace(): Boolean = booted && core.request_frame_trace()
     /** PRE-boot: where the core leaves a fatal error's message before aborting. */
     fun setFatalReportPath(path: String?) = core.set_fatal_report_path(path)
     fun presenterWork(): LongArray = if (booted) core.presenter_work() else longArrayOf(0, 0, 0)
