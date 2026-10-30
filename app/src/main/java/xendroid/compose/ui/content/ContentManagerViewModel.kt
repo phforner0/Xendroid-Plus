@@ -160,7 +160,7 @@ class ContentManagerViewModel(
             EmulatorRuntime.ensureLoaded()
             fun describe(file: File, folder: String?): FoundPackage? {
                 val meta = metadata.readContentHeader(file.absolutePath) ?: return null
-                val installed = meta.titleId?.let { File(ContentPaths.contentDir(it, meta.contentType), file.name).exists() } == true
+                val installed = meta.titleId?.let { File(ContentPaths.contentDir(it, meta.contentType), meta.packageName).exists() } == true
                 val version = if (meta.contentType == ContentPaths.TU_CONTENT_TYPE) ContentVersion.ofPackage(file) else null
                 return FoundPackage(file.absolutePath, file.name, meta.titleId, meta.contentType, meta.displayName.ifBlank { file.name },
                     file.length(), file.lastModified(), folder, installed, version)
@@ -321,7 +321,7 @@ class ContentManagerViewModel(
                 appContext.getString(xendroid.compose.R.string.cm_wrong_title, meta.titleId ?: "?", titleId ?: "?"))
         val name = meta.displayName.ifBlank { File(srcPath).name }
         storageShortfall(appContext, meta.contentSize)?.let { return PreCheck.Reject(it) }
-        val pkgDir = File(ContentPaths.contentDir(meta.titleId, meta.contentType), File(srcPath).name)
+        val pkgDir = File(ContentPaths.contentDir(meta.titleId, meta.contentType), meta.packageName)
         return if (pkgDir.exists()) PreCheck.Overwrite(name) else PreCheck.Ok(name)
     }
 

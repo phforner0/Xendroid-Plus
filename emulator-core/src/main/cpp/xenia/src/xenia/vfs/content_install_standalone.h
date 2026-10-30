@@ -75,6 +75,12 @@ X_STATUS DeleteInstalledContent(const std::filesystem::path& content_root,
                                 uint32_t title_id, uint32_t content_type,
                                 const std::string& pkg_dir);
 
+// Renames the packages of title_id under XUID 0 whose names the content calls
+// refuse, which installs before FatxPackageName could leave, and their
+// headers, to names they take. Blocking file I/O.
+void RenameUnusablePackages(const std::filesystem::path& content_root,
+                            uint32_t title_id);
+
 }  // namespace vfs
 }  // namespace xe
 
