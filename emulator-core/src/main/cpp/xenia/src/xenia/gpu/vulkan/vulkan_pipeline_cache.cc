@@ -859,6 +859,21 @@ void VulkanPipelineCache::RefreshPipelineLayoutIfStale(
   }
 }
 
+namespace {
+// XenDroid: a discrete or continuous tessellated draw of triangles or quads whose
+// domain shader reads the indices of all the corners of a patch (r1), as opposed
+// to the single patch index of one with patches as its guest primitive type.
+bool IsDomainControlPointIndexed(uint64_t vertex_shader_modification) {
+  const Shader::HostVertexShaderType host_vertex_shader_type =
+      SpirvShaderTranslator::Modification(vertex_shader_modification)
+          .vertex.host_vertex_shader_type;
+  return host_vertex_shader_type ==
+             Shader::HostVertexShaderType::kTriangleDomainCPIndexed ||
+         host_vertex_shader_type ==
+             Shader::HostVertexShaderType::kQuadDomainCPIndexed;
+}
+}  // namespace
+
 bool VulkanPipelineCache::ConfigurePipeline(
     VulkanShader::VulkanTranslation* vertex_shader,
     VulkanShader::VulkanTranslation* pixel_shader,
@@ -984,7 +999,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
     // For adaptive mode, we always use multi-control-point (per-edge factors).
     // For discrete/continuous, the host vertex shader type determines this.
     bool use_control_point_count =
-        (description.tessellation_mode == PipelineTessellationMode::kAdaptive);
+        description.tessellation_mode == PipelineTessellationMode::kAdaptive ||
+        IsDomainControlPointIndexed(description.vertex_shader_modification);
     tessellation_control_shader = GetTessellationControlShader(
         description.tessellation_mode, description.tessellation_patch,
         use_control_point_count);
@@ -3052,9 +3068,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     // Determine patch control point count based on mode and patch type.
     // For adaptive mode, we use the actual patch corner count (3 for triangles,
     // 4 for quads) since each control point has its own edge factor.
-    // For discrete/continuous modes, we use 1 control point (the Xenos vertex
-    // shader receives the patch index and computes all corners internally).
-    if (description.tessellation_mode == PipelineTessellationMode::kAdaptive) {
+    // For discrete/continuous modes, we use 1 control point if the Xenos vertex
+    // shader receives the patch index and computes all corners internally, and
+    // the corners if it receives their indices. Halo: Reach's faces, drawn with
+    // the latter with 1 control point, each index being a patch, were invisible.
+    if (description.tessellation_mode == PipelineTessellationMode::kAdaptive ||
+        IsDomainControlPointIndexed(description.vertex_shader_modification)) {
       tessellation_state.patchControlPoints =
           (description.tessellation_patch ==
            PipelineTessellationPatchType::kTriangle)
@@ -3553,8 +3572,10 @@ void VulkanPipelineCache::InitializeShaderStorage(
         tessellation_vertex_shader =
             GetTessellationVertexShader(pipeline_description.tessellation_mode);
         bool use_control_point_count =
-            (pipeline_description.tessellation_mode ==
-             PipelineTessellationMode::kAdaptive);
+            pipeline_description.tessellation_mode ==
+                PipelineTessellationMode::kAdaptive ||
+            IsDomainControlPointIndexed(
+                pipeline_description.vertex_shader_modification);
         tessellation_control_shader = GetTessellationControlShader(
             pipeline_description.tessellation_mode,
             pipeline_description.tessellation_patch, use_control_point_count);
