@@ -546,6 +546,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         result = COMMAND_PROCESSOR::ExecutePacketType3_NOP(packet, count);
         break;
       case PM4_INTERRUPT:
+        ++guest_sync_count_;
         result = COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(packet, count);
         break;
       case PM4_XE_SWAP:
@@ -557,6 +558,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
                                                                        count);
         break;
       case PM4_WAIT_REG_MEM:
+        ++guest_sync_count_;
         result =
             COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(packet, count);
         break;
@@ -575,14 +577,17 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
             COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(packet, count);
         break;
       case PM4_EVENT_WRITE:
+        ++guest_sync_count_;
         result =
             COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE(packet, count);
         break;
       case PM4_EVENT_WRITE_SHD:
+        ++guest_sync_count_;
         result = COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(packet,
                                                                        count);
         break;
       case PM4_EVENT_WRITE_EXT:
+        ++guest_sync_count_;
         result = COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(packet,
                                                                        count);
         break;
@@ -735,6 +740,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         break;
       }
       case PM4_WAIT_FOR_IDLE: {
+        ++guest_sync_count_;
         // This opcode is used by 5454084E while going / being ingame.
         assert_true(count == 1);
         uint32_t value = reader_.ReadAndSwap<uint32_t>();
@@ -1611,12 +1617,16 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
   // merge_tiling_bands: draws of an earlier band aren't repeated.
   if (draw_succeeded && XE_UNLIKELY(tiling_band_ >= 0) &&
       !COMMAND_PROCESSOR::PrepareTilingBandDraw()) {
+    ++guest_sync_count_;
     return true;
   }
 
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
+    if (viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z) {
+      // Not issued, but a title could still wait for exports with such a draw.
+      ++guest_sync_count_;
+    } else {
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
       // shader has memexport.
       // TODO(Triang3l || JoelLinn): Handle this properly in the render
