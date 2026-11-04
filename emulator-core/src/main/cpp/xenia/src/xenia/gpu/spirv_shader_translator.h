@@ -137,6 +137,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // scaling. Doesn't affect fetch offsets, those follow texture scale, not
       // from the draw. This is only set when the draw is native because of a
       // set scale threshold (FBO only).
+      // XenDroid: without resolution scaling, which the threshold needs, it
+      // instead means the samples of a 4x draw are pixels here, so PsParamGen
+      // halves the position (no bits are left in this structure).
       uint32_t resolution_scale_native : 1;
     } pixel;
     uint64_t value = 0;

@@ -4005,15 +4005,26 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     assert_true(input_fragment_coordinates_ != spv::NoResult);
     id_vector_temp_.clear();
     id_vector_temp_.push_back(const_int_0_);
+    // XenDroid: resolution_scale_native without resolution scaling: the samples
+    // of a 4x draw are pixels here, its position half of theirs.
+    const bool param_gen_samples_as_pixels =
+        modification.pixel.resolution_scale_native &&
+        draw_resolution_scale_x_ == 1 && draw_resolution_scale_y_ == 1;
+    spv::Id param_gen_x_coordinate = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassInput,
+                                    input_fragment_coordinates_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    if (param_gen_samples_as_pixels) {
+      param_gen_x_coordinate = builder_->createBinOp(
+          spv::OpFMul, type_float_, param_gen_x_coordinate,
+          builder_->makeFloatConstant(0.5f));
+    }
     spv::Id param_gen_x = builder_->createUnaryBuiltinCall(
         type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs,
         builder_->createUnaryBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
-            builder_->createLoad(
-                builder_->createAccessChain(spv::StorageClassInput,
-                                            input_fragment_coordinates_,
-                                            id_vector_temp_),
-                spv::NoPrecision)));
+            param_gen_x_coordinate));
     // Apply resolution scale inversion after truncating.
     if (GetCurrentDrawResolutionScaleX() > 1) {
       param_gen_x = builder_->createBinOp(
@@ -4047,15 +4058,21 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     // Y - pixel Y .0 in the magnitude, is point in the sign bit.
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeIntConstant(1));
+    spv::Id param_gen_y_coordinate = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassInput,
+                                    input_fragment_coordinates_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    if (param_gen_samples_as_pixels) {
+      param_gen_y_coordinate = builder_->createBinOp(
+          spv::OpFMul, type_float_, param_gen_y_coordinate,
+          builder_->makeFloatConstant(0.5f));
+    }
     spv::Id param_gen_y = builder_->createUnaryBuiltinCall(
         type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs,
         builder_->createUnaryBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
-            builder_->createLoad(
-                builder_->createAccessChain(spv::StorageClassInput,
-                                            input_fragment_coordinates_,
-                                            id_vector_temp_),
-                spv::NoPrecision)));
+            param_gen_y_coordinate));
     // Apply resolution scale inversion after truncating.
     if (GetCurrentDrawResolutionScaleY() > 1) {
       param_gen_y = builder_->createBinOp(

@@ -491,9 +491,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // The key of the current depth surface: depth base | pitch << 16.
   uint32_t GetMsaa4xDepthSurface() const;
   std::unordered_set<uint32_t> msaa_4x_scene_depth_surfaces_;
-  // vulkan_samples_as_pixels_simple_ps when msaa_4x_scene_depth_surfaces_ was
-  // filled.
-  bool msaa_4x_scene_depth_surfaces_simple_ps_ = false;
+  // vulkan_samples_as_pixels_simple_ps and vulkan_samples_as_pixels_coarse when
+  // msaa_4x_scene_depth_surfaces_ was filled.
+  uint32_t msaa_4x_scene_depth_surfaces_options_ = 0;
+  // vulkan_samples_as_pixels_coarse: this draw is shaded once per 2x2 pixels.
+  bool draw_samples_as_pixels_coarse_ = false;
 
   void InitializeTrace() override;
 

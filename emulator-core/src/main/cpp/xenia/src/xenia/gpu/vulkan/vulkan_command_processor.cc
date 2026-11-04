@@ -206,6 +206,19 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
+    vulkan_samples_as_pixels_coarse, false,
+    "With vulkan_depth_4x_as_1x and vulkan_fragment_shading_rate: also render "
+    "4x MSAA draws whose pixel shader reads textures or the position into the "
+    "1x surface of their samples, shaded once per 2x2 pixels - the same "
+    "invocations as per 4x pixel - and don't count their color as making a "
+    "depth surface a multisampled scene's. A title may switch its depth "
+    "between 1x and 4x several times a frame for just a few such draws, like "
+    "the half-resolution soft particles of Halo: Reach (11000 of its 24000 "
+    "transferred tiles a frame). Can be switched at runtime "
+    "(debug.xendroid.samples_as_pixels_coarse).",
+    "GPU");
+
+DEFINE_bool(
     vulkan_samples_as_pixels_2x, false,
     "With vulkan_depth_4x_as_1x: a 4x MSAA draw it would render into the 1x "
     "surface of its samples, over EDRAM a 2x MSAA surface of the same pitch "
@@ -633,6 +646,9 @@ void PollDebugPropertyOverrides(CommandProcessor& command_processor) {
   PollDebugPropertyOverride("debug.xendroid.samples_as_pixels_ps",
                             "vulkan_samples_as_pixels_simple_ps",
                             cvars::vulkan_samples_as_pixels_simple_ps);
+  PollDebugPropertyOverride("debug.xendroid.samples_as_pixels_coarse",
+                            "vulkan_samples_as_pixels_coarse",
+                            cvars::vulkan_samples_as_pixels_coarse);
   PollDebugPropertyOverride("debug.xendroid.samples_as_pixels_2x",
                             "vulkan_samples_as_pixels_2x",
                             cvars::vulkan_samples_as_pixels_2x);
@@ -7075,8 +7091,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // vulkan_shading_rate: coarse shading of the multisampled scene's draws,
   // where the rate is allowed with what the pixel shader writes.
   draw_shading_rate_ = 0;
-  if (cvars::vulkan_shading_rate && pixel_shader &&
-      device_properties.pipelineFragmentShadingRate) {
+  if (draw_samples_as_pixels_coarse_ && depth_4x_as_1x) {
+    // Once per 2x2 pixels, the samples of a 4x pixel.
+    draw_shading_rate_ = 3;
+  } else if (cvars::vulkan_shading_rate && pixel_shader &&
+             device_properties.pipelineFragmentShadingRate) {
     const xenos::MsaaSamples guest_msaa_samples =
         regs.Get<reg::RB_SURFACE_INFO>().msaa_samples;
     if (guest_msaa_samples != xenos::MsaaSamples::k1X &&
@@ -7989,10 +8008,11 @@ bool VulkanCommandProcessor::RewriteMsaa4xSurfaceInfoForDraw(
   }
   // The scene classification depends on which pixel shaders may run per 1x
   // pixel.
-  if (msaa_4x_scene_depth_surfaces_simple_ps_ !=
-      cvars::vulkan_samples_as_pixels_simple_ps) {
-    msaa_4x_scene_depth_surfaces_simple_ps_ =
-        cvars::vulkan_samples_as_pixels_simple_ps;
+  const uint32_t scene_options =
+      uint32_t(cvars::vulkan_samples_as_pixels_simple_ps) |
+      (uint32_t(cvars::vulkan_samples_as_pixels_coarse) << 1);
+  if (msaa_4x_scene_depth_surfaces_options_ != scene_options) {
+    msaa_4x_scene_depth_surfaces_options_ = scene_options;
     msaa_4x_scene_depth_surfaces_.clear();
   }
   // A pixel shader whose result doesn't depend on running per 4x pixel rather
@@ -8004,6 +8024,27 @@ bool VulkanCommandProcessor::RewriteMsaa4xSurfaceInfoForDraw(
       !pixel_shader->uses_texture_fetch_instruction_results() &&
       !pixel_shader_uses_position && !pixel_shader->memexport_eM_written() &&
       !regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable;
+  // Any other pixel shader, shaded once per 2x2 pixels where the host can: the
+  // samples of a 4x pixel are 2x2 pixels of the 1x surface, aligned the same
+  // way, and the derivatives span the same texels. Coverage, depth and stencil
+  // stay per pixel, as they were per sample, so not where the shader writes the
+  // depth, which also takes the polygon offset on the host render target path
+  // and may take the conversion to float24.
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      GetVulkanDevice()->properties();
+  const auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  const bool pixel_shader_coarse =
+      pixel_shader && !pixel_shader_simple &&
+      cvars::vulkan_samples_as_pixels_coarse &&
+      !cvars::vulkan_samples_as_pixels_2x &&
+      !pixel_shader->memexport_eM_written() &&
+      !regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable &&
+      device_properties.pipelineFragmentShadingRate &&
+      !pixel_shader->writes_depth() &&
+      !pa_su_sc_mode_cntl.poly_offset_front_enable &&
+      !pa_su_sc_mode_cntl.poly_offset_back_enable &&
+      !cvars::depth_float24_convert_in_pixel_shader;
+  draw_samples_as_pixels_coarse_ = pixel_shader_coarse;
   const uint32_t color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(
                          regs, pixel_shader->writes_color_targets())
@@ -8015,7 +8056,7 @@ bool VulkanCommandProcessor::RewriteMsaa4xSurfaceInfoForDraw(
   // quarter-resolution stencil marking of its 1280x720 lighting).
   const uint32_t depth_surface = GetMsaa4xDepthSurface();
   bool scene;
-  if (color_mask && !pixel_shader_simple) {
+  if (color_mask && !pixel_shader_simple && !pixel_shader_coarse) {
     msaa_4x_scene_depth_surfaces_.insert(depth_surface);
     scene = true;
   } else {
@@ -8026,7 +8067,7 @@ bool VulkanCommandProcessor::RewriteMsaa4xSurfaceInfoForDraw(
   }
   // Depth-only draws (no pixel shader) or simple pixel shaders - nothing then
   // depends on the sample positions or on the pixel shader seeing 4x.
-  if ((pixel_shader && !pixel_shader_simple) ||
+  if ((pixel_shader && !pixel_shader_simple && !pixel_shader_coarse) ||
       texture_cache_->IsDrawResolutionScaled() ||
       uint32_t(surface_info.surface_pitch) * 2 >
           xenos::kTexture2DCubeMaxWidthHeight) {
