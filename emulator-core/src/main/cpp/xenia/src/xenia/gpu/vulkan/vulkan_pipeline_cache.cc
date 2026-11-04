@@ -140,9 +140,10 @@ DEFINE_string(
     "Diagnostics with vulkan_pipeline_statistics: also save the driver's "
     "internal representations (such as the final GPU assembly) of matching "
     "guest pipelines as text files in shader_ir next to the Vulkan pipeline "
-    "cache. A comma-separated list of pixel shader hashes (hex) and/or "
-    "min_fs=N for every pipeline whose fragment shader has at least N "
-    "instructions. Takes effect for pipelines created afterwards.",
+    "cache. A comma-separated list of pixel shader hashes (hex), vs=HASH for "
+    "vertex shaders and/or min_fs=N for every pipeline whose fragment shader "
+    "has at least N instructions. Takes effect for pipelines created "
+    "afterwards.",
     "Vulkan");
 
 DECLARE_bool(vulkan_dynamic_rendering);
@@ -159,7 +160,8 @@ namespace gpu {
 namespace vulkan {
 
 namespace {
-bool MatchesPipelineIrDumpFilter(uint64_t ps_hash, int64_t fs_instructions) {
+bool MatchesPipelineIrDumpFilter(uint64_t vs_hash, uint64_t ps_hash,
+                                 int64_t fs_instructions) {
   const std::string& filter = cvars::vulkan_pipeline_ir_dump;
   size_t begin = 0;
   while (begin < filter.size()) {
@@ -174,6 +176,10 @@ bool MatchesPipelineIrDumpFilter(uint64_t ps_hash, int64_t fs_instructions) {
     }
     if (token.rfind("min_fs=", 0) == 0) {
       if (fs_instructions >= std::strtoll(token.c_str() + 7, nullptr, 10)) {
+        return true;
+      }
+    } else if (token.rfind("vs=", 0) == 0) {
+      if (std::strtoull(token.c_str() + 3, nullptr, 16) == vs_hash) {
         return true;
       }
     } else if (std::strtoull(token.c_str(), nullptr, 16) == ps_hash) {
@@ -323,7 +329,7 @@ void LogPipelineStatistics(const ui::vulkan::VulkanDevice& vulkan_device,
            ps_hash, ps_modification, executables[i].name, line);
   }
   if (!ir_dump_directory.empty() &&
-      MatchesPipelineIrDumpFilter(ps_hash, fs_instructions)) {
+      MatchesPipelineIrDumpFilter(vs_hash, ps_hash, fs_instructions)) {
     DumpPipelineInternalRepresentations(vulkan_device, pipeline, executables,
                                         ir_dump_directory, vs_hash, ps_hash,
                                         ps_modification);
