@@ -491,9 +491,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // The key of the current depth surface: depth base | pitch << 16.
   uint32_t GetMsaa4xDepthSurface() const;
   std::unordered_set<uint32_t> msaa_4x_scene_depth_surfaces_;
-  // vulkan_samples_as_pixels_simple_ps when msaa_4x_scene_depth_surfaces_ was
-  // filled.
-  bool msaa_4x_scene_depth_surfaces_simple_ps_ = false;
+  // vulkan_samples_as_pixels_simple_ps and vulkan_samples_as_pixels_coarse when
+  // msaa_4x_scene_depth_surfaces_ was filled.
+  uint32_t msaa_4x_scene_depth_surfaces_options_ = 0;
+  // vulkan_samples_as_pixels_coarse: this draw is shaded once per 2x2 pixels.
+  bool draw_samples_as_pixels_coarse_ = false;
 
   void InitializeTrace() override;
 
@@ -805,6 +807,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint64_t submissions = 0;
     uint64_t resolves = 0;  // EDRAM resolves issued (churn magnitude)
     uint64_t memexport_awaits = 0;
+    // Draws with memory export, and what each draw's barrier was.
+    uint64_t memexport_draws = 0;
+    uint64_t memexport_draw_barriers[size_t(
+        VulkanSharedMemory::DrawBarrier::kCount)] = {};
     uint64_t readback_awaits = 0;
     // Host-side latency from vkQueueSubmit to the fence being observed
     // completed - includes GPU queue wait, render time and detection delay.
@@ -974,6 +980,23 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // log_gpu_frame_time_breakdown for the awaits).
   std::string memexport_log_value_;
   uint32_t memexport_log_left_ = 0;
+  // debug.xendroid.memexport_trace: logs the next exporting draws.
+  std::string memexport_trace_value_;
+  uint32_t memexport_trace_left_ = 0;
+  // vulkan_memexport_barriers_by_range: this draw's ranges, kept to reuse their
+  // storage.
+  std::vector<std::pair<uint32_t, uint32_t>> memexport_barrier_reads_;
+  std::vector<std::pair<uint32_t, uint32_t>> memexport_barrier_exports_;
+  bool memexport_barriers_by_range_last_ = false;
+  // The batch of exporting draws going on (DrawExportTracker), and what a draw
+  // has to match to be a part of it.
+  uint64_t memexport_batch_ = 0;
+  uint64_t memexport_batch_vertex_shader_ = 0;
+  uint64_t memexport_batch_pixel_shader_ = 0;
+  uint64_t memexport_batch_next_draw_ = 0;
+  uint64_t memexport_batch_sync_count_ = 0;
+  // All guest draws so far, also those with no effect here.
+  uint64_t guest_draw_count_ = 0;
 
   struct SubmissionWork {
     uint32_t draws = 0;

@@ -392,6 +392,45 @@ static const Quirk kQuirks[] = {
      "the car shadow's depth moments resolve as integers"},
     {0x4D530910, "texture_integer_num_format", true,
      "the car shadow samples its depth moments as integers"},
+    // Halo: Reach, standing in the first mission: 17 fps with none of these, its
+    // limit of 30 fps with them, the sky, the fog and the distant valley matching
+    // (2026-11-04). The steps below are measured with the GPU's timestamps, which
+    // cost a little: 64.4 ms a frame to start with, 35.9 ms with all of them.
+    // Its particles are updated in place by a vertex shader (838B50F94967ACAD)
+    // with memory export, 115 draws of 16 particles each, the others also
+    // exporting or waiting for that:
+    // - Each exporting draw got a barrier, whatever the next draw touched, ending
+    //   the render pass and invalidating the GPU's caches: 53.0 ms, 103 render
+    //   passes instead of 227, by range.
+    // - Each jump of that shader went through a loop and a switch over all its
+    //   labels, up to 43 jumps in 14 iterations: 50.5 ms as if and else.
+    // - Everything that reaches a memory export, there most of it, was rounded
+    //   toward zero in software, which the host can't do in hardware (39184
+    //   instructions, 8.6 ms for those draws, down to 4.9 ms). No exploding or
+    //   z-fighting geometry on foot in the first mission without it: 43.1 ms.
+    // Its half-resolution soft particles (11 draws) kept its depth moving between
+    // 1x and 4x, 24000 tiles a frame, down to 13000 with them in the 1x surface,
+    // shaded once per 2x2 pixels (2.9 ms). The rest are the exact or tested options
+    // of the other titles. NOT spirv_ps_relaxed_math: it darkens the sky and
+    // brightens the valley.
+    {0x4D53085B, "vulkan_memexport_barriers_by_range", true,
+     "barriers only between exports and draws that touch them"},
+    {0x4D53085B, "spirv_structured_forward_jumps", true,
+     "shader jumps as if and else"},
+    {0x4D53085B, "alu_round_toward_zero", false,
+     "vertex math with the host's rounding"},
+    {0x4D53085B, "spirv_vs_relaxed_math", int64_t(1),
+     "no SM3 zero-multiply emulation in vertex shaders"},
+    {0x4D53085B, "spirv_texture_implicit_lod", true,
+     "2D texture fetches with the host's LOD"},
+    {0x4D53085B, "vulkan_fragment_shading_rate", true,
+     "shading 4x draws in the 1x surface once per 2x2 pixels"},
+    {0x4D53085B, "vulkan_depth_4x_as_1x", true,
+     "4x depth-only draws into the 1x surface of their samples"},
+    {0x4D53085B, "vulkan_samples_as_pixels_simple_ps", true,
+     "4x draws with simple pixel shaders into the 1x surface"},
+    {0x4D53085B, "vulkan_samples_as_pixels_coarse", true,
+     "4x draws with textures into the 1x surface, once per 2x2 pixels"},
     // Naruto: Rise of a Ninja: its worker thread 0x18 starts (8265BB68) by
     // calling the routine at +0xEC of its object. When it ran on its
     // creator's CPU right after its creation, the object held the thread's id

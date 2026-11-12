@@ -848,6 +848,9 @@ class CommandProcessor {
 
   uint32_t counter_ = 0;
 
+  // XenDroid: the packets so far that a title could wait for the GPU with.
+  uint64_t guest_sync_count_ = 0;
+
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
 

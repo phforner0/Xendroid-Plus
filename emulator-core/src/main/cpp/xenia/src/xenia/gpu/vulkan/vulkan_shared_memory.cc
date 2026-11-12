@@ -568,6 +568,8 @@ void VulkanSharedMemory::Use(Usage usage,
         buffer_, offset, size, src_stage_mask, dst_stage_mask, src_access_mask,
         dst_access_mask, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
         false);
+    // All the draws' accesses so far are ordered by it.
+    draw_exports_.Clear();
     // Memexport-touching draws are routed to the host-imported buffer, so their
     // writes and the reads that consume them go through host_buffer_, not
     // buffer_. Mirror the same ordering barrier onto it so those GPU
@@ -579,7 +581,88 @@ void VulkanSharedMemory::Use(Usage usage,
           VK_QUEUE_FAMILY_IGNORED, false);
     }
   }
+  // Reads with no barrier after them, for an export to wait for.
+  if (usage == Usage::kRead) {
+    draw_exports_.NoteOtherReads();
+  }
   last_written_range_ = written_range;
+}
+
+VulkanSharedMemory::DrawBarrier VulkanSharedMemory::UseForGuestDraw(
+    const std::pair<uint32_t, uint32_t>* reads, size_t read_count,
+    const std::pair<uint32_t, uint32_t>* exports, size_t export_count,
+    uint64_t export_batch) {
+  // The extent of the exports: what the next barrier has to make available.
+  uint32_t export_start = UINT32_MAX, export_end = 0;
+  for (size_t i = 0; i < export_count; ++i) {
+    export_start = std::min(export_start, exports[i].first);
+    export_end = std::max(export_end, exports[i].first + exports[i].second);
+  }
+  const bool exporting = export_start < export_end;
+  const auto add_draw = [&]() {
+    draw_exports_.AddDraw(reads, read_count, exports, export_count,
+                          export_batch);
+    if (exporting) {
+      const bool written = last_written_range_.second != 0;
+      const uint32_t start =
+          written ? std::min(last_written_range_.first, export_start)
+                  : export_start;
+      const uint32_t end =
+          written ? std::max(last_written_range_.first +
+                                 last_written_range_.second,
+                             export_end)
+                  : export_end;
+      last_written_range_ = std::make_pair(start, end - start);
+    }
+  };
+  // As ever from other uses of the buffer, and the first export after them,
+  // which aren't tracked, has to wait for them.
+  if ((last_usage_ != Usage::kRead &&
+       last_usage_ != Usage::kGuestDrawReadWrite) ||
+      (last_usage_ == Usage::kRead && exporting)) {
+    const Usage usage = exporting ? Usage::kGuestDrawReadWrite : Usage::kRead;
+    Use(usage);
+    add_draw();
+    return exporting ? DrawBarrier::kFirstExport : DrawBarrier::kNone;
+  }
+  DrawBarrier result =
+      last_written_range_.second ? DrawBarrier::kElided : DrawBarrier::kNone;
+  VkPipelineStageFlags stage_mask;
+  VkAccessFlags access_mask;
+  GetUsageMasks(Usage::kGuestDrawReadWrite, stage_mask, access_mask);
+  switch (draw_exports_.Check(reads, read_count, exports, export_count,
+                              export_batch)) {
+    case DrawExportTracker::Need::kCommit:
+      if (!exporting) {
+        Use(Usage::kRead);
+        draw_exports_.AddDraw(reads, read_count, exports, export_count,
+                              export_batch);
+        return DrawBarrier::kReadAfterExport;
+      }
+      // Between two draws of the same usage, the masks on both sides are that
+      // usage's. Only the ranges written have to be made visible.
+      command_processor_.PushBufferMemoryBarrier(
+          buffer_, VkDeviceSize(last_written_range_.first),
+          VkDeviceSize(last_written_range_.second), stage_mask, stage_mask,
+          access_mask, access_mask, VK_QUEUE_FAMILY_IGNORED,
+          VK_QUEUE_FAMILY_IGNORED, false);
+      draw_exports_.Clear();
+      last_written_range_ = std::make_pair(uint32_t(0), uint32_t(0));
+      result = DrawBarrier::kExportAfterExport;
+      break;
+    case DrawExportTracker::Need::kWaitForReads:
+      command_processor_.PushBufferMemoryBarrier(
+          buffer_, 0, VK_WHOLE_SIZE, stage_mask, stage_mask,
+          VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT, access_mask,
+          VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+      draw_exports_.ClearReads();
+      result = DrawBarrier::kExportAfterRead;
+      break;
+    default:
+      break;
+  }
+  add_draw();
+  return result;
 }
 
 bool VulkanSharedMemory::CopyToGuestMemory(uint32_t start, uint32_t length) {

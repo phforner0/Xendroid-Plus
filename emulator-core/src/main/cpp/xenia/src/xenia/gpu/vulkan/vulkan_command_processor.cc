@@ -208,6 +208,19 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
+    vulkan_samples_as_pixels_coarse, false,
+    "With vulkan_depth_4x_as_1x and vulkan_fragment_shading_rate: also render "
+    "4x MSAA draws whose pixel shader reads textures or the position into the "
+    "1x surface of their samples, shaded once per 2x2 pixels - the same "
+    "invocations as per 4x pixel - and don't count their color as making a "
+    "depth surface a multisampled scene's. A title may switch its depth "
+    "between 1x and 4x several times a frame for just a few such draws, like "
+    "the half-resolution soft particles of Halo: Reach (11000 of its 24000 "
+    "transferred tiles a frame). Can be switched at runtime "
+    "(debug.xendroid.samples_as_pixels_coarse).",
+    "GPU");
+
+DEFINE_bool(
     vulkan_samples_as_pixels_2x, false,
     "With vulkan_depth_4x_as_1x: a 4x MSAA draw it would render into the 1x "
     "surface of its samples, over EDRAM a 2x MSAA surface of the same pitch "
@@ -382,6 +395,18 @@ DEFINE_bool(
     "option stays off for don't). Red Dead Redemption otherwise writes a "
     "constants descriptor set for nearly every draw (7260 a frame). Read at "
     "startup.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_memexport_barriers_by_range, false,
+    "Shared memory barriers between guest draws with memory export only where "
+    "a draw reads or writes what an earlier one has exported, or writes what "
+    "an earlier one has read, instead of after each exporting draw, whatever "
+    "the next draw touches. Each of them ended the render pass and invalidated "
+    "the GPU's caches. Consecutive exporting draws with the same vertex shader "
+    "aren't ordered with each other: a Xenos draw can't rely on what the one "
+    "right before it has exported. Can be switched at runtime "
+    "(debug.xendroid.memexport_barriers).",
     "Vulkan");
 
 DEFINE_int32(
@@ -623,6 +648,9 @@ void PollDebugPropertyOverrides(CommandProcessor& command_processor) {
   PollDebugPropertyOverride("debug.xendroid.samples_as_pixels_ps",
                             "vulkan_samples_as_pixels_simple_ps",
                             cvars::vulkan_samples_as_pixels_simple_ps);
+  PollDebugPropertyOverride("debug.xendroid.samples_as_pixels_coarse",
+                            "vulkan_samples_as_pixels_coarse",
+                            cvars::vulkan_samples_as_pixels_coarse);
   PollDebugPropertyOverride("debug.xendroid.samples_as_pixels_2x",
                             "vulkan_samples_as_pixels_2x",
                             cvars::vulkan_samples_as_pixels_2x);
@@ -648,6 +676,9 @@ void PollDebugPropertyOverrides(CommandProcessor& command_processor) {
   PollDebugPropertyOverride("debug.xendroid.texture_integer_num_format",
                             "texture_integer_num_format",
                             cvars::texture_integer_num_format);
+  PollDebugPropertyOverride("debug.xendroid.memexport_barriers",
+                            "vulkan_memexport_barriers_by_range",
+                            cvars::vulkan_memexport_barriers_by_range);
   // Read per exporting draw; one read back right away first reads back those
   // still pending.
   PollDebugPropertyOverride("debug.xendroid.memexport_deferred",
@@ -3426,6 +3457,16 @@ void VulkanCommandProcessor::PollFrameDump() {
     XELOGI("debug.xendroid.memexport_log: the next {} exports and awaits",
            memexport_log_left_);
   }
+  char memexport_trace_value[PROP_VALUE_MAX] = {};
+  __system_property_get("debug.xendroid.memexport_trace",
+                        memexport_trace_value);
+  if (memexport_trace_value_ != memexport_trace_value) {
+    memexport_trace_value_ = memexport_trace_value;
+    memexport_trace_left_ =
+        uint32_t(std::max(std::atoi(memexport_trace_value), 0));
+    XELOGI("debug.xendroid.memexport_trace: the next {} exporting draws",
+           memexport_trace_left_);
+  }
   char value[PROP_VALUE_MAX] = {};
   __system_property_get("debug.xendroid.frame_dump", value);
   if (frame_dump_value_ == value) {
@@ -4157,6 +4198,21 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         uint64_t reopens_total = 0;
         for (uint64_t count : s.pass_reopens) {
           reopens_total += count;
+        }
+        if (s.memexport_draws) {
+          auto draw_barriers = [&](VulkanSharedMemory::DrawBarrier kind) {
+            return s.memexport_draw_barriers[size_t(kind)] / f;
+          };
+          XELOGI(
+              "VkMemexport: per frame: exporting draws={:.1f} | barriers: read "
+              "after export={:.1f} export after export={:.1f} export after "
+              "read={:.1f} first export={:.1f} | elided={:.1f}",
+              s.memexport_draws / f,
+              draw_barriers(VulkanSharedMemory::DrawBarrier::kReadAfterExport),
+              draw_barriers(VulkanSharedMemory::DrawBarrier::kExportAfterExport),
+              draw_barriers(VulkanSharedMemory::DrawBarrier::kExportAfterRead),
+              draw_barriers(VulkanSharedMemory::DrawBarrier::kFirstExport),
+              draw_barriers(VulkanSharedMemory::DrawBarrier::kElided));
         }
         XELOGI(
             "VkPassEnd: per frame: render_targets={:.1f} resolve={:.1f} "
@@ -6079,6 +6135,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
 
   const RegisterFile& regs = *register_file_;
 
+  if (!issue_draw_pipeline_retry_) {
+    ++guest_draw_count_;
+  }
+
   // vulkan_depth_4x_as_1x rewrites the surface info for one draw only - the
   // guest may keep drawing with it, and every draw decides for itself.
   struct SurfaceInfoRestore {
@@ -7046,8 +7106,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // vulkan_shading_rate: coarse shading of the multisampled scene's draws,
   // where the rate is allowed with what the pixel shader writes.
   draw_shading_rate_ = 0;
-  if (cvars::vulkan_shading_rate && pixel_shader &&
-      device_properties.pipelineFragmentShadingRate) {
+  if (draw_samples_as_pixels_coarse_ && depth_4x_as_1x) {
+    // Once per 2x2 pixels, the samples of a 4x pixel.
+    draw_shading_rate_ = 3;
+  } else if (cvars::vulkan_shading_rate && pixel_shader &&
+             device_properties.pipelineFragmentShadingRate) {
     const xenos::MsaaSamples guest_msaa_samples =
         regs.Get<reg::RB_SURFACE_INFO>().msaa_samples;
     if (guest_msaa_samples != xenos::MsaaSamples::k1X &&
@@ -7184,10 +7247,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // references, allowing us to check the current register values at draw time.
   const Shader::ConstantRegisterMap& constant_map_vertex =
       vertex_shader->constant_register_map();
+  uint32_t vfetch_addresses[96];
+  uint32_t vfetch_sizes[96];
+  uint32_t vfetch_current_queued = 0;
   {
-    uint32_t vfetch_addresses[96];
-    uint32_t vfetch_sizes[96];
-    uint32_t vfetch_current_queued = 0;
     for (uint32_t i = 0;
          i < xe::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
       uint32_t vfetch_bits_remaining =
@@ -7326,11 +7389,79 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   {
     PassEndReasonScope pass_end_reason_scope(*this,
                                              PassEndReason::kSharedMemory);
-    if (memexport_extent_start < memexport_extent_end) {
+    // XenDroid: Halo: Reach has hundreds of exporting draws a frame, each of
+    // which got a barrier ending the render pass, whatever the next draw
+    // touches. Exporting to the host's buffer (memexport_enable), or with local
+    // read attachments, the usual barriers stay.
+    const bool memexport_barriers_by_range =
+        cvars::vulkan_memexport_barriers_by_range && !route_to_host &&
+        shared_memory_->host_buffer() == VK_NULL_HANDLE &&
+        !render_target_cache_->local_read_attachments();
+    // Switched at runtime: the two keep different state about what's pending.
+    if (memexport_barriers_by_range_last_ !=
+        cvars::vulkan_memexport_barriers_by_range) {
+      memexport_barriers_by_range_last_ =
+          cvars::vulkan_memexport_barriers_by_range;
+      shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+    }
+    if (memexport_barriers_by_range) {
+      memexport_barrier_reads_.clear();
+      memexport_barrier_exports_.clear();
+      if (!memexport_ranges_.empty() || shared_memory_->NeedsDrawRanges()) {
+        for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
+          memexport_barrier_reads_.emplace_back(vfetch_addresses[i] << 2,
+                                                vfetch_sizes[i] << 2);
+        }
+        if (primitive_processing_result.index_buffer_type ==
+                PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+            primitive_processing_result.index_buffer_type ==
+                PrimitiveProcessor::ProcessedIndexBufferType::
+                    kHostBuiltinForDMA) {
+          memexport_barrier_reads_.emplace_back(
+              primitive_processing_result.guest_index_base,
+              primitive_processing_result.guest_draw_vertex_count
+                  << (vgt_draw_initiator.index_size ==
+                              xenos::IndexFormat::kInt32
+                          ? 2
+                          : 1));
+        }
+        for (const draw_util::MemExportRange& memexport_range :
+             memexport_ranges_) {
+          memexport_barrier_exports_.emplace_back(
+              memexport_range.base_address_dwords << 2,
+              memexport_range.size_bytes);
+        }
+      }
+      // A batch of exporting draws (DrawExportTracker) ends at another shader,
+      // at any draw in between, also one with no effect here, and at what a
+      // title could wait for exports with.
+      const uint64_t memexport_batch_vertex_shader =
+          vertex_shader->ucode_data_hash();
+      const uint64_t memexport_batch_pixel_shader =
+          memexport_used_pixel ? pixel_shader->ucode_data_hash() : 0;
+      if (memexport_batch_vertex_shader != memexport_batch_vertex_shader_ ||
+          memexport_batch_pixel_shader != memexport_batch_pixel_shader_ ||
+          guest_draw_count_ != memexport_batch_next_draw_ ||
+          guest_sync_count_ != memexport_batch_sync_count_) {
+        memexport_batch_vertex_shader_ = memexport_batch_vertex_shader;
+        memexport_batch_pixel_shader_ = memexport_batch_pixel_shader;
+        memexport_batch_sync_count_ = guest_sync_count_;
+        ++memexport_batch_;
+      }
+      memexport_batch_next_draw_ = guest_draw_count_ + 1;
+      const VulkanSharedMemory::DrawBarrier draw_barrier =
+          shared_memory_->UseForGuestDraw(
+              memexport_barrier_reads_.data(), memexport_barrier_reads_.size(),
+              memexport_barrier_exports_.data(),
+              memexport_barrier_exports_.size(), memexport_batch_);
+      ++vk_frame_sync_stats_.memexport_draw_barriers[size_t(draw_barrier)];
+    } else if (memexport_extent_start < memexport_extent_end) {
       shared_memory_->Use(
           VulkanSharedMemory::Usage::kGuestDrawReadWrite,
           std::make_pair(memexport_extent_start,
                          memexport_extent_end - memexport_extent_start));
+      ++vk_frame_sync_stats_.memexport_draw_barriers[size_t(
+          VulkanSharedMemory::DrawBarrier::kFirstExport)];
     } else {
       // With in-pass resolves, fragment shaders may write shared memory inside
       // any guest pass - declare the write usage up front so no barrier is
@@ -7340,6 +7471,39 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
            !cvars::vulkan_in_pass_resolve_debug_read_usage)
               ? VulkanSharedMemory::Usage::kGuestDrawReadWrite
               : VulkanSharedMemory::Usage::kRead);
+    }
+  }
+
+  if (!memexport_ranges_.empty()) {
+    ++vk_frame_sync_stats_.memexport_draws;
+    if (memexport_trace_left_) {
+      --memexport_trace_left_;
+      std::string out, in;
+      for (const draw_util::MemExportRange& memexport_range :
+           memexport_ranges_) {
+        out += fmt::format(" {:08X}+{:X}", memexport_range.base_address_dwords
+                                               << 2,
+                           memexport_range.size_bytes);
+      }
+      for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
+        in += fmt::format(" {:08X}+{:X}", vfetch_addresses[i] << 2,
+                          vfetch_sizes[i] << 2);
+      }
+      if (primitive_processing_result.index_buffer_type ==
+              PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+          primitive_processing_result.index_buffer_type ==
+              PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA) {
+        in += fmt::format(" indices {:08X}",
+                          primitive_processing_result.guest_index_base);
+      }
+      XELOGI(
+          "MemexportTrace: frame {} draw {} vs {:016X} prim {} count {} offset "
+          "{:08X} min {:08X} max {:08X} | out{} | in{}",
+          frame_current_, frame_draw_index_ - 1,
+          vertex_shader->ucode_data_hash(), uint32_t(prim_type), index_count,
+          regs.values[XE_GPU_REG_VGT_INDX_OFFSET],
+          regs.values[XE_GPU_REG_VGT_MIN_VTX_INDX],
+          regs.values[XE_GPU_REG_VGT_MAX_VTX_INDX], out, in);
     }
   }
 
@@ -7859,10 +8023,11 @@ bool VulkanCommandProcessor::RewriteMsaa4xSurfaceInfoForDraw(
   }
   // The scene classification depends on which pixel shaders may run per 1x
   // pixel.
-  if (msaa_4x_scene_depth_surfaces_simple_ps_ !=
-      cvars::vulkan_samples_as_pixels_simple_ps) {
-    msaa_4x_scene_depth_surfaces_simple_ps_ =
-        cvars::vulkan_samples_as_pixels_simple_ps;
+  const uint32_t scene_options =
+      uint32_t(cvars::vulkan_samples_as_pixels_simple_ps) |
+      (uint32_t(cvars::vulkan_samples_as_pixels_coarse) << 1);
+  if (msaa_4x_scene_depth_surfaces_options_ != scene_options) {
+    msaa_4x_scene_depth_surfaces_options_ = scene_options;
     msaa_4x_scene_depth_surfaces_.clear();
   }
   // A pixel shader whose result doesn't depend on running per 4x pixel rather
@@ -7874,6 +8039,27 @@ bool VulkanCommandProcessor::RewriteMsaa4xSurfaceInfoForDraw(
       !pixel_shader->uses_texture_fetch_instruction_results() &&
       !pixel_shader_uses_position && !pixel_shader->memexport_eM_written() &&
       !regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable;
+  // Any other pixel shader, shaded once per 2x2 pixels where the host can: the
+  // samples of a 4x pixel are 2x2 pixels of the 1x surface, aligned the same
+  // way, and the derivatives span the same texels. Coverage, depth and stencil
+  // stay per pixel, as they were per sample, so not where the shader writes the
+  // depth, which also takes the polygon offset on the host render target path
+  // and may take the conversion to float24.
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      GetVulkanDevice()->properties();
+  const auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  const bool pixel_shader_coarse =
+      pixel_shader && !pixel_shader_simple &&
+      cvars::vulkan_samples_as_pixels_coarse &&
+      !cvars::vulkan_samples_as_pixels_2x &&
+      !pixel_shader->memexport_eM_written() &&
+      !regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable &&
+      device_properties.pipelineFragmentShadingRate &&
+      !pixel_shader->writes_depth() &&
+      !pa_su_sc_mode_cntl.poly_offset_front_enable &&
+      !pa_su_sc_mode_cntl.poly_offset_back_enable &&
+      !cvars::depth_float24_convert_in_pixel_shader;
+  draw_samples_as_pixels_coarse_ = pixel_shader_coarse;
   const uint32_t color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(
                          regs, pixel_shader->writes_color_targets())
@@ -7885,7 +8071,7 @@ bool VulkanCommandProcessor::RewriteMsaa4xSurfaceInfoForDraw(
   // quarter-resolution stencil marking of its 1280x720 lighting).
   const uint32_t depth_surface = GetMsaa4xDepthSurface();
   bool scene;
-  if (color_mask && !pixel_shader_simple) {
+  if (color_mask && !pixel_shader_simple && !pixel_shader_coarse) {
     msaa_4x_scene_depth_surfaces_.insert(depth_surface);
     scene = true;
   } else {
@@ -7896,7 +8082,7 @@ bool VulkanCommandProcessor::RewriteMsaa4xSurfaceInfoForDraw(
   }
   // Depth-only draws (no pixel shader) or simple pixel shaders - nothing then
   // depends on the sample positions or on the pixel shader seeing 4x.
-  if ((pixel_shader && !pixel_shader_simple) ||
+  if ((pixel_shader && !pixel_shader_simple && !pixel_shader_coarse) ||
       texture_cache_->IsDrawResolutionScaled() ||
       uint32_t(surface_info.surface_pitch) * 2 >
           xenos::kTexture2DCubeMaxWidthHeight) {

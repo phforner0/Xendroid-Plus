@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "xenia/base/cvar.h"
+#include "xenia/gpu/draw_export_tracker.h"
 #include "xenia/gpu/shared_memory.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/memory.h"
@@ -52,6 +53,43 @@ class VulkanSharedMemory : public SharedMemory {
   // Inserts a pipeline barrier for the target usage, also ensuring consecutive
   // read-write accesses are ordered with each other.
   void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
+
+  // What UseForGuestDraw did, for VkMemexport.
+  enum class DrawBarrier {
+    // None was needed, as with Use.
+    kNone,
+    // Use would have inserted one here.
+    kElided,
+    // A draw reads what an earlier draw exported.
+    kReadAfterExport,
+    // A draw exports over what an earlier draw exported.
+    kExportAfterExport,
+    // A draw exports after draws that read other memory, or over what an
+    // earlier exporting draw read: execution only.
+    kExportAfterRead,
+    // The first export after the buffer was used otherwise, as with Use. With
+    // vulkan_memexport_barriers_by_range off, the barrier of any exporting draw.
+    kFirstExport,
+    kCount,
+  };
+  // Use for a guest draw that reads and exports these byte ranges. Consecutive
+  // draws with memory export otherwise get a barrier between each two, ending
+  // the render pass, whether or not they touch the same memory. Here, there's
+  // one only where a draw reads or writes what an earlier one has exported (or
+  // writes what an earlier one has read) - later uses of the buffer by anything
+  // else go through Use, which orders them after all the exports.
+  // export_batch: see DrawExportTracker.
+  // Not for local read attachments, which Use is for.
+  DrawBarrier UseForGuestDraw(
+      const std::pair<uint32_t, uint32_t>* reads, size_t read_count,
+      const std::pair<uint32_t, uint32_t>* exports, size_t export_count,
+      uint64_t export_batch);
+
+  // Whether UseForGuestDraw needs a draw's ranges even if it doesn't export:
+  // exports not ordered with later draws yet may be in its way.
+  bool NeedsDrawRanges() const {
+    return last_usage_ == Usage::kGuestDrawReadWrite;
+  }
 
   VkBuffer buffer() const { return buffer_; }
 
@@ -146,6 +184,7 @@ class VulkanSharedMemory : public SharedMemory {
 
   Usage last_usage_;
   std::pair<uint32_t, uint32_t> last_written_range_;
+  DrawExportTracker draw_exports_;
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
