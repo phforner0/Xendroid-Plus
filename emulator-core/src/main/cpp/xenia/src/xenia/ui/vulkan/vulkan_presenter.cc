@@ -40,6 +40,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 #include "xenia/gpu/gpu_flags.h"
+#include "xenia/ui/vulkan/vulkan_present_divisor.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 #include "xenia/ui/vulkan/zerofg_build_guard.h"
 #include "xenia/ui/vulkan/zerofg_completion_owner.h"
@@ -138,6 +139,12 @@ DEFINE_bool(
     "Prefer R16G16B16A16_SFLOAT with VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT "
     "(scRGB HDR / wide gamut) when supported by the Vulkan surface.",
     "Vulkan");
+DEFINE_int32(
+    vulkan_android_present_divisor, 0,
+    "Android swapchain integer divisor: 0 - auto (largest integer divisor "
+    "keeping the swapchain at or above the game's render resolution on "
+    "QHD+/tablet panels), 1 - native display resolution, 2..4 - fixed divisor.",
+    "Vulkan");
 DEFINE_bool(zerofg_frame_generation, false,
             "Enable the independent ZeroFG presenter.", "Vulkan");
 DEFINE_string(zerofg_mode, "off", "ZeroFG: off, zero (RC7), reallyzero (the dense flow).", "Vulkan");
@@ -225,6 +232,30 @@ std::string ZeroFGBuildIdentity(const VulkanDevice& device) {
       uint32_t(properties.driverID), properties.driverVersion,
       properties.deviceName, engine, XE_BUILD_COMMIT_SHORT);
 }
+
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+int32_t ReadIntCvarOrDefault(const char* name, int32_t default_value) {
+  if (!cvar::ConfigVars) {
+    return default_value;
+  }
+  auto it = cvar::ConfigVars->find(name);
+  if (it == cvar::ConfigVars->end() || !it->second) {
+    return default_value;
+  }
+  std::string val = it->second->effective_value();
+  if (val.empty()) {
+    return default_value;
+  }
+  char* end = nullptr;
+  long parsed = std::strtol(val.c_str(), &end, 10);
+  if (end == val.c_str() || *end != '\0') {
+    return default_value;
+  }
+  parsed = std::clamp<long>(parsed, std::numeric_limits<int32_t>::min(),
+                            std::numeric_limits<int32_t>::max());
+  return static_cast<int32_t>(parsed);
+}
+#endif
 
 }  // namespace
 
@@ -1554,6 +1585,32 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
                  std::min(max_framebuffer_extent.height,
                           surface_capabilities.maxImageExtent.height));
   }
+
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  if (!IsZeroFGRequested() && !xe::IsZeroFGMainSurfaceActive()) {
+    const VkExtent2D original_extent = image_extent;
+    const uint32_t max_w = std::min(max_framebuffer_extent.width,
+                                    surface_capabilities.maxImageExtent.width);
+    const uint32_t max_h = std::min(max_framebuffer_extent.height,
+                                    surface_capabilities.maxImageExtent.height);
+    const int32_t scale_x = ReadIntCvarOrDefault("draw_resolution_scale_x", 1);
+    const int32_t scale_y = ReadIntCvarOrDefault("draw_resolution_scale_y", 1);
+    uint32_t chosen_divisor = 1;
+    const PresentExtent divided_extent = ComputeAndroidPresentExtent(
+        image_extent.width, image_extent.height,
+        surface_capabilities.minImageExtent.width,
+        surface_capabilities.minImageExtent.height, max_w, max_h, scale_x,
+        scale_y, cvars::vulkan_android_present_divisor, &chosen_divisor);
+    if (divided_extent.width != original_extent.width ||
+        divided_extent.height != original_extent.height) {
+      image_extent.width = divided_extent.width;
+      image_extent.height = divided_extent.height;
+      XELOGI("VulkanPresenter: Android swapchain divisor {} ({}x{} -> {}x{})",
+             chosen_divisor, original_extent.width, original_extent.height,
+             image_extent.width, image_extent.height);
+    }
+  }
+#endif
 
   // Get the surface format.
   std::vector<VkSurfaceFormatKHR> surface_formats;

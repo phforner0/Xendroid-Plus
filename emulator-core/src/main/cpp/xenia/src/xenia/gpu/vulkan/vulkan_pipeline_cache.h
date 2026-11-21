@@ -882,13 +882,19 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // Verified, size-bounded, atomically replaced file per driver identity (see
   // vulkan_pipeline_cache_file.h). Set while vk_pipeline_cache_path_ is.
   std::unique_ptr<pipeline_cache_file::Store> vk_pipeline_cache_store_;
+  // Serializes SaveVkPipelineCache() and store teardown across threads.
+  std::mutex vk_pipeline_cache_save_mutex_;
   // Saves vk_pipeline_cache_ to vk_pipeline_cache_path_ (no-op if either is
-  // unset). Safe to call from the GPU thread concurrently with pipeline
-  // creation (the pipeline cache is internally synchronized by the driver).
+  // unset). Safe to call concurrently from the GPU thread or creation threads
+  // (vk_pipeline_cache_ is internally synchronized by the driver, and disk
+  // persistence is serialized by vk_pipeline_cache_save_mutex_).
   void SaveVkPipelineCache();
   // Periodically persist vk_pipeline_cache_ on the GPU thread so the cache
   // survives Android process kills (upstream only saves at clean shutdown,
   // which Android frequently skips when terminating the process).
+  static constexpr uint64_t kVkPipelineCacheSaveIntervalMs = 20000;
+  static constexpr uint64_t kVkPipelineCachePrecreateSaveIntervalMs = 5000;
+  static constexpr size_t kVkPipelineCachePrecreateSaveBatch = 256;
   std::atomic<bool> vk_pipeline_cache_dirty_{false};
   uint64_t vk_pipeline_cache_last_save_ms_ = 0;
 };

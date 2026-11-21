@@ -9,6 +9,7 @@
 
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -1271,17 +1272,21 @@ void VulkanPipelineCache::MaybeSaveVkPipelineCache() {
   // Periodically persist vk_pipeline_cache_ to disk so it survives Android
   // process kills (upstream only writes it in ShutdownShaderStorage, which
   // Android frequently skips). Throttled, and only when new pipelines were
-  // created since the last save. Safe on the GPU thread concurrently with the
-  // creation threads (the pipeline cache is internally synchronized).
+  // created since the last save. Safe concurrently with the creation threads
+  // (the pipeline cache is internally synchronized and saves are serialized).
   if (vk_pipeline_cache_dirty_.load(std::memory_order_relaxed) &&
       vk_pipeline_cache_ != VK_NULL_HANDLE && !vk_pipeline_cache_path_.empty()) {
-    static constexpr uint64_t kVkPipelineCacheSaveIntervalMs = 20000;
+    const uint64_t save_interval_ms =
+        startup_loading_.load(std::memory_order_relaxed)
+            ? kVkPipelineCachePrecreateSaveIntervalMs
+            : kVkPipelineCacheSaveIntervalMs;
     const uint64_t now = xe::Clock::QueryHostUptimeMillis();
     if (vk_pipeline_cache_last_save_ms_ == 0 ||
-        now - vk_pipeline_cache_last_save_ms_ >= kVkPipelineCacheSaveIntervalMs) {
-      vk_pipeline_cache_dirty_.store(false, std::memory_order_relaxed);
-      vk_pipeline_cache_last_save_ms_ = now;
-      SaveVkPipelineCache();
+        now - vk_pipeline_cache_last_save_ms_ >= save_interval_ms) {
+      if (vk_pipeline_cache_dirty_.exchange(false, std::memory_order_acq_rel)) {
+        vk_pipeline_cache_last_save_ms_ = now;
+        SaveVkPipelineCache();
+      }
     }
   }
 }
@@ -3979,10 +3984,20 @@ void VulkanPipelineCache::InitializeShaderStorage(
     if (completion_callback) {
       completion_callback = [this, orig = std::move(completion_callback)]() {
         startup_loading_ = false;
+        if (vk_pipeline_cache_dirty_.exchange(false,
+                                              std::memory_order_acq_rel)) {
+          SaveVkPipelineCache();
+        }
         orig();
       };
     } else {
-      completion_callback = [this]() { startup_loading_ = false; };
+      completion_callback = [this]() {
+        startup_loading_ = false;
+        if (vk_pipeline_cache_dirty_.exchange(false,
+                                              std::memory_order_acq_rel)) {
+          SaveVkPipelineCache();
+        }
+      };
     }
   }
 
@@ -4051,6 +4066,11 @@ void VulkanPipelineCache::InitializeShaderStorage(
     }
   }
 #endif
+  const int32_t clamped_lod_bias =
+      std::clamp(cvars::gpu_texture_lod_bias, -2, 4);
+  if (clamped_lod_bias != 0) {
+    vk_pipeline_cache_name += fmt::format(".lodbias{}", clamped_lod_bias);
+  }
   vk_pipeline_cache_path_ =
       shader_storage_local_root / (vk_pipeline_cache_name + ".vk.bin");
 
@@ -4300,14 +4320,25 @@ void VulkanPipelineCache::InitializeShaderStorage(
           pipeline_pair.second.creation_failed.store(
               true, std::memory_order_release);
         }
+        if ((pipelines_created + 1) % kVkPipelineCachePrecreateSaveBatch == 0 &&
+            vk_pipeline_cache_dirty_.exchange(false,
+                                              std::memory_order_acq_rel)) {
+          SaveVkPipelineCache();
+        }
       }
 
       ++pipelines_created;
     }
 
-    if (!creation_threads_.empty()) {
+    if (creation_threads_.empty()) {
+      if (vk_pipeline_cache_dirty_.exchange(false,
+                                            std::memory_order_acq_rel)) {
+        SaveVkPipelineCache();
+      }
+    } else {
       if (blocking) {
-        // Blocking mode: wait for all pipelines to be created.
+        // Blocking mode: wait for all pipelines to be created, checkpointing
+        // VkPipelineCache periodically so progress survives process kills.
         bool await_creation_completion_event;
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -4321,7 +4352,20 @@ void VulkanPipelineCache::InitializeShaderStorage(
         }
         if (await_creation_completion_event) {
           creation_request_cond_.notify_one();
-          xe::threading::Wait(creation_completion_event_.get(), false);
+          while (xe::threading::Wait(
+                     creation_completion_event_.get(), false,
+                     std::chrono::milliseconds(
+                         kVkPipelineCachePrecreateSaveIntervalMs)) ==
+                 xe::threading::WaitResult::kTimeout) {
+            if (vk_pipeline_cache_dirty_.exchange(false,
+                                                  std::memory_order_acq_rel)) {
+              SaveVkPipelineCache();
+            }
+          }
+        }
+        if (vk_pipeline_cache_dirty_.exchange(false,
+                                              std::memory_order_acq_rel)) {
+          SaveVkPipelineCache();
         }
       } else {
         // Non-blocking mode: store callback for later invocation.
@@ -4363,6 +4407,7 @@ void VulkanPipelineCache::InitializeShaderStorage(
 }
 
 void VulkanPipelineCache::SaveVkPipelineCache() {
+  std::lock_guard<std::mutex> save_lock(vk_pipeline_cache_save_mutex_);
   if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty() ||
       !vk_pipeline_cache_store_) {
     return;
@@ -4400,8 +4445,12 @@ void VulkanPipelineCache::SaveVkPipelineCache() {
 void VulkanPipelineCache::ShutdownShaderStorage() {
   // Save VkPipelineCache to disk before shutting down storage.
   SaveVkPipelineCache();
-  vk_pipeline_cache_path_.clear();
-  vk_pipeline_cache_store_.reset();
+  {
+    std::lock_guard<std::mutex> save_lock(vk_pipeline_cache_save_mutex_);
+    vk_pipeline_cache_path_.clear();
+    vk_pipeline_cache_store_.reset();
+    vk_pipeline_cache_dirty_.store(false, std::memory_order_relaxed);
+  }
 
   // Shut down the storage writer (closes files, stops write thread).
   storage_writer_.ShutdownShaderStorage();
