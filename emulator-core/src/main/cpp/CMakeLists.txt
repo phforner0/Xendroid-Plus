@@ -10,9 +10,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Global compile options applied to every target in this build.
-# Baseline ARMv8.2-A + LSE atomics + SDOT/UDOT + FP16 + LDAPR (RCPC) + CRC32
-# (Snapdragon 855+ / Cortex-A75+ / Dimensity 1000+ / Exynos 9820+).
-add_compile_options(-march=armv8.2-a+lse+dotprod+fp16+rcpc+crc)
+# Baseline ARMv8.0-A so Cortex-A73/A53 devices (e.g. Snapdragon 680, #122) do not
+# fault with SIGILL on static/library load. -moutline-atomics dispatches to LSE
+# atomics at runtime on ARMv8.1+ CPUs while falling back to LL/SC on ARMv8.0.
+add_compile_options(-march=armv8-a -moutline-atomics)
 add_compile_options(-stdlib=libc++)
 add_compile_options(-fno-omit-frame-pointer)
 add_compile_options(-funwind-tables)
