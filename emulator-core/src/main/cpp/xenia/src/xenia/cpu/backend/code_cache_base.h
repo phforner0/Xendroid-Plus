@@ -243,6 +243,10 @@ class CodeCacheBase : public CodeCache {
           indirection_table_actual_base_ = kIndirectionTableBase;
           indirection_table_base_bias_ = 0;
           encoded_indirection_ = false;
+          xe::memory::AdviseHugePages(generated_code_execute_base_,
+                                      kGeneratedCodeSize);
+          xe::memory::AdviseHugePages(indirection_table_base_,
+                                      kIndirectionTableSize);
           generated_code_map_.reserve(kMaximumFunctionCount);
           return true;
         }
@@ -327,6 +331,10 @@ class CodeCacheBase : public CodeCache {
       return false;
     }
 
+    xe::memory::AdviseHugePages(generated_code_execute_base_,
+                                kGeneratedCodeSize);
+    xe::memory::AdviseHugePages(indirection_table_base_,
+                                kIndirectionTableSize);
     generated_code_map_.reserve(kMaximumFunctionCount);
     return true;
   }

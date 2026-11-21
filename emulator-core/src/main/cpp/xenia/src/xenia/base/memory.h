@@ -112,6 +112,8 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
 
+void AdviseHugePages(void* base_address, size_t length);
+
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.
 template <typename T>

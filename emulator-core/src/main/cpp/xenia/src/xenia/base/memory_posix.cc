@@ -31,6 +31,7 @@
 #include <mach/vm_region.h>
 #endif  // XE_PLATFORM_MAC
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
@@ -50,6 +51,12 @@
 
 #include "xenia/base/main_android.h"
 #endif
+
+DEFINE_bool(
+    memory_huge_pages, true,
+    "Advise the OS to back large guest RAM and JIT code cache mappings with "
+    "2 MiB transparent huge pages (MADV_HUGEPAGE on Linux/Android).",
+    "Memory");
 
 namespace xe {
 namespace memory {
@@ -461,6 +468,24 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   memory_maps.close();
   return false;
 #endif  // XE_PLATFORM_MAC
+}
+
+void AdviseHugePages(void* base_address, size_t length) {
+  if (!cvars::memory_huge_pages || !base_address ||
+      length < (2u * 1024u * 1024u)) {
+    return;
+  }
+#ifdef MADV_HUGEPAGE
+  const size_t host_page = page_size();
+  const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(base_address);
+  const uintptr_t aligned_begin = raw_begin & ~(host_page - 1);
+  const uintptr_t aligned_end =
+      (raw_begin + length + host_page - 1) & ~(host_page - 1);
+  if (aligned_end > aligned_begin) {
+    (void)madvise(reinterpret_cast<void*>(aligned_begin),
+                  aligned_end - aligned_begin, MADV_HUGEPAGE);
+  }
+#endif
 }
 
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
