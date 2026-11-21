@@ -47,6 +47,7 @@
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/texture_util.h"
+#include "xenia/gpu/vulkan/vulkan_driver_quirks.h"
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 #include "xenia/gpu/vulkan/vulkan_render_target_cache.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
@@ -9004,13 +9005,8 @@ bool VulkanCommandProcessor::RewriteMsaa4xSurfaceInfoForDraw(
   }
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       GetVulkanDevice()->properties();
-  const bool non_turnip_mobile_tiler =
-      device_properties.driverID != VK_DRIVER_ID_MESA_TURNIP &&
-      (device_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY ||
-       device_properties.driverID == VK_DRIVER_ID_MESA_PANVK ||
-       device_properties.vendorID == 0x13B5 ||
-       device_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY ||
-       device_properties.vendorID == 0x144D);
+  const bool non_turnip_mobile_tiler = IsNonTurnipMobileTiler(
+      uint32_t(device_properties.driverID), device_properties.vendorID);
   if (cvars::vulkan_msaa_4x_as_2x2 && non_turnip_mobile_tiler &&
       !texture_cache_->IsDrawResolutionScaled() &&
       uint32_t(surface_info.surface_pitch) * 2 <=

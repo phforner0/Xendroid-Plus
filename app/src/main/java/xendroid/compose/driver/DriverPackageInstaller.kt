@@ -44,11 +44,16 @@ class DriverPackageInstaller(private val root: File) {
             try {
                 val extracted = ArchiveFiles.unpack(archive, stage, limits, checkCancelled)
                 require(extracted.none { it.name == marker }) { "Reserved driver metadata" }
-                val meta = File(stage, "meta.json")
-                val library = if (meta.isFile) {
+                val meta = File(stage, "meta.json").takeIf { it.isFile }
+                    ?: extracted.singleOrNull { it.name == "meta.json" }
+                val library = if (meta != null) {
                     require(meta.length() <= 64 * 1024) { "Driver metadata too large" }
-                    json.parseToJsonElement(meta.readText()).jsonObject["libraryName"]?.jsonPrimitive?.contentOrNull
+                    val rawLibrary = json.parseToJsonElement(meta.readText()).jsonObject["libraryName"]?.jsonPrimitive?.contentOrNull
+                        ?.let { ArchiveFiles.relative(it) }
                         ?: error("Missing libraryName in meta.json")
+                    val metaDir = meta.parentFile?.relativeTo(stage)?.invariantSeparatorsPath
+                        ?.takeIf { it.isNotEmpty() && it != "." }
+                    if (metaDir == null) rawLibrary else "$metaDir/$rawLibrary"
                 } else {
                     extracted.filter { it.extension == "so" }.singleOrNull()?.relativeTo(stage)?.invariantSeparatorsPath
                         ?: error("A driver without metadata must contain exactly one library")

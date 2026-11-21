@@ -65,6 +65,8 @@ done
 "$build/lote16_upstream_test" "$cpp/xenia/src/xenia/cpu/backend/a64"
 "${cxx[@]}" "${flags[@]}" -pthread "$test/shader_translation_wait_test.cc" -o "$build/shader_translation_wait_test"
 "$build/shader_translation_wait_test" "$cpp/xenia/src/xenia"
+"${cxx[@]}" "${flags[@]}" "$test/hotfix_032_test.cc" -o "$build/hotfix_032_test"
+"$build/hotfix_032_test" "$cpp"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then

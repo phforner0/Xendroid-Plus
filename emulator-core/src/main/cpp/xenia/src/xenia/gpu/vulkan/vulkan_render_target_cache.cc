@@ -36,6 +36,7 @@
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/spirv_single_sample_patch.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
+#include "xenia/gpu/vulkan/vulkan_driver_quirks.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
@@ -1270,13 +1271,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   msaa_single_sample_storage_ =
       cvars::vulkan_msaa_single_sample_storage &&
       path_ == Path::kHostRenderTargets;
-  const bool non_turnip_mobile_tiler =
-      device_properties.driverID != VK_DRIVER_ID_MESA_TURNIP &&
-      (device_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY ||
-       device_properties.driverID == VK_DRIVER_ID_MESA_PANVK ||
-       device_properties.vendorID == 0x13B5 ||
-       device_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY ||
-       device_properties.vendorID == 0x144D);
+  const bool non_turnip_mobile_tiler = IsNonTurnipMobileTiler(
+      uint32_t(device_properties.driverID), device_properties.vendorID);
   msaa_4x_as_2x2_ = cvars::vulkan_msaa_4x_as_2x2 &&
                     path_ == Path::kHostRenderTargets &&
                     !IsDrawResolutionScaled() && non_turnip_mobile_tiler;

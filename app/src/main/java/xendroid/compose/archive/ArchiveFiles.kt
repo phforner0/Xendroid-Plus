@@ -24,11 +24,18 @@ data class ArchiveLimits(
 
 object ArchiveFiles {
     fun relative(name: String): String {
-        require(name.isNotEmpty() && name.length <= 1024 && !name.startsWith('/') &&
-            !name.contains('\\') && !name.contains(':') && !name.contains('\u0000')) { "Invalid archive path" }
-        val clean = name.removeSuffix("/")
-        require(clean.split('/').size <= 64) { "Archive path is too deep" }
-        require(clean.split('/').all { it.isNotEmpty() && it != "." && it != ".." }) { "Invalid archive path" }
+        require(name.isNotEmpty() && name.length <= 1024 && !name.contains(':') && !name.contains('\u0000')) {
+            "Invalid archive path"
+        }
+        val normalized = name.replace('\\', '/')
+        require(!normalized.startsWith('/')) { "Invalid archive path" }
+        var clean = normalized.trimEnd('/')
+        while (clean.startsWith("./")) {
+            clean = clean.removePrefix("./")
+        }
+        val parts = clean.split('/')
+        require(parts.size <= 64) { "Archive path is too deep" }
+        require(parts.all { it.isNotEmpty() && it != "." && it != ".." }) { "Invalid archive path" }
         return clean
     }
 
@@ -113,10 +120,21 @@ object ArchiveFiles {
             while (entries.hasMoreElements()) {
                 checkCancelled()
                 val entry = entries.nextElement()
+                val isDir = entry.isDirectory || entry.name.endsWith("/") || entry.name.endsWith("\\")
+                if (isDir) {
+                    val raw = entry.name.replace('\\', '/')
+                    if (!raw.startsWith('/')) {
+                        var dirName = raw.trimEnd('/')
+                        while (dirName.startsWith("./")) {
+                            dirName = dirName.removePrefix("./")
+                        }
+                        if (dirName.isEmpty() || dirName == ".") continue
+                    }
+                }
                 val name = relative(entry.name)
                 require(seen.add(name.lowercase(Locale.ROOT))) { "Duplicate archive path" }
                 val dest = resolve(staging, name)
-                if (entry.isDirectory) {
+                if (isDir) {
                     check(dest.isDirectory || dest.mkdirs()); continue
                 }
                 require(entry.size in 0..limits.entryBytes && total + entry.size <= limits.totalBytes) { "Archive exceeds size limit" }
