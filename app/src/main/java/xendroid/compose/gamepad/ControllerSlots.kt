@@ -1,7 +1,5 @@
 package xendroid.compose.gamepad
 
-import kotlin.math.abs
-
 /**
  * I01: which physical controller plays as which player. The first controller shares P1
  * with the on-screen pad; the next ones take P2..P4 in the order they first play (#76). A
@@ -80,7 +78,14 @@ class SlotInputRouter(
     }
 
     private val pads = HashMap<Int, Pad>()
+    @Volatile private var leftOuterDeadzone: Float = 0f
+    @Volatile private var rightOuterDeadzone: Float = 0f
     private fun pad(slot: Int) = pads.getOrPut(slot) { Pad() }
+
+    fun setStickOuterDeadzones(left: Float, right: Float) {
+        leftOuterDeadzone = StickRange.sanitizeOuterDeadzone(left)
+        rightOuterDeadzone = StickRange.sanitizeOuterDeadzone(right)
+    }
 
     fun keyDown(slot: Int, identity: Long, key: Int) {
         val pad = pad(slot)
@@ -105,10 +110,10 @@ class SlotInputRouter(
     fun motion(slot: Int, lx: Float, ly: Float, rx: Float, ry: Float, lt: Float, rt: Float, hatX: Float, hatY: Float,
                ltKey: Int? = KC_TRIGGER_L, rtKey: Int? = KC_TRIGGER_R) {
         val pad = pad(slot)
-        axisPair(slot, pad, lx, KC_LTHUMB_LEFT, KC_LTHUMB_RIGHT, invert = false)
-        axisPair(slot, pad, ly, KC_LTHUMB_UP, KC_LTHUMB_DOWN, invert = true)
-        axisPair(slot, pad, rx, KC_RTHUMB_LEFT, KC_RTHUMB_RIGHT, invert = false)
-        axisPair(slot, pad, ry, KC_RTHUMB_UP, KC_RTHUMB_DOWN, invert = true)
+        axisPair(slot, pad, lx, KC_LTHUMB_LEFT, KC_LTHUMB_RIGHT, invert = false, outerDeadzone = leftOuterDeadzone)
+        axisPair(slot, pad, ly, KC_LTHUMB_UP, KC_LTHUMB_DOWN, invert = true, outerDeadzone = leftOuterDeadzone)
+        axisPair(slot, pad, rx, KC_RTHUMB_LEFT, KC_RTHUMB_RIGHT, invert = false, outerDeadzone = rightOuterDeadzone)
+        axisPair(slot, pad, ry, KC_RTHUMB_UP, KC_RTHUMB_DOWN, invert = true, outerDeadzone = rightOuterDeadzone)
         for (out in pad.triggers.changes(AnalogTriggers.outputs(lt, rt, ltKey, rtKey))) send(slot, out.key, out.pressed, out.value)
         held(slot, pad, KC_DPAD_LEFT, hatX < -0.5f)
         held(slot, pad, KC_DPAD_RIGHT, hatX > 0.5f)
@@ -127,9 +132,9 @@ class SlotInputRouter(
 
     fun releaseAll() = pads.keys.toList().forEach(::release)
 
-    private fun axisPair(slot: Int, pad: Pad, axis: Float, negKey: Int, posKey: Int, invert: Boolean) {
+    private fun axisPair(slot: Int, pad: Pad, axis: Float, negKey: Int, posKey: Int, invert: Boolean, outerDeadzone: Float = 0f) {
         val raw = if (invert) -axis else axis
-        val v = if (abs(raw) < deadzone || !raw.isFinite()) 0f else raw.coerceIn(-1f, 1f)
+        val v = StickRange.scaleAxis(raw, deadzone, outerDeadzone)
         when {
             v < 0f -> { axis(slot, pad, posKey, false, 0); axis(slot, pad, negKey, true, (v * 32768f).toInt()) }
             v > 0f -> { axis(slot, pad, negKey, false, 0); axis(slot, pad, posKey, true, (v * 32767f).toInt()) }

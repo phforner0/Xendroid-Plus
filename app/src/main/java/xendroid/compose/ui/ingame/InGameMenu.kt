@@ -152,6 +152,8 @@ data class InGameMenuModel(
     val savedChanges: Int = 0,
     /** Round 2: the HUD as it is set now, drawn at the top of the HUD category (the HUD itself hides under the menu). */
     val hudPreview: HudPreview? = null,
+    /** Live system time formatted in the user's locale, shown in the menu header (#146). */
+    val clock: String? = null,
 )
 
 /** The HUD's settings for the menu's preview: what it shows, how, and its size. */
@@ -268,7 +270,11 @@ private fun Head(model: InGameMenuModel, controller: Boolean, compactActions: Bo
         if (model.art != null) AsyncImage(model.art, null, Modifier.size(36.dp, 46.dp).clip(RoundedCornerShape(7.dp)), contentScale = ContentScale.Crop)
         Column(Modifier.weight(1f)) {
             Text(model.gameName ?: stringResource(R.string.app_name), style = XdText.h2, color = c.fg, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(stringResource(if (model.paused) R.string.xd_menu_paused else R.string.xd_menu_running), style = XdText.small, color = c.fg3,
+            val subtitle = listOfNotNull(
+                stringResource(if (model.paused) R.string.xd_menu_paused else R.string.xd_menu_running),
+                model.clock?.takeIf { it.isNotBlank() },
+            ).joinToString(" · ")
+            Text(subtitle, style = XdText.small, color = c.fg3,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         if (compactActions && model.savedChanges > 0) {
@@ -625,6 +631,7 @@ internal fun InGameAction.title(): String = stringResource(
         InGameAction.COLOR_FILTER -> R.string.menu_t_color_filter
         InGameAction.STRETCH -> R.string.menu_t_stretch
         InGameAction.EXTERNAL_DISPLAY -> R.string.menu_t_tv
+        InGameAction.SECONDARY_DASHBOARD -> R.string.menu_t_secondary_dashboard
         InGameAction.TV_MARGIN -> R.string.menu_tv_margin_title
         InGameAction.DRIVER_INFO -> R.string.menu_group_driver
         InGameAction.ZEROFG -> R.string.menu_t_zerofg

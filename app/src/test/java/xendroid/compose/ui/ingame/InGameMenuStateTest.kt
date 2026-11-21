@@ -39,7 +39,8 @@ class InGameMenuStateTest {
         assertTrue(advancedActions.all { it in placed })
         inGamePageActions.forEach { (page, actions) -> actions.forEach { assertNotNull("$it on $page", groupOf(page, it)) } }
         assertTrue(inGamePageActions.getValue(InGamePage.GRAPHICS).containsAll(listOf(InGameAction.DISPLAY_MODE, InGameAction.ANTIALIASING,
-            InGameAction.SHARPNESS, InGameAction.WINFG, InGameAction.DRIVER_INFO)))
+            InGameAction.SHARPNESS, InGameAction.WINFG, InGameAction.SECONDARY_DASHBOARD, InGameAction.DRIVER_INFO)))
+        assertEquals(RowKind.TOGGLE, InGameAction.SECONDARY_DASHBOARD.kind)
         assertTrue(inGamePageActions.getValue(InGamePage.SYSTEM).containsAll(listOf(InGameAction.FPS_LIMIT, InGameAction.SUSTAINED_PERFORMANCE)))
         assertTrue(inGamePageActions.getValue(InGamePage.HUD).containsAll(listOf(InGameAction.PERFORMANCE_HUD, InGameAction.HUD_LAYOUT,
             InGameAction.HUD_METRICS, InGameAction.HUD_OPACITY, InGameAction.HUD_COLORS)))

@@ -154,6 +154,8 @@
     <string name="xd_ct_right">Direito</string>
     <string name="xd_ct_game_gets">O jogo recebe</string>
     <string name="xd_ct_dz_core">Zona morta do core</string>
+    <string name="xd_ct_outer_dz">Zona morta externa do analógico</string>
+    <string name="xd_ct_outer_dz_hint">Escala analógicos de curso curto (ex.: 0,82 → 1,00 para correr em jogos FPS)</string>
     <string name="xd_ct_hold_b">Segure para sair</string>
     <string name="xd_pc_sub">Para um jogo aberto em outro telefone</string>
     <string name="xd_pc_vibration">Vibração neste telefone</string>

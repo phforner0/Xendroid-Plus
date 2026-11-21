@@ -42,7 +42,6 @@ import xendroid.compose.core.DualScreenDashboard
 import xendroid.compose.core.ExternalGameDisplay
 import xendroid.compose.core.GlitchRecorder
 import xendroid.compose.core.PresenterPerformanceHints
-import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.firstOrNull
@@ -368,6 +367,12 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var surfaceAvailable = false
     private var externalDisplay: ExternalGameDisplay? = null
     private var dualScreenDashboard: DualScreenDashboard? = null
+    private val secondaryDashboardEnabled = mutableStateOf(false)
+    private val menuClock = mutableStateOf("")
+    private var leftStickOuterDeadzone = 0f
+    private var rightStickOuterDeadzone = 0f
+    private fun currentClockText(): String =
+        android.text.format.DateFormat.getTimeFormat(this).format(java.util.Date())
     private val glitchRecorder = GlitchRecorder()
     private val glitchChord = GlitchRecorder.ChordDetector()
     /** Null until the TV output reports (it starts on the phone). */
@@ -535,6 +540,9 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         gyroAim.value = options.gyroAim
         gyroSensitivity.intValue = options.gyroSensitivity.ordinal
         gyroCamera.sensitivity = options.gyroSensitivity.scale
+        leftStickOuterDeadzone = xendroid.compose.gamepad.StickRange.sanitizeOuterDeadzone(options.leftStickOuterDeadzone)
+        rightStickOuterDeadzone = xendroid.compose.gamepad.StickRange.sanitizeOuterDeadzone(options.rightStickOuterDeadzone)
+        slotInput.setStickOuterDeadzones(leftStickOuterDeadzone, rightStickOuterDeadzone)
         val unbuffered = unbufferedInput.value != options.unbufferedInput
         unbufferedInput.value = options.unbufferedInput
         if (unbuffered && window?.decorView?.isAttachedToWindow == true) applyUnbufferedInput()
@@ -1476,9 +1484,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             gameOnExternalDisplay.value = extId != null
             dualScreenDashboard?.setGameOutputDisplay(extId)
         })
-        dualScreenDashboard = runCatching { DualScreenDashboard(this) }.getOrNull()
+        val displayPrefs = getSharedPreferences(DISPLAY_SETTINGS_PREFS, MODE_PRIVATE)
+        secondaryDashboardEnabled.value = displayPrefs.getBoolean("secondary_dashboard", false)
+        dualScreenDashboard = runCatching {
+            DualScreenDashboard(this, initialEnabled = secondaryDashboardEnabled.value)
+        }.getOrNull()
         dualScreenDashboard?.setGameOutputDisplay(externalDisplay?.activeDisplay?.displayId)
-        tvMargin.floatValue = getSharedPreferences(DISPLAY_SETTINGS_PREFS, MODE_PRIVATE).getFloat("tv_margin_percent", 0f)
+        tvMargin.floatValue = displayPrefs.getFloat("tv_margin_percent", 0f)
             .coerceIn(0f, xendroid.compose.core.TvMargin.MAX)
         externalDisplay?.setMargin(tvMargin.floatValue)
 
@@ -1932,27 +1944,32 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                                             )
                                         )
                                     }
-                                    dualScreenDashboard?.let { dash ->
-                                        val batC = xendroid.compose.sessions.SessionRuns.batteryCelsius(applicationContext) ?: 0f
-                                        val padPct = readControllerBatteryPercent()
-                                        val recentFeed = runEvents.snapshot().events.takeLast(5).map { xendroid.compose.sessions.describeEvent(it) }
-                                        dash.update(
-                                            DualScreenDashboard.DashboardSnapshot(
-                                                gameName = loadingName ?: activeTitle ?: "XenDroid+",
-                                                titleId = activeTitle,
-                                                driverLabel = session.activeDriverIdentity()?.label,
-                                                fps = curFps,
-                                                frameMs = curFrameMs,
-                                                playedSeconds = (android.os.SystemClock.elapsedRealtime() - createdAtMs) / 1000L,
-                                                pipelinesCompiled = compileStats?.getOrNull(0) ?: 0L,
-                                                audioConcealed = audioStatsNow?.getOrNull(2) ?: 0L,
-                                                batteryCelsius = batC,
-                                                controllerBatteryPercent = padPct,
-                                                recentEvents = recentFeed,
+                                    if (secondaryDashboardEnabled.value) {
+                                        dualScreenDashboard?.let { dash ->
+                                            val batC = xendroid.compose.sessions.SessionRuns.batteryCelsius(applicationContext) ?: 0f
+                                            val padPct = readControllerBatteryPercent()
+                                            val recentFeed = runEvents.snapshot().events.takeLast(5).map { xendroid.compose.sessions.describeEvent(it) }
+                                            dash.update(
+                                                DualScreenDashboard.DashboardSnapshot(
+                                                    gameName = loadingName ?: activeTitle ?: "XenDroid+",
+                                                    titleId = activeTitle,
+                                                    driverLabel = session.activeDriverIdentity()?.label,
+                                                    fps = curFps,
+                                                    frameMs = curFrameMs,
+                                                    playedSeconds = (android.os.SystemClock.elapsedRealtime() - createdAtMs) / 1000L,
+                                                    pipelinesCompiled = compileStats?.getOrNull(0) ?: 0L,
+                                                    audioConcealed = audioStatsNow?.getOrNull(2) ?: 0L,
+                                                    batteryCelsius = batC,
+                                                    controllerBatteryPercent = padPct,
+                                                    recentEvents = recentFeed,
+                                                )
                                             )
-                                        )
+                                        }
                                     }
-                                    if (menuState.value.open) menuStatus.value = buildMenuStatus()
+                                    if (menuState.value.open) {
+                                        menuStatus.value = buildMenuStatus()
+                                        menuClock.value = currentClockText()
+                                    }
                                     // 15n: the performance panel, built only while it is on screen.
                                     panelSnapshot.value = if (performanceOverlayEnabled.value &&
                                         hudDetail.value == xendroid.compose.core.HudDetail.PANEL) {
@@ -2760,10 +2777,10 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             return hatHandled || super.onGenericMotionEvent(event)
         }
 
-        emitAxisPair(axes.lx, negKey = KC_LTHUMB_LEFT, posKey = KC_LTHUMB_RIGHT, invert = false)
-        emitAxisPair(axes.ly, negKey = KC_LTHUMB_UP, posKey = KC_LTHUMB_DOWN, invert = true)
-        emitAxisPair(axes.rx, negKey = KC_RTHUMB_LEFT, posKey = KC_RTHUMB_RIGHT, invert = false)
-        emitAxisPair(axes.ry, negKey = KC_RTHUMB_UP, posKey = KC_RTHUMB_DOWN, invert = true)
+        emitAxisPair(axes.lx, negKey = KC_LTHUMB_LEFT, posKey = KC_LTHUMB_RIGHT, invert = false, outerDeadzone = leftStickOuterDeadzone)
+        emitAxisPair(axes.ly, negKey = KC_LTHUMB_UP, posKey = KC_LTHUMB_DOWN, invert = true, outerDeadzone = leftStickOuterDeadzone)
+        emitAxisPair(axes.rx, negKey = KC_RTHUMB_LEFT, posKey = KC_RTHUMB_RIGHT, invert = false, outerDeadzone = rightStickOuterDeadzone)
+        emitAxisPair(axes.ry, negKey = KC_RTHUMB_UP, posKey = KC_RTHUMB_DOWN, invert = true, outerDeadzone = rightStickOuterDeadzone)
         emitTriggers(axes.lt, axes.rt)
         return true
     }
@@ -2802,7 +2819,8 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         axis: Float,
         negKey: Int,
         posKey: Int,
-        invert: Boolean
+        invert: Boolean,
+        outerDeadzone: Float = 0f,
     ) {
         val raw =
             if (invert) {
@@ -2811,15 +2829,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 axis
             }
 
-        val v =
-            if (
-                abs(raw) <
-                    AXIS_DEADZONE
-            ) {
-                0f
-            } else {
-                raw
-            }
+        val v = xendroid.compose.gamepad.StickRange.scaleAxis(raw, AXIS_DEADZONE, outerDeadzone)
 
         when {
             v < 0f -> {
@@ -3123,6 +3133,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
         menuState.value = menuState.value.copy(frameTrace = session.frameTraceAvailable()).show(pausedHere)
         syncPerformanceHints()
         menuStatus.value = runCatching { buildMenuStatus() }.getOrDefault(emptyList())
+        menuClock.value = currentClockText()
         refreshFpsConfig()
         refreshDriverLine()
         refreshGameOwnKeys()
@@ -3282,6 +3293,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             InGameAction.STRETCH to MenuValue(on = fullscreenStretchEnabled.value, text = stringResource(R.string.menu_t_stretch_note),
                 enabled = !fps.loading && !fps.saving && fps.error == null),
             InGameAction.EXTERNAL_DISPLAY to MenuValue(text = externalDisplayLabel.value ?: stringResource(R.string.tv_phone)),
+            InGameAction.SECONDARY_DASHBOARD to MenuValue(on = secondaryDashboardEnabled.value, text = stringResource(R.string.menu_t_secondary_dashboard_note)),
             InGameAction.TV_MARGIN to MenuValue(text = number.format(tvMargin.floatValue.toDouble()) + "%"),
             InGameAction.DRIVER_INFO to MenuValue(text = driverLine.value.let { (state, label) ->
                 when (state) {
@@ -3415,6 +3427,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
             notes = notes, logSessions = menuLogSessions.value, savedChanges = if (autoSave.value) sessionChanges.intValue else 0,
             hudPreview = if (performanceOverlayEnabled.value) xendroid.compose.ui.ingame.HudPreview(hudDetail.value, hudMetrics.value, hudLook.value,
                 style, hudScaleNow) else null,
+            clock = menuClock.value.ifBlank { currentClockText() },
         )
     }
 
@@ -3441,6 +3454,13 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
                 syncPerformanceHints()
             }
             InGameAction.EXTERNAL_DISPLAY -> externalDisplay?.cycle()
+            InGameAction.SECONDARY_DASHBOARD -> {
+                val on = !secondaryDashboardEnabled.value
+                secondaryDashboardEnabled.value = on
+                getSharedPreferences(DISPLAY_SETTINGS_PREFS, MODE_PRIVATE).edit()
+                    .putBoolean("secondary_dashboard", on).apply()
+                dualScreenDashboard?.setEnabled(on)
+            }
             InGameAction.GYRO_CAMERA -> if (gyroCamera.available) {
                 gyroEnabled.value = !gyroEnabled.value
                 val on = gyroEnabled.value
@@ -3672,6 +3692,7 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun toggleOn(action: InGameAction): Boolean = when (action) {
         InGameAction.STRETCH -> fullscreenStretchEnabled.value
+        InGameAction.SECONDARY_DASHBOARD -> secondaryDashboardEnabled.value
         InGameAction.WINFG -> presentationState.value.let { it.requested && it.engine == 0 }
         InGameAction.LSFG -> presentationState.value.let { it.requested && it.engine == 1 }
         InGameAction.SUSTAINED_PERFORMANCE -> sustainedMode.value

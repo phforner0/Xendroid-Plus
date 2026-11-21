@@ -82,6 +82,8 @@
     <string name="menu_t_stretch">Esticar na tela toda</string>
     <string name="menu_t_stretch_note">A partir da próxima abertura</string>
     <string name="menu_t_tv">TV ou tela externa</string>
+    <string name="menu_t_secondary_dashboard">Painel em tela secundária</string>
+    <string name="menu_t_secondary_dashboard_note">Telemetria na tela secundária (desative para espelhamento normal na TV)</string>
     <string name="menu_t_winfg">Win-FG 2×</string>
     <string name="menu_t_winfg_preset">Predefinição do Win-FG</string>
     <string name="menu_t_lsfg">LSFG nativo</string>
