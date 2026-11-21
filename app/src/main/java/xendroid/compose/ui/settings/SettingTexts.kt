@@ -118,6 +118,8 @@ private val TITLES: Map<String, Int> = mapOf(
     "CPU|enable_early_precompilation" to R.string.st_t_cpu_enable_early_precompilation,
     "Memory|shm_coalesce_writewatch_pages" to R.string.st_t_memory_shm_coalesce_writewatch_pages,
     "Kernel|file_read_no_apc_inline" to R.string.st_t_kernel_file_read_no_apc_inline,
+    "GPU|gpu_texture_lod_bias" to R.string.st_t_gpu_gpu_texture_lod_bias,
+    "Vulkan|vulkan_android_present_divisor" to R.string.st_t_vulkan_vulkan_android_present_divisor,
 )
 
 private val DESCRIPTIONS: Map<String, Int> = mapOf(
@@ -223,6 +225,8 @@ private val DESCRIPTIONS: Map<String, Int> = mapOf(
     "CPU|enable_early_precompilation" to R.string.st_d_cpu_enable_early_precompilation,
     "Memory|shm_coalesce_writewatch_pages" to R.string.st_d_memory_shm_coalesce_writewatch_pages,
     "Kernel|file_read_no_apc_inline" to R.string.st_d_kernel_file_read_no_apc_inline,
+    "GPU|gpu_texture_lod_bias" to R.string.st_d_gpu_gpu_texture_lod_bias,
+    "Vulkan|vulkan_android_present_divisor" to R.string.st_d_vulkan_vulkan_android_present_divisor,
 )
 
 private val CATEGORIES: Map<String, Int> = mapOf(
@@ -244,6 +248,24 @@ fun settingSearchText(context: Context, s: Setting): String =
 @Composable
 fun categoryTitle(category: SettingsCategory): String = CATEGORIES[category.title]?.let { stringResource(it) } ?: category.title
 
+/** String resource for a translated ListChoice option shared by [optionLabel] and [optionText]. */
+internal fun listOptionStringRes(key: String, value: String): Int? = when (key) {
+    "GPU|gpu_texture_lod_bias" -> when (value) {
+        "0" -> R.string.xd_opt_lod_off
+        "1" -> R.string.xd_opt_lod_1
+        "2" -> R.string.xd_opt_lod_2
+        else -> null
+    }
+    "Vulkan|vulkan_android_present_divisor" -> when (value) {
+        "0" -> R.string.xd_opt_div_auto
+        "1" -> R.string.xd_opt_div_native
+        "2" -> R.string.xd_opt_div_half
+        "3" -> R.string.xd_opt_div_third
+        else -> null
+    }
+    else -> null
+}
+
 /** A list option as shown; only words are translated (sizes, codes and filter names stay). */
 @Composable
 fun optionLabel(s: Setting.ListChoice, value: String, english: String): String = when {
@@ -251,7 +273,7 @@ fun optionLabel(s: Setting.ListChoice, value: String, english: String): String =
     s.key == "GPU|anisotropic_override" && value == "-1" -> stringResource(R.string.set_aniso_game)
     s.key == "GPU|anisotropic_override" && value == "0" -> stringResource(R.string.set_option_off)
     s.name.endsWith("_stick_deadzone_percentage") && value == "0.0" -> stringResource(R.string.set_option_off)
-    else -> english
+    else -> listOptionStringRes(s.key, value)?.let { stringResource(it) } ?: english
 }
 
 /** U03: what saving the setting does, in the shown language. */

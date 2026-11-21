@@ -103,7 +103,7 @@ object SettingsProfiles {
     val ALLOWED_KEYS: Set<String> = setOf(
         "GPU|framerate_limit", "GPU|guest_display_refresh_cap", "GPU|anisotropic_override",
         "GPU|draw_resolution_scale_x", "GPU|draw_resolution_scale_y", "GPU|draw_resolution_scaled_texture_offsets",
-        "GPU|draw_resolution_scale_threshold",
+        "GPU|draw_resolution_scale_threshold", "GPU|gpu_texture_lod_bias",
         "GPU|readback_resolve", "GPU|occlusion_query", "GPU|vulkan_mid_frame_submission_draws",
         "GPU|render_target_path", "GPU|half_pixel_offset", "GPU|native_2x_msaa",
         "GPU|resolve_resolution_scale_fill_half_pixel_offset", "GPU|snorm16_render_target_full_range",
@@ -126,7 +126,7 @@ object SettingsProfiles {
         "Vulkan|vulkan_xclipse_bc_transcode", "Vulkan|vulkan_msaa_4x_as_2x2",
         "Vulkan|vulkan_adreno_bcenabler", "Vulkan|vulkan_memexport_batch",
         "Vulkan|vulkan_tight_render_area", "Vulkan|vulkan_shader_object",
-        "Vulkan|vulkan_graphics_pipeline_library",
+        "Vulkan|vulkan_graphics_pipeline_library", "Vulkan|vulkan_android_present_divisor",
         "Display|postprocess_scaling_and_sharpening", "Display|postprocess_antialiasing",
         "Display|present_letterbox", "Display|postprocess_dither",
         "Console|widescreen", "Console|internal_display_resolution",

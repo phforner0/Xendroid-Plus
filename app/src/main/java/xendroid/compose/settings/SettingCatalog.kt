@@ -61,6 +61,8 @@ object SettingCatalog {
             e("Video|internal_display_resolution_x", A, isNew = true, dependsOn = "Console|internal_display_resolution" to "17"),
             e("Video|internal_display_resolution_y", A, isNew = true, dependsOn = "Console|internal_display_resolution" to "17"),
             e("GPU|draw_resolution_scale_threshold", A, isNew = true),
+            e("GPU|gpu_texture_lod_bias", A, isNew = true),
+            e("Vulkan|vulkan_android_present_divisor", A, isNew = true),
             e("Display|postprocess_ffx_cas_additional_sharpness", A, dependsOn = "Display|postprocess_scaling_and_sharpening" to "cas"),
             e("Display|postprocess_ffx_fsr_sharpness_reduction", A, dependsOn = "Display|postprocess_scaling_and_sharpening" to "fsr"),
             e("Display|postprocess_ffx_fsr_max_upsampling_passes", A, isNew = true, dependsOn = "Display|postprocess_scaling_and_sharpening" to "fsr"),

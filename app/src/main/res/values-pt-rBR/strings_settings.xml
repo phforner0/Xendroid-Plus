@@ -114,6 +114,13 @@
     <string name="xd_opt_mask_no_gpu">Tudo menos a GPU</string>
     <string name="xd_opt_up_to_px">até %1$d px</string>
     <string name="xd_opt_fxaa_extreme">FXAA extremo</string>
+    <string name="xd_opt_lod_off">Desligado (padrão do jogo)</string>
+    <string name="xd_opt_lod_1">+1 (mips em meia resolução)</string>
+    <string name="xd_opt_lod_2">+2 (mips em 1/4 da resolução)</string>
+    <string name="xd_opt_div_auto">Automático</string>
+    <string name="xd_opt_div_native">Painel nativo</string>
+    <string name="xd_opt_div_half">Metade (÷2)</string>
+    <string name="xd_opt_div_third">Terço (÷3)</string>
     <plurals name="xd_set_games_override">
         <item quantity="one">%1$d jogo usa outro valor</item>
         <item quantity="other">%1$d jogos usam outro valor</item>
@@ -301,4 +308,8 @@
     <string name="st_d_memory_shm_coalesce_writewatch_pages">Agrupa páginas físicas contíguas do jogo em chamadas mprotect únicas ao armar ou limpar vigias de escrita da GPU.</string>
     <string name="st_t_kernel_file_read_no_apc_inline">Adiar APC de conclusão de leitura</string>
     <string name="st_d_kernel_file_read_no_apc_inline">Enfileira APCs assíncronos de NtReadFile em vez de executá-los na hora, corrigindo condições de corrida em motores de streaming.</string>
+    <string name="st_t_gpu_gpu_texture_lod_bias">Viés de LOD de textura</string>
+    <string name="st_d_gpu_gpu_texture_lod_bias">Desloca o nível de detalhe de mipmaps em texturas 3D para economizar banda da GPU no celular (0 mantém o padrão do jogo; +1 usa mips em meia resolução). Vale a partir da próxima abertura.</string>
+    <string name="st_t_vulkan_vulkan_android_present_divisor">Divisor de tamanho do swapchain</string>
+    <string name="st_d_vulkan_vulkan_android_present_divisor">Reduz o tamanho do swapchain em telas de alta densidade por um fator inteiro, mantendo no mínimo a resolução de renderização do jogo (economiza GPU em telas QHD+ e tablets). Automático escolhe sozinho; Painel nativo desativa.</string>
 </resources>

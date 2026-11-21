@@ -28,9 +28,14 @@ class SettingCatalogTest {
         assertEquals(SettingsSchema.allSettings.size, x.size)
     }
 
-    @Test fun twenty_nine_new_cvars_and_two_new_values() {
-        assertEquals(29, SettingCatalog.newCount)
+    @Test fun thirty_one_new_cvars_and_two_new_values() {
+        assertEquals(31, SettingCatalog.newCount)
         assertEquals(2, SettingCatalog.newOptionCount)
+        listOf("GPU|gpu_texture_lod_bias", "Vulkan|vulkan_android_present_divisor").forEach { key ->
+            val meta = SettingCatalog.meta(key)
+            assertEquals(SettingLevel.ADVANCED, meta.level)
+            assertTrue("$key must be marked isNew", meta.isNew)
+        }
     }
 
     @Test fun dependencies_name_real_settings_and_values() {

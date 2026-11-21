@@ -62,6 +62,8 @@ object SettingsSchema {
             b("Vulkan", "vulkan_tight_render_area", "Tight TBDR render area from dirty/scissor bounds", true),
             b("Vulkan", "vulkan_shader_object", "Shader objects (VK_EXT_shader_object)", false),
             b("Vulkan", "vulkan_graphics_pipeline_library", "Graphics pipeline library (VK_EXT_GPL)", true),
+            l("Vulkan", "vulkan_android_present_divisor", "Swapchain size divisor", "0",
+                "0" to "Auto", "1" to "Native panel", "2" to "Half (÷2)", "3" to "Third (÷3)"),
         )),
 
         SettingsCategory("Video", listOf(
@@ -268,6 +270,8 @@ object SettingsSchema {
                 "1" to "1x", "2" to "2x", "3" to "3x"),
             l("GPU", "draw_resolution_scale_threshold", "Keep narrow surfaces at native size", "0",
                 "0" to "Off", "80" to "up to 80 px", "160" to "up to 160 px", "320" to "up to 320 px", "640" to "up to 640 px"),
+            l("GPU", "gpu_texture_lod_bias", "Texture LOD bias", "0",
+                "0" to "Off (game default)", "1" to "+1 (half-res mips)", "2" to "+2 (quarter-res mips)"),
             b("GPU", "draw_resolution_scaled_texture_offsets", "Draw resolution-scaled texture offsets", true),
             l("GPU", "gpu", "GPU backend", "vulkan",
                 "vulkan" to "vulkan", "null" to "null"),

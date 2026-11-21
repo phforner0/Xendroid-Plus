@@ -1,6 +1,7 @@
 package xendroid.compose.settings
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -17,11 +18,12 @@ class SettingsSchemaTest {
     // less APU|mute and GPU|readback_memexport, which the core never defined (ajustes-2.md).
     // Display|host_present_from_non_ui_thread is intentionally absent (forced true natively).
     // Plus adds Vulkan|zerofg_mode, System link's Network|systemlink + Network|systemlink_peers (176),
-    // and the 19 Plus Ultra Track A/B/C/D canonical engine cvars: 195.
-    @Test fun total_entry_count_is_195() {
-        assertEquals(195, all.size)
+    // the 19 Plus Ultra Track A/B/C/D canonical engine cvars (195), and the 2 Wave 1 mobile
+    // optimization cvars (GPU|gpu_texture_lod_bias, Vulkan|vulkan_android_present_divisor): 197.
+    @Test fun total_entry_count_is_197() {
+        assertEquals(197, all.size)
         assertEquals(
-            195,
+            197,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
@@ -30,7 +32,7 @@ class SettingsSchemaTest {
     @Test fun counts_by_type_match_verified_inventory() {
         assertEquals(138, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra bool cvars
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
-        assertEquals(32, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start
+        assertEquals(34, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start + 2 Wave 1 list cvars
         assertEquals(2, all.count { it is Setting.Action })
         assertEquals(3, all.count { it is Setting.Text })          // launch_module, cl, systemlink_peers
     }
@@ -172,6 +174,37 @@ class SettingsSchemaTest {
     @Test fun jit_frame_start_defaults_to_off() {
         val s = SettingsSchema.byKey["HID|jit_frame_start"] as Setting.ListChoice
         assertEquals("0", s.default)
+    }
+
+    @Test fun wave1_mobile_opts_list_choices_match_contract() {
+        val lodBias = SettingsSchema.byKey["GPU|gpu_texture_lod_bias"] as Setting.ListChoice
+        assertEquals("0", lodBias.default)
+        assertEquals("Texture LOD bias", lodBias.title)
+        assertEquals(
+            listOf(
+                "0" to "Off (game default)",
+                "1" to "+1 (half-res mips)",
+                "2" to "+2 (quarter-res mips)",
+            ),
+            lodBias.options.map { it.value to it.label },
+        )
+        assertTrue(lodBias.desc.isNotBlank())
+        assertFalse(lodBias.key in SettingsSchema.playerKeys)
+
+        val presentDiv = SettingsSchema.byKey["Vulkan|vulkan_android_present_divisor"] as Setting.ListChoice
+        assertEquals("0", presentDiv.default)
+        assertEquals("Swapchain size divisor", presentDiv.title)
+        assertEquals(
+            listOf(
+                "0" to "Auto",
+                "1" to "Native panel",
+                "2" to "Half (÷2)",
+                "3" to "Third (÷3)",
+            ),
+            presentDiv.options.map { it.value to it.label },
+        )
+        assertTrue(presentDiv.desc.isNotBlank())
+        assertFalse(presentDiv.key in SettingsSchema.playerKeys)
     }
 
     /** vulkan_texture_cache reads -1 (no override) and 0..5 (off, 1x..16x). */

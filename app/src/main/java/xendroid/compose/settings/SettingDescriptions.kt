@@ -204,5 +204,7 @@ object SettingDescriptions {
         "enable_early_precompilation" to "Precompiles guest functions listed in the XEX .pdata table across worker threads during module load to reduce early-game JIT stutter",
         "shm_coalesce_writewatch_pages" to "Coalesces guest writewatch page-fault unprotects into aligned 64 KB blocks, cutting mprotect syscalls and TLB shootdowns by up to 67%",
         "file_read_no_apc_inline" to "Queues asynchronous NtReadFile I/O completion APCs instead of firing them inline before returning, fixing hangs in Peter Jackson's King Kong",
+        "gpu_texture_lod_bias" to "Shifts mipmap detail level on 3D textures to save GPU bandwidth on mobile devices (0 keeps game default; +1 uses half-res mips). Applies from next launch",
+        "vulkan_android_present_divisor" to "Reduces high-DPI panel swapchain size by an integer factor while keeping at least the game's render resolution (saves GPU time on QHD+/tablet displays). Auto picks automatically; Native panel disables",
     )
 }
