@@ -24,10 +24,12 @@
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache_file.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
+#include "xenia/gpu/vulkan/deferred_resolve_clear.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/vulkan/single_layout_descriptor_set_pool.h"
 #include "xenia/ui/vulkan/vulkan_upload_buffer_pool.h"
 
+DECLARE_bool(vulkan_defer_resolve_clears);
 DECLARE_bool(vulkan_depth_unorm24);
 DECLARE_bool(vulkan_normalize_dontcare_keys);
 DECLARE_bool(vulkan_msaa_4x_as_2x2);
@@ -256,6 +258,42 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // (transfer_cleared_sources_as_clears), recorded in the currently-active
   // guest render pass - after the in-pass transfers, before the draw.
   void EncodePendingDrawPassClears();
+
+  // Deferred resolve clear folding (vulkan_defer_resolve_clears):
+  // StageDeferredResolveClearsForLastUpdate() is called at the end of Update()
+  // and stages any pending resolve clears on the bound attachments without
+  // consuming them from VulkanRenderTarget (so speculative Update() aborts
+  // preserve them).
+  void StageDeferredResolveClearsForLastUpdate();
+  // Bitmask of attachment slots (0 = depth, 1..4 = color) that received
+  // VK_ATTACHMENT_LOAD_OP_CLEAR in the most recent
+  // GetLastUpdateRenderingAttachments() call.
+  uint32_t last_update_load_op_clear_mask() const {
+    return last_update_load_op_clear_mask_;
+  }
+  bool HasPendingDeferredResolveClears() const {
+    return !deferred_clear_render_targets_.empty();
+  }
+  bool HasStagedDeferredResolveClears() const {
+    return staged_deferred_clear_mask_ != 0;
+  }
+  // Called immediately after CmdVkBeginRendering / CmdVkBeginRenderPass.
+  // Expands the deferred command buffer's drawn bounds for each slot in
+  // `load_op_clear_mask` and consumes only those slots from their targets.
+  void ConsumeDeferredResolveClearsOnPassBegin(uint32_t load_op_clear_mask);
+  // Emits CmdVkClearAttachments inside the currently-active guest render pass
+  // for any staged deferred resolve clears not folded into LOAD_OP_CLEAR (e.g.
+  // sub-rect clears, traditional VkRenderPass, or already-open pass), and clears
+  // PendingResolveClear on those targets only after emitting.
+  void EncodePendingDeferredResolveClears();
+  // Immediately executes all pending deferred resolve clears in standalone
+  // single-attachment passes (e.g. on runtime toggle-off via
+  // debug.xendroid.defer_resolve_clears or before resolve copies / dumps).
+  // Returns true if any clears were flushed.
+  bool FlushAllDeferredResolveClears();
+  // Discards all pending and staged deferred resolve clears without GPU work
+  // (e.g. RestoreEdramSnapshot, ClearCache, Shutdown).
+  void DiscardAllDeferredResolveClears();
 
   // For VK_KHR_dynamic_rendering: fills in attachment info structures.
   // Returns the number of color attachments (may be less than max if trailing
@@ -737,6 +775,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       temporary_sort_index_ = index;
     }
 
+    bool has_pending_resolve_clear() const {
+      return pending_resolve_clear_.active;
+    }
+    const PendingResolveClear& pending_resolve_clear() const {
+      return pending_resolve_clear_;
+    }
+    void SetPendingResolveClear(const PendingResolveClear& clear) {
+      pending_resolve_clear_ = clear;
+      pending_resolve_clear_.active = true;
+    }
+    void ClearPendingResolveClear() {
+      pending_resolve_clear_ = PendingResolveClear{};
+    }
+
    private:
     VulkanRenderTargetCache& render_target_cache_;
     size_t descriptor_set_index_input_attachment_ = SIZE_MAX;
@@ -761,6 +813,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // Temporary storage for indices in operations like transfers and dumps.
     uint32_t temporary_sort_index_ = 0;
+
+    PendingResolveClear pending_resolve_clear_{};
   };
 
   struct FramebufferKey {
@@ -1445,6 +1499,27 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // For TakeTransferStats.
   uint64_t transfers_as_clears_ = 0;
   uint64_t transfer_tiles_as_clears_ = 0;
+
+  // Deferred resolve clears pending across VulkanRenderTarget instances.
+  std::vector<VulkanRenderTarget*> deferred_clear_render_targets_;
+  std::array<PendingResolveClear, 1 + xenos::kMaxColorRenderTargets>
+      staged_deferred_clears_{};
+  std::array<VulkanRenderTarget*, 1 + xenos::kMaxColorRenderTargets>
+      staged_deferred_clear_render_targets_{};
+  uint32_t staged_deferred_clear_mask_ = 0;
+  uint32_t staged_deferred_clear_full_mask_ = 0;
+  mutable uint32_t last_update_load_op_clear_mask_ = 0;
+  void RegisterPendingResolveClear(VulkanRenderTarget* render_target,
+                                   const PendingResolveClear& clear);
+  void UnregisterPendingResolveClear(VulkanRenderTarget* render_target);
+  void ClearStagedDeferredResolveClears();
+  bool FlushDeferredResolveClearForTarget(VulkanRenderTarget* render_target);
+  void FlushDeferredResolveClearsForTransfers(
+      uint32_t render_target_count, RenderTarget* const* render_targets,
+      const std::vector<Transfer>* render_target_transfers, bool flush_dests);
+  void FlushOverlappingDeferredResolveClears(
+      uint32_t base_tiles, uint32_t tile_count,
+      const VulkanRenderTarget* exclude_render_target);
 
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;

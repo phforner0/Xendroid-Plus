@@ -1300,6 +1300,12 @@ class DeferredCommandBuffer {
   void ShrinkRenderAreaToDrawn(uint32_t granularity_width,
                                uint32_t granularity_height);
 
+  // Expands the tracked drawn bounds to cover `rect` so ShrinkRenderAreaToDrawn
+  // never clips a pass-begin LOAD_OP_CLEAR or deferred resolve clear.
+  void ExpandRenderAreaToRect(const VkRect2D& rect) {
+    AccumulateDrawnRect(rect);
+  }
+
   // vulkan_replay_stats: what the replays sent to the driver, and how much of
   // it repeated the state already set in the same command buffer (the same
   // pipeline, descriptor sets, push constant bytes or dynamic state value).

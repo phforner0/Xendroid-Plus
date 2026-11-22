@@ -35,6 +35,7 @@
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
+#include "xenia/gpu/vulkan/thermal_vrs_controller.h"
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 #include "xenia/gpu/vulkan/vulkan_primitive_processor.h"
@@ -244,6 +245,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Called by the render target cache between the copy and the clear of a
   // resolve, splitting its VkResolveTime into the two.
   void MarkResolveCopyEnd();
+  void FlushDeferredResolveClearsIfPending() {
+    if (render_target_cache_ &&
+        render_target_cache_->HasPendingDeferredResolveClears() &&
+        BeginSubmission(true)) {
+      render_target_cache_->FlushAllDeferredResolveClears();
+    }
+  }
   // debug.xendroid.pm4_bin_trace sequence note from the render target cache.
   void BinTraceNoteIfActive(const char* tag, uint32_t a, uint32_t b) {
     if (bin_trace_.frames_left) {
@@ -1487,6 +1495,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint32_t draw_shading_rate_ = 0;
   uint32_t dynamic_shading_rate_ = 0;
   bool dynamic_shading_rate_update_needed_ = true;
+  ThermalVrsController thermal_vrs_controller_;
+  uint64_t last_thermal_vrs_poll_ms_ = 0;
 
   // Currently used samplers.
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>

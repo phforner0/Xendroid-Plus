@@ -305,6 +305,7 @@ class VulkanDevice {
     bool fragmentShadingRateWithShaderSampleMask = false;
     VkSampleCountFlagBits maxFragmentShadingRateRasterizationSamples =
         VK_SAMPLE_COUNT_1_BIT;
+    VkExtent2D maxFragmentSize = {1, 1};
 
     // Optional RC1 Test diagnostics on device B. Advertisement, supported
     // feature and enabled feature are separate facts; none is an RC1 gate.

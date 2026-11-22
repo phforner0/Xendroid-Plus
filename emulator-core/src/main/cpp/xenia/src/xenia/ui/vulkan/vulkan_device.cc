@@ -66,6 +66,28 @@ namespace xe {
 namespace ui {
 namespace vulkan {
 
+namespace {
+
+bool ReadBoolCvarOrDefault(const char* name, bool default_value) {
+  if (!cvar::ConfigVars) {
+    return default_value;
+  }
+  auto it = cvar::ConfigVars->find(name);
+  if (it == cvar::ConfigVars->end() || !it->second) {
+    return default_value;
+  }
+  const std::string val = it->second->effective_value();
+  if (val == "true" || val == "1") {
+    return true;
+  }
+  if (val == "false" || val == "0") {
+    return false;
+  }
+  return default_value;
+}
+
+}  // namespace
+
 template <typename Structure, VkStructureType StructureType>
 struct VulkanFeatures {
   Structure supported = {StructureType};
@@ -506,10 +528,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         cvars::vulkan_pipeline_statistics) {
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_executable_properties)
     }
-    // #227. Only for the coarse shading option.
+    // #227. Only for the coarse shading option or thermal Auto-VRS.
     if (get_physical_device_properties2_supported &&
         properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
-        cvars::vulkan_fragment_shading_rate) {
+        (cvars::vulkan_fragment_shading_rate ||
+         ReadBoolCvarOrDefault("vulkan_auto_vrs_thermal", false))) {
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_fragment_shading_rate)
     }
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
@@ -1030,6 +1053,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
             fsr.fragmentShadingRateWithShaderSampleMask != VK_FALSE;
         device->properties_.maxFragmentShadingRateRasterizationSamples =
             fsr.maxFragmentShadingRateRasterizationSamples;
+        device->properties_.maxFragmentSize = fsr.maxFragmentSize;
         XELOGI(
             "Vulkan fragment shading rate: max fragment size {}x{}, max "
             "samples {}, with shader depth/stencil writes {}, with sample mask "

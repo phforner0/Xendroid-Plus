@@ -173,6 +173,13 @@ DEFINE_bool(
     "Vulkan");
 
 DEFINE_bool(
+    vulkan_defer_resolve_clears, true,
+    "Defer eligible EDRAM resolve clears into the next draw render pass via "
+    "LOAD_OP_CLEAR or in-pass vkCmdClearAttachments, flushing immediately "
+    "before copies, dumps, or overlapping transfers.",
+    "GPU");
+
+DEFINE_bool(
     vulkan_normalize_dontcare_keys, true,
     "Keep the loadOp discard bits out of framebuffer and pipeline cache keys "
     "under dynamic rendering, so toggling them cannot force a render pass "
@@ -2041,6 +2048,8 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
 
   SaveRtPipelineCache(true);
 
+  DiscardAllDeferredResolveClears();
+
   // Destroy all render targets before the descriptor set pool is destroyed -
   // may happen if shutting down the VulkanRenderTargetCache by destroying it,
   // so ShutdownCommon is called by the RenderTargetCache destructor, when it's
@@ -2289,6 +2298,7 @@ void VulkanRenderTargetCache::ClearCache() {
   // Queued in-pass transfers point to render targets that the common
   // ClearCache may delete (a source that just lost its EDRAM range).
   ClearPendingDrawPassTransfers();
+  DiscardAllDeferredResolveClears();
 
   RenderTargetCache::ClearCache();
 }
@@ -2716,6 +2726,7 @@ void VulkanRenderTargetCache::ReplicateTilingBandRows(uint32_t render_targets,
 void VulkanRenderTargetCache::ReplicateTilingBandRenderTargetRows(
     RenderTarget* render_target, uint32_t band_rows) {
   auto& rt = *static_cast<VulkanRenderTarget*>(render_target);
+  FlushDeferredResolveClearForTarget(&rt);
   const RenderTargetKey key = rt.key();
   const uint32_t width = key.GetWidth() * GetKeyScaleX(key);
   const uint32_t height =
@@ -4430,10 +4441,15 @@ bool VulkanRenderTargetCache::Resolve(
             copy_group_count_x, copy_group_count_y);
         assert_true(copy_group_count_x && copy_group_count_y);
       }
+      // Flush any deferred resolve clears before reading host render targets
+      // for a resolve copy or EDRAM dump. Clear-only resolves do not enter this
+      // copy branch, preserving deferred clears on unrelated targets.
+      const bool flushed_deferred_clears = FlushAllDeferredResolveClears();
       // Try the on-tile resolve before dumping the owning render targets - not
-      // after a transfer flush, which left a transfer pass open instead of the
-      // guest pass.
+      // after a transfer or clear flush, which left a transfer pass open
+      // instead of the guest pass.
       if (cvars::vulkan_in_pass_resolve && !flushed_pending_transfers &&
+          !flushed_deferred_clears &&
           copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
         copied = TryInPassResolveCopy(
             resolve_info, copy_shader_constants, copy_shader, dump_base,
@@ -4803,15 +4819,117 @@ bool VulkanRenderTargetCache::Resolve(
                         (uint64_t(resolve_info.rb_color_clear) << 32)
                   : resolve_info.rb_color_clear;
           ++command_processor_.vk_frame_sync_stats().resolve_clears;
+          // Flush any deferred clears referenced as sources of clear transfers
+          // before clearing or transferring.
+          FlushDeferredResolveClearsForTransfers(
+              2, clear_render_targets, clear_transfers_, /*flush_dests=*/false);
+          RenderTarget* immediate_clear_render_targets[2] = {};
+          const bool defer_enabled = cvars::vulkan_defer_resolve_clears;
+          const bool is_host_rt_path = GetPath() == Path::kHostRenderTargets;
+          for (uint32_t i = 0; i < 2; ++i) {
+            if (!clear_render_targets[i]) {
+              continue;
+            }
+            auto* vulkan_rt =
+                static_cast<VulkanRenderTarget*>(clear_render_targets[i]);
+            const RenderTargetKey rt_key = vulkan_rt->key();
+            const uint32_t scale_x = GetKeyScaleX(rt_key);
+            const uint32_t scale_y = GetKeyScaleY(rt_key);
+            DeferredClearRect clear_rect;
+            clear_rect.x = int32_t(clear_rectangle.x_pixels * scale_x);
+            clear_rect.y = int32_t(clear_rectangle.y_pixels * scale_y);
+            clear_rect.width = clear_rectangle.width_pixels * scale_x;
+            clear_rect.height = clear_rectangle.height_pixels * scale_y;
+            const uint32_t rt_host_width = rt_key.GetWidth() * scale_x;
+            const uint32_t rt_host_height =
+                GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp,
+                                      rt_key.msaa_samples) *
+                scale_y;
+            const bool bounds_fit = DeferredClearRectFitsExtent(
+                clear_rect, rt_host_width, rt_host_height);
+            const bool has_separate_transfer_view =
+                !rt_key.is_depth &&
+                vulkan_rt->view_color_transfer_separate() != VK_NULL_HANDLE;
+            if (bounds_fit &&
+                CanDeferResolveClear(defer_enabled, is_host_rt_path,
+                                     has_separate_transfer_view,
+                                     !clear_transfers_[i].empty(),
+                                     copied_in_pass)) {
+              const uint32_t msaa_x_log2 =
+                  uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k4X);
+              const uint32_t msaa_y_log2 =
+                  uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k2X);
+              const uint32_t start_row =
+                  (clear_rectangle.y_pixels << msaa_y_log2) /
+                  xenos::kEdramTileHeightSamples;
+              const uint32_t end_row =
+                  ((clear_rectangle.y_pixels + clear_rectangle.height_pixels -
+                    1)
+                   << msaa_y_log2) /
+                  xenos::kEdramTileHeightSamples;
+              const uint32_t start_col =
+                  (clear_rectangle.x_pixels << msaa_x_log2) /
+                  xenos::kEdramTileWidthSamples;
+              const uint32_t end_col =
+                  ((clear_rectangle.x_pixels + clear_rectangle.width_pixels - 1)
+                   << msaa_x_log2) /
+                  xenos::kEdramTileWidthSamples;
+              const uint32_t bpp_shift = uint32_t(rt_key.Is64bpp());
+              const uint32_t start_rel = std::min(
+                  (start_row * rt_key.pitch_tiles_at_32bpp + start_col)
+                      << bpp_shift,
+                  xenos::kEdramTileCount);
+              const uint32_t end_rel = std::min(
+                  ((end_row * rt_key.pitch_tiles_at_32bpp + end_col)
+                   << bpp_shift) +
+                      (uint32_t(1) << bpp_shift),
+                  xenos::kEdramTileCount);
+              const uint32_t clear_base_tiles =
+                  (rt_key.base_tiles + start_rel) &
+                  (xenos::kEdramTileCount - 1u);
+              const uint32_t clear_tile_count =
+                  end_rel > start_rel ? (end_rel - start_rel) : 0u;
+
+              FlushOverlappingDeferredResolveClears(clear_base_tiles,
+                                                   clear_tile_count, vulkan_rt);
+              if (vulkan_rt->has_pending_resolve_clear() &&
+                  !DeferredClearRectCovers(
+                      clear_rect, vulkan_rt->pending_resolve_clear().rect)) {
+                FlushDeferredResolveClearForTarget(vulkan_rt);
+              }
+              VkClearAttachment clear_attachment{};
+              GetResolveClearAttachment(rt_key, clear_values[i],
+                                        clear_attachment);
+              PendingResolveClear pending{};
+              pending.rt_key = rt_key.key;
+              pending.base_tiles = clear_base_tiles;
+              pending.tile_count = clear_tile_count;
+              pending.rect = clear_rect;
+              pending.aspect =
+                  FromVkImageAspectFlags(clear_attachment.aspectMask);
+              pending.value = FromVkClearValue(clear_attachment.clearValue,
+                                               pending.aspect);
+              pending.active = true;
+              RegisterPendingResolveClear(vulkan_rt, pending);
+            } else {
+              FlushDeferredResolveClearForTarget(vulkan_rt);
+              immediate_clear_render_targets[i] = clear_render_targets[i];
+            }
+          }
           // After an in-pass copy, clearing the same attachment in the same
           // pass would need a read-to-write self-dependency first - leave that
           // case to the general path, which breaks the pass.
-          if (!cvars::vulkan_resolve_clear_in_guest_pass || copied_in_pass ||
-              !TryResolveClearInGuestPass(clear_render_targets, clear_values,
-                                          clear_rectangle, shared_memory)) {
-            PerformTransfersAndResolveClears(2, clear_render_targets,
-                                             clear_transfers_, clear_values,
-                                             &clear_rectangle);
+          if (immediate_clear_render_targets[0] ||
+              immediate_clear_render_targets[1]) {
+            if (!cvars::vulkan_resolve_clear_in_guest_pass || copied_in_pass ||
+                !TryResolveClearInGuestPass(immediate_clear_render_targets,
+                                            clear_values, clear_rectangle,
+                                            shared_memory)) {
+              PerformTransfersAndResolveClears(2,
+                                               immediate_clear_render_targets,
+                                               clear_transfers_, clear_values,
+                                               &clear_rectangle);
+            }
           }
           // What later transfers from these may copy as a clear instead.
           RecordResolveClear(clear_render_targets[0], clear_values[0],
@@ -5018,6 +5136,7 @@ bool VulkanRenderTargetCache::Update(
     return false;
   }
   FlushPendingDrawPassClears();
+  ClearStagedDeferredResolveClears();
 
   if (!RenderTargetCache::Update(is_rasterization_done,
                                  normalized_depth_control,
@@ -5175,6 +5294,11 @@ bool VulkanRenderTargetCache::Update(
         }
       }
       if (any_transfers) {
+        // Flush any deferred resolve clears on transfer sources or destinations
+        // with incoming transfers before executing or queuing them.
+        FlushDeferredResolveClearsForTransfers(
+            1 + xenos::kMaxColorRenderTargets, depth_and_color_render_targets,
+            update_transfers, /*flush_dests=*/true);
         if (cvars::vulkan_in_pass_transfers) {
           // Try to queue each render target's transfers for in-pass execution;
           // transfers that can't be merged into the active pass fall back to
@@ -5273,6 +5397,8 @@ bool VulkanRenderTargetCache::Update(
                   depth_and_color_render_targets,
                   sizeof(last_update_framebuffer_attachments_));
       last_update_framebuffer_ = framebuffer;
+
+      StageDeferredResolveClearsForLastUpdate();
 
       // Transition the used render targets.
       for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
@@ -5778,20 +5904,340 @@ bool VulkanRenderTargetCache::FlushPendingDrawPassTransfers() {
   return true;
 }
 
+void VulkanRenderTargetCache::ClearStagedDeferredResolveClears() {
+  staged_deferred_clears_.fill(PendingResolveClear{});
+  staged_deferred_clear_render_targets_.fill(nullptr);
+  staged_deferred_clear_mask_ = 0;
+  staged_deferred_clear_full_mask_ = 0;
+  last_update_load_op_clear_mask_ = 0;
+}
+
+void VulkanRenderTargetCache::RegisterPendingResolveClear(
+    VulkanRenderTarget* render_target, const PendingResolveClear& clear) {
+  if (!render_target) {
+    return;
+  }
+  render_target->SetPendingResolveClear(clear);
+  if (std::find(deferred_clear_render_targets_.begin(),
+                deferred_clear_render_targets_.end(),
+                render_target) == deferred_clear_render_targets_.end()) {
+    deferred_clear_render_targets_.push_back(render_target);
+  }
+}
+
+void VulkanRenderTargetCache::UnregisterPendingResolveClear(
+    VulkanRenderTarget* render_target) {
+  if (!render_target) {
+    return;
+  }
+  render_target->ClearPendingResolveClear();
+  auto it = std::find(deferred_clear_render_targets_.begin(),
+                      deferred_clear_render_targets_.end(), render_target);
+  if (it != deferred_clear_render_targets_.end()) {
+    *it = deferred_clear_render_targets_.back();
+    deferred_clear_render_targets_.pop_back();
+  }
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (staged_deferred_clear_render_targets_[i] == render_target) {
+      const uint32_t bit = uint32_t(1) << i;
+      staged_deferred_clear_render_targets_[i] = nullptr;
+      staged_deferred_clears_[i] = PendingResolveClear{};
+      staged_deferred_clear_mask_ &= ~bit;
+      staged_deferred_clear_full_mask_ &= ~bit;
+      last_update_load_op_clear_mask_ &= ~bit;
+    }
+  }
+}
+
+bool VulkanRenderTargetCache::FlushDeferredResolveClearForTarget(
+    VulkanRenderTarget* render_target) {
+  if (!render_target || !render_target->has_pending_resolve_clear()) {
+    return false;
+  }
+  if (GetPath() != Path::kHostRenderTargets) {
+    UnregisterPendingResolveClear(render_target);
+    return false;
+  }
+  const PendingResolveClear clear = render_target->pending_resolve_clear();
+  UnregisterPendingResolveClear(render_target);
+  if (!AnyDeferredClearAspect(clear.aspect) || !clear.rect.width ||
+      !clear.rect.height) {
+    return false;
+  }
+
+  const RenderTargetKey dest_rt_key = render_target->key();
+  VkPipelineStageFlags dest_dst_stage_mask;
+  VkAccessFlags dest_dst_access_mask;
+  VkImageLayout dest_new_layout;
+  render_target->GetDrawUsage(&dest_dst_stage_mask, &dest_dst_access_mask,
+                              &dest_new_layout);
+  command_processor_.PushImageMemoryBarrier(
+      render_target->image(),
+      ui::vulkan::util::InitializeSubresourceRange(
+          dest_rt_key.is_depth
+              ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+              : VK_IMAGE_ASPECT_COLOR_BIT),
+      render_target->current_stage_mask(), dest_dst_stage_mask,
+      render_target->current_access_mask(), dest_dst_access_mask,
+      render_target->current_layout(), dest_new_layout);
+  render_target->SetUsage(dest_dst_stage_mask, dest_dst_access_mask,
+                          dest_new_layout);
+
+  RenderPassKey clear_render_pass_key;
+  clear_render_pass_key.msaa_samples = dest_rt_key.msaa_samples;
+  clear_render_pass_key.host_2x = dest_rt_key.host_2x;
+  if (dest_rt_key.is_depth) {
+    clear_render_pass_key.depth_and_color_used = 0b1;
+    clear_render_pass_key.depth_format = dest_rt_key.GetDepthFormat();
+  } else {
+    clear_render_pass_key.depth_and_color_used = 0b1 << 1;
+    clear_render_pass_key.color_0_view_format = dest_rt_key.GetColorFormat();
+    clear_render_pass_key.color_rts_use_transfer_formats = 1;
+  }
+  VkRenderPass clear_render_pass =
+      GetHostRenderTargetsRenderPass(clear_render_pass_key);
+  if (clear_render_pass == VK_NULL_HANDLE) {
+    return false;
+  }
+  const RenderTarget* clear_framebuffer_rts[1 + xenos::kMaxColorRenderTargets] =
+      {};
+  clear_framebuffer_rts[dest_rt_key.is_depth ? 0 : 1] = render_target;
+  const Framebuffer* clear_framebuffer = GetHostRenderTargetsFramebuffer(
+      clear_render_pass_key, dest_rt_key.pitch_tiles_at_32bpp,
+      clear_framebuffer_rts);
+  if (!clear_framebuffer) {
+    return false;
+  }
+  VkImageView clear_dest_view = dest_rt_key.is_depth
+                                    ? render_target->view_depth_stencil()
+                                    : render_target->view_color_transfer();
+
+  command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+      clear_render_pass, clear_framebuffer, clear_dest_view,
+      dest_rt_key.is_depth);
+
+  VkClearAttachment clear_attachment{};
+  clear_attachment.aspectMask = ToVkImageAspectFlags(clear.aspect);
+  clear_attachment.colorAttachment = 0;
+  clear_attachment.clearValue = ToVkClearValue(clear.value, clear.aspect);
+  VkClearRect clear_rect{};
+  clear_rect.rect = ToVkRect2D(clear.rect);
+  clear_rect.baseArrayLayer = 0;
+  clear_rect.layerCount = 1;
+  command_processor_.deferred_command_buffer().CmdVkClearAttachments(
+      1, &clear_attachment, 1, &clear_rect);
+  return true;
+}
+
+void VulkanRenderTargetCache::FlushDeferredResolveClearsForTransfers(
+    uint32_t render_target_count, RenderTarget* const* render_targets,
+    const std::vector<Transfer>* render_target_transfers, bool flush_dests) {
+  if (deferred_clear_render_targets_.empty()) {
+    return;
+  }
+  for (uint32_t i = 0; i < render_target_count; ++i) {
+    const std::vector<Transfer>& transfers = render_target_transfers[i];
+    if (transfers.empty()) {
+      continue;
+    }
+    if (flush_dests && render_targets[i]) {
+      FlushDeferredResolveClearForTarget(
+          static_cast<VulkanRenderTarget*>(render_targets[i]));
+    }
+    for (const Transfer& transfer : transfers) {
+      if (transfer.source) {
+        FlushDeferredResolveClearForTarget(
+            static_cast<VulkanRenderTarget*>(transfer.source));
+      }
+      if (transfer.host_depth_source) {
+        FlushDeferredResolveClearForTarget(
+            static_cast<VulkanRenderTarget*>(transfer.host_depth_source));
+      }
+    }
+  }
+}
+
+void VulkanRenderTargetCache::FlushOverlappingDeferredResolveClears(
+    uint32_t base_tiles, uint32_t tile_count,
+    const VulkanRenderTarget* exclude_render_target) {
+  if (deferred_clear_render_targets_.empty() || !tile_count) {
+    return;
+  }
+  // Iterate over a snapshot because FlushDeferredResolveClearForTarget mutates
+  // deferred_clear_render_targets_.
+  std::vector<VulkanRenderTarget*> to_flush;
+  for (VulkanRenderTarget* rt : deferred_clear_render_targets_) {
+    if (!rt || rt == exclude_render_target || !rt->has_pending_resolve_clear()) {
+      continue;
+    }
+    const PendingResolveClear& existing = rt->pending_resolve_clear();
+    if (DeferredClearTileRangesOverlap(existing.base_tiles, existing.tile_count,
+                                       base_tiles, tile_count)) {
+      to_flush.push_back(rt);
+    }
+  }
+  for (VulkanRenderTarget* rt : to_flush) {
+    FlushDeferredResolveClearForTarget(rt);
+  }
+}
+
+void VulkanRenderTargetCache::StageDeferredResolveClearsForLastUpdate() {
+  ClearStagedDeferredResolveClears();
+  if (GetPath() != Path::kHostRenderTargets || !last_update_framebuffer_ ||
+      deferred_clear_render_targets_.empty()) {
+    return;
+  }
+  RenderTarget* const* rts = last_update_accumulated_render_targets();
+  const VkExtent2D& host_extent = last_update_framebuffer_->host_extent;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    const uint32_t bit = uint32_t(1) << i;
+    if (!(last_update_render_pass_key_.depth_and_color_used & bit) ||
+        !rts[i]) {
+      continue;
+    }
+    auto* vulkan_rt = static_cast<VulkanRenderTarget*>(rts[i]);
+    if (!vulkan_rt->has_pending_resolve_clear()) {
+      continue;
+    }
+    const PendingResolveClear& clear = vulkan_rt->pending_resolve_clear();
+    if (!DeferredClearRectFitsExtent(clear.rect, host_extent.width,
+                                     host_extent.height)) {
+      // Clear rectangle exceeds this framebuffer's extent (e.g., narrower
+      // pitch); flush it in its own full-extent framebuffer before drawing.
+      FlushDeferredResolveClearForTarget(vulkan_rt);
+      continue;
+    }
+    staged_deferred_clears_[i] = clear;
+    staged_deferred_clear_render_targets_[i] = vulkan_rt;
+    staged_deferred_clear_mask_ |= bit;
+    if (DeferredClearCoversExtent(clear.rect, host_extent.width,
+                                  host_extent.height)) {
+      staged_deferred_clear_full_mask_ |= bit;
+    }
+  }
+}
+
+void VulkanRenderTargetCache::ConsumeDeferredResolveClearsOnPassBegin(
+    uint32_t load_op_clear_mask) {
+  const uint32_t consumed_mask =
+      staged_deferred_clear_mask_ & load_op_clear_mask;
+  if (!consumed_mask) {
+    return;
+  }
+  DeferredCommandBuffer& command_buffer =
+      command_processor_.deferred_command_buffer();
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    const uint32_t bit = uint32_t(1) << i;
+    if (!(consumed_mask & bit)) {
+      continue;
+    }
+    command_buffer.ExpandRenderAreaToRect(
+        ToVkRect2D(staged_deferred_clears_[i].rect));
+    VulkanRenderTarget* vulkan_rt = staged_deferred_clear_render_targets_[i];
+    if (vulkan_rt) {
+      UnregisterPendingResolveClear(vulkan_rt);
+    }
+  }
+}
+
+void VulkanRenderTargetCache::EncodePendingDeferredResolveClears() {
+  if (!staged_deferred_clear_mask_) {
+    return;
+  }
+  DeferredCommandBuffer& command_buffer =
+      command_processor_.deferred_command_buffer();
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    const uint32_t bit = uint32_t(1) << i;
+    if (!(staged_deferred_clear_mask_ & bit)) {
+      continue;
+    }
+    VulkanRenderTarget* vulkan_rt = staged_deferred_clear_render_targets_[i];
+    if (!vulkan_rt || !vulkan_rt->has_pending_resolve_clear()) {
+      continue;
+    }
+    const PendingResolveClear clear = staged_deferred_clears_[i];
+    VkClearAttachment clear_attachment{};
+    clear_attachment.aspectMask = ToVkImageAspectFlags(clear.aspect);
+    clear_attachment.colorAttachment = i ? (i - 1) : 0;
+    clear_attachment.clearValue = ToVkClearValue(clear.value, clear.aspect);
+    VkClearRect clear_rect{};
+    clear_rect.rect = ToVkRect2D(clear.rect);
+    clear_rect.baseArrayLayer = 0;
+    clear_rect.layerCount = 1;
+    command_buffer.CmdVkClearAttachments(1, &clear_attachment, 1, &clear_rect);
+    UnregisterPendingResolveClear(vulkan_rt);
+  }
+  ClearStagedDeferredResolveClears();
+}
+
+bool VulkanRenderTargetCache::FlushAllDeferredResolveClears() {
+  if (deferred_clear_render_targets_.empty()) {
+    return false;
+  }
+  bool any_flushed = false;
+  while (!deferred_clear_render_targets_.empty()) {
+    VulkanRenderTarget* rt = deferred_clear_render_targets_.back();
+    if (FlushDeferredResolveClearForTarget(rt)) {
+      any_flushed = true;
+    } else {
+      UnregisterPendingResolveClear(rt);
+    }
+  }
+  ClearStagedDeferredResolveClears();
+  return any_flushed;
+}
+
+void VulkanRenderTargetCache::DiscardAllDeferredResolveClears() {
+  for (VulkanRenderTarget* rt : deferred_clear_render_targets_) {
+    if (rt) {
+      rt->ClearPendingResolveClear();
+    }
+  }
+  deferred_clear_render_targets_.clear();
+  ClearStagedDeferredResolveClears();
+}
+
 void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     VkRenderingAttachmentInfo* color_attachments,
     uint32_t* color_attachment_count_out,
     VkRenderingAttachmentInfo* depth_attachment,
     VkRenderingAttachmentInfo* stencil_attachment) const {
   RenderPassKey key = last_update_render_pass_key_;
-  if (mali_normalize_mixed_load_ops_) {
-    const uint32_t used = key.depth_and_color_used;
-    const uint32_t dont_care = key.depth_and_color_load_dont_care & used;
-    if (dont_care != 0 && dont_care != used) {
-      key.depth_and_color_load_dont_care = 0;
+  const RenderTarget* const* rts = last_update_accumulated_render_targets();
+
+  uint32_t candidate_load_op_clear_mask = 0;
+  if (use_dynamic_rendering_ && staged_deferred_clear_mask_) {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      const uint32_t bit = uint32_t(1) << i;
+      if ((staged_deferred_clear_mask_ & bit) &&
+          (staged_deferred_clear_full_mask_ & bit) &&
+          (key.depth_and_color_used & bit) && rts[i] &&
+          rts[i] == staged_deferred_clear_render_targets_[i] &&
+          static_cast<const VulkanRenderTarget*>(rts[i])
+              ->has_pending_resolve_clear()) {
+        candidate_load_op_clear_mask |= bit;
+      }
     }
   }
-  const RenderTarget* const* rts = last_update_accumulated_render_targets();
+
+  uint32_t dont_care_mask = key.depth_and_color_load_dont_care;
+  const DeferredClearFoldMode fold_mode = SelectDeferredClearFoldMode(
+      use_dynamic_rendering_, /*already_in_render_pass=*/false,
+      candidate_load_op_clear_mask != 0, mali_normalize_mixed_load_ops_,
+      key.depth_and_color_used, dont_care_mask, candidate_load_op_clear_mask);
+  const uint32_t load_op_clear_mask =
+      (fold_mode == DeferredClearFoldMode::kLoadOpClear)
+          ? candidate_load_op_clear_mask
+          : 0u;
+  if (!load_op_clear_mask && mali_normalize_mixed_load_ops_) {
+    const uint32_t used = key.depth_and_color_used;
+    const uint32_t dont_care = dont_care_mask & used;
+    if (dont_care != 0 && dont_care != used) {
+      dont_care_mask = 0;
+    }
+  }
+  last_update_load_op_clear_mask_ = load_op_clear_mask;
+  key.depth_and_color_load_dont_care = dont_care_mask;
 
   // Initialize depth/stencil attachments. Must match what pipeline creation
   // declared (depthAttachmentFormat from key.depth_and_color_used bit 0); null
@@ -5811,6 +6257,19 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
       depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       // Stencil uses the same view for depth-stencil formats.
       *stencil_attachment = *depth_attachment;
+      if (load_op_clear_mask & 0b1) {
+        const PendingResolveClear& clear = staged_deferred_clears_[0];
+        const VkClearValue vk_clear = ToVkClearValue(clear.value, clear.aspect);
+        if (AnyDeferredClearAspect(clear.aspect & DeferredClearAspect::kDepth)) {
+          depth_attachment->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          depth_attachment->clearValue = vk_clear;
+        }
+        if (AnyDeferredClearAspect(clear.aspect &
+                                   DeferredClearAspect::kStencil)) {
+          stencil_attachment->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          stencil_attachment->clearValue = vk_clear;
+        }
+      }
     }
   }
 
@@ -5826,7 +6285,8 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     std::memset(&color_attachment, 0, sizeof(VkRenderingAttachmentInfo));
     // Unused slots below the last used one are passed too (with a null view).
     color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    if (!(key.depth_and_color_used & (1 << (1 + i)))) {
+    const uint32_t slot_bit = uint32_t(1) << (1 + i);
+    if (!(key.depth_and_color_used & slot_bit)) {
       continue;
     }
     color_attachment_count = i + 1;
@@ -5836,10 +6296,16 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rts[1 + i]);
     color_attachment.imageView = vulkan_rt->view_depth_color();
     color_attachment.imageLayout = color_draw_layout_;
-    color_attachment.loadOp =
-        (key.depth_and_color_load_dont_care & (uint32_t(1) << (1 + i)))
-            ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
-            : VK_ATTACHMENT_LOAD_OP_LOAD;
+    if (load_op_clear_mask & slot_bit) {
+      color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      color_attachment.clearValue = ToVkClearValue(
+          staged_deferred_clears_[1 + i].value, DeferredClearAspect::kColor);
+    } else {
+      color_attachment.loadOp =
+          (key.depth_and_color_load_dont_care & slot_bit)
+              ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+              : VK_ATTACHMENT_LOAD_OP_LOAD;
+    }
     color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   }
   *color_attachment_count_out = color_attachment_count;
@@ -6085,6 +6551,7 @@ VkFormat VulkanRenderTargetCache::GetColorOwnershipTransferVulkanFormat(
 }
 
 VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
+  render_target_cache_.UnregisterPendingResolveClear(this);
   const ui::vulkan::VulkanDevice* const vulkan_device =
       render_target_cache_.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -9747,6 +10214,20 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     return;
   }
 
+  if (!in_current_render_pass) {
+    FlushDeferredResolveClearsForTransfers(
+        render_target_count, render_targets, render_target_transfers,
+        /*flush_dests=*/true);
+    if (resolve_clear_needed) {
+      for (uint32_t i = 0; i < render_target_count; ++i) {
+        if (render_targets[i]) {
+          FlushDeferredResolveClearForTarget(
+              static_cast<VulkanRenderTarget*>(render_targets[i]));
+        }
+      }
+    }
+  }
+
   command_processor_.PushDebugMarker("PerformTransfersAndResolveClears");
 
   const ui::vulkan::VulkanDevice* const vulkan_device =
@@ -11191,6 +11672,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
 }
 
 void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+  DiscardAllDeferredResolveClears();
   if (IsDrawResolutionScaled()) {
     // Scaled EDRAM has no 1:1 mapping to a guest snapshot.
     return;
@@ -11319,11 +11801,15 @@ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
 }
 
 void VulkanRenderTargetCache::DumpAllRenderTargetsToEdram() {
+  FlushAllDeferredResolveClears();
   DumpRenderTargets(0, xenos::kEdramTileCount, 1, xenos::kEdramTileCount,
                     false);
 }
 
 bool VulkanRenderTargetCache::BeginEdramSnapshotReadback() {
+  if (GetPath() == Path::kHostRenderTargets) {
+    FlushAllDeferredResolveClears();
+  }
   if (edram_snapshot_download_buffer_ == VK_NULL_HANDLE) {
     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
             command_processor_.GetVulkanDevice(), xenos::kEdramSizeBytes,
@@ -11401,6 +11887,8 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
                                                 uint32_t dump_pitch,
                                                 bool native_layout) {
   assert_true(GetPath() == Path::kHostRenderTargets);
+
+  FlushAllDeferredResolveClears();
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
                                  dump_pitch, dump_rectangles_);

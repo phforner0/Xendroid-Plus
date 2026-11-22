@@ -28,6 +28,7 @@
 #endif
 
 #include "xenia/base/assert.h"
+#include "xenia/base/android_thermal.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/filesystem.h"
@@ -242,6 +243,15 @@ DEFINE_int32(
     "Coverage, depth and stencil stay per sample: edges keep their "
     "antialiasing, textures and lighting inside triangles get coarser. Can be "
     "switched at runtime (debug.xendroid.shading_rate).",
+    "GPU");
+
+DEFINE_bool(
+    vulkan_auto_vrs_thermal, false,
+    "Automatically adjust fragment shading rate (1x1 -> 2x1 -> 2x2) on "
+    "multisampled 3D scene draws based on Android thermal status and headroom "
+    "when vulkan_shading_rate is 0. Opt-in, requires device support for "
+    "VK_KHR_fragment_shading_rate at startup. Can be switched at runtime "
+    "(debug.xendroid.auto_vrs_thermal).",
     "GPU");
 
 DEFINE_bool(
@@ -594,6 +604,14 @@ void PollDebugPropertyOverrides(CommandProcessor& command_processor) {
   PollDebugPropertyOverride("debug.xendroid.resolve_clear_in_guest_pass",
                             "vulkan_resolve_clear_in_guest_pass",
                             cvars::vulkan_resolve_clear_in_guest_pass);
+  const bool prev_defer_resolve_clears = cvars::vulkan_defer_resolve_clears;
+  PollDebugPropertyOverride("debug.xendroid.defer_resolve_clears",
+                            "vulkan_defer_resolve_clears",
+                            cvars::vulkan_defer_resolve_clears);
+  if (prev_defer_resolve_clears && !cvars::vulkan_defer_resolve_clears) {
+    static_cast<VulkanCommandProcessor&>(command_processor)
+        .FlushDeferredResolveClearsIfPending();
+  }
   // Read per frame (merge_tiling_bands) and per draw (the other two).
   PollDebugPropertyOverride("debug.xendroid.merge_bands", "merge_tiling_bands",
                             cvars::merge_tiling_bands);
@@ -792,6 +810,9 @@ void PollDebugPropertyOverrides(CommandProcessor& command_processor) {
       XELOGI("debug.xendroid.shading_rate: vulkan_shading_rate = {}", rate);
     }
   }
+  PollDebugPropertyOverride("debug.xendroid.auto_vrs_thermal",
+                            "vulkan_auto_vrs_thermal",
+                            cvars::vulkan_auto_vrs_thermal);
   // Draws per mid-frame submission (0 = one submission per frame), read per
   // draw.
   char submit_value[PROP_VALUE_MAX] = {};
@@ -4065,6 +4086,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   PollFrameDump();
   ReassertGpuPowerControlIfDue();
 
+  if (cvars::vulkan_auto_vrs_thermal) {
+    const uint64_t now_ms = Clock::QueryHostUptimeMillis();
+    if (last_thermal_vrs_poll_ms_ == 0 ||
+        (now_ms >= last_thermal_vrs_poll_ms_ &&
+         (now_ms - last_thermal_vrs_poll_ms_) >= 2000)) {
+      last_thermal_vrs_poll_ms_ = now_ms;
+      thermal_vrs_controller_.Update(now_ms, xe::ReadAndroidThermalSample(10));
+    }
+  } else {
+    thermal_vrs_controller_.Reset();
+    last_thermal_vrs_poll_ms_ = 0;
+  }
+
   if (!pipeline_use_.empty()) {
     // Most-used shader pairs of the traced frame, to rank against PipeStats.
     std::vector<std::pair<std::tuple<uint64_t, uint64_t, uint32_t>,
@@ -5838,11 +5872,13 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     // For dynamic rendering, compare framebuffer directly.
     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
         current_render_pass_ == VK_NULL_HANDLE) {
+      render_target_cache_->EncodePendingDeferredResolveClears();
       return;
     }
   } else {
     if (current_render_pass_ == render_pass &&
         current_framebuffer_ == framebuffer) {
+      render_target_cache_->EncodePendingDeferredResolveClears();
       return;
     }
   }
@@ -5954,6 +5990,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   // Resume any pending ZPD segment now that the pass is open.
   OpenQuerySegment(false);
+
+  render_target_cache_->ConsumeDeferredResolveClearsOnPassBegin(
+      use_dynamic_rendering
+          ? render_target_cache_->last_update_load_op_clear_mask()
+          : 0u);
+  render_target_cache_->EncodePendingDeferredResolveClears();
 }
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -7847,11 +7889,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             cvars::vulkan_fable2_float24_depth)))) {
     // Once per 2x2 pixels, the samples of a 4x pixel.
     draw_shading_rate_ = 3;
-  } else if (cvars::vulkan_shading_rate && pixel_shader &&
-             device_properties.pipelineFragmentShadingRate) {
+  } else if ((cvars::vulkan_shading_rate || cvars::vulkan_auto_vrs_thermal) &&
+             pixel_shader && device_properties.pipelineFragmentShadingRate) {
     const xenos::MsaaSamples guest_msaa_samples =
         regs.Get<reg::RB_SURFACE_INFO>().msaa_samples;
     if (guest_msaa_samples != xenos::MsaaSamples::k1X &&
+        !pixel_shader->memexport_eM_written() &&
         (uint32_t(1) << uint32_t(render_target_cache_->GetHostMsaaSamples(
              guest_msaa_samples))) <=
             uint32_t(
@@ -7863,7 +7906,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         (!regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable ||
          device_properties.fragmentShadingRateWithShaderSampleMask ||
          (cvars::host_alpha_to_coverage && (normalized_color_mask & 0xF)))) {
-      draw_shading_rate_ = uint32_t(cvars::vulkan_shading_rate) & 3;
+      draw_shading_rate_ = SelectDrawShadingRate(
+          cvars::vulkan_shading_rate, cvars::vulkan_auto_vrs_thermal,
+          thermal_vrs_controller_.current_rate(),
+          guest_msaa_samples == xenos::MsaaSamples::k1X,
+          pixel_shader->memexport_eM_written() != 0,
+          device_properties.maxFragmentSize.width,
+          device_properties.maxFragmentSize.height);
     }
   }
   const VulkanPipelineCache::DynamicState& active_dynamic_state =
