@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "xenia/base/threading.h"
+#include "xenia/kernel/adpf_tid_registry.h"
 
 namespace xe {
 namespace kernel {
@@ -198,6 +199,14 @@ class GuestScheduler {
   void ExitIfTerminated();
 
   KernelState* kernel_state() const { return kernel_state_; }
+
+  GuestCpuTidRegistry& cpu_tid_registry() { return cpu_tid_registry_; }
+  const GuestCpuTidRegistry& cpu_tid_registry() const {
+    return cpu_tid_registry_;
+  }
+  void TickAdpfHint(bool enabled, uint64_t frame_duration_ns) {
+    adpf_session_.OnFrameTick(enabled, frame_duration_ns, cpu_tid_registry_);
+  }
 
  private:
   // Xbox 360 logical CPU count, also the maximum number of dispatch threads.
@@ -480,6 +489,9 @@ class GuestScheduler {
   std::atomic<uint32_t> io_pool_tids_[kMaxIoPoolThreads]{};
   uint64_t stats_thread_cpu_ticks_[kMaxCpus + 1 + kMaxIoPoolThreads] = {};
   void ReportThreadPlacement(uint64_t interval_ms);
+
+  GuestCpuTidRegistry cpu_tid_registry_;
+  CpuPerformanceHintSession adpf_session_;
 };
 
 }  // namespace kernel

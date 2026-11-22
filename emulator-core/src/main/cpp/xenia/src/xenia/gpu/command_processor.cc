@@ -26,6 +26,7 @@
 DECLARE_int32(spin_park_mode);
 DECLARE_uint32(guest_yield_sleep_us);
 DECLARE_int32(apu_queue_target);
+DECLARE_bool(kernel_delay0_backoff);
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/byte_stream.h"
@@ -37,6 +38,7 @@ DECLARE_int32(apu_queue_target);
 #include "xenia/config.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/backend/code_cache.h"
+#include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/mmio_handler.h"
 #include "xenia/cpu/processor.h"
@@ -46,8 +48,13 @@ DECLARE_int32(apu_queue_target);
 #include "xenia/gpu/sampler_info.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/xenos_zpd_report.h"
+#include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
+
+namespace {
+std::atomic<uint64_t> cpu_hint_last_swap_ns_{0};
+}  // namespace
 
 #if !defined(NDEBUG)
 
@@ -438,6 +445,11 @@ void CommandProcessor::Shutdown() {
         wrm_writer_callback_handle_);
     wrm_writer_callback_handle_ = nullptr;
   }
+
+  cpu_hint_last_swap_ns_.store(0, std::memory_order_relaxed);
+  if (kernel_state_ && kernel_state_->guest_scheduler()) {
+    kernel_state_->guest_scheduler()->TickAdpfHint(false, 0);
+  }
 }
 
 void CommandProcessor::InitializeShaderStorage(
@@ -721,6 +733,20 @@ uint64_t CommandProcessor::FrameWaitBegin() {
 
 void CommandProcessor::FrameHintEndFrame() {
 #if defined(__ANDROID__)
+  if (kernel_state_ && kernel_state_->guest_scheduler()) {
+    if (__atomic_load_n(&cvars::adpf_cpu_performance_hint,
+                        __ATOMIC_RELAXED)) {
+      const uint64_t cpu_now = FrameStatsNow();
+      const uint64_t prev =
+          cpu_hint_last_swap_ns_.exchange(cpu_now, std::memory_order_relaxed);
+      const uint64_t cpu_interval =
+          (prev && cpu_now > prev) ? (cpu_now - prev) : 0;
+      kernel_state_->guest_scheduler()->TickAdpfHint(true, cpu_interval);
+    } else {
+      cpu_hint_last_swap_ns_.store(0, std::memory_order_relaxed);
+      kernel_state_->guest_scheduler()->TickAdpfHint(false, 0);
+    }
+  }
   if (!cvars::gpu_performance_hint || frame_hint_failed_) {
     return;
   }
@@ -895,6 +921,17 @@ void CommandProcessor::BinTracePoll() {
       cvars::guest_yield_sleep_us = sleep_us;
       XELOGI("debug.xendroid.yield_sleep_us: guest_yield_sleep_us = {}",
              sleep_us);
+    }
+  }
+  if (__system_property_get("debug.xendroid.delay0_backoff", value) > 0 &&
+      (value[0] == '0' || value[0] == '1')) {
+    const bool enabled = value[0] == '1';
+    if (__atomic_load_n(&cvars::kernel_delay0_backoff, __ATOMIC_RELAXED) !=
+        enabled) {
+      __atomic_store_n(&cvars::kernel_delay0_backoff, enabled,
+                       __ATOMIC_RELAXED);
+      XELOGI("debug.xendroid.delay0_backoff: kernel_delay0_backoff = {}",
+             enabled);
     }
   }
   // debug.xendroid.wrm_log N: log the next N PM4_WAIT_REG_MEM waits that were

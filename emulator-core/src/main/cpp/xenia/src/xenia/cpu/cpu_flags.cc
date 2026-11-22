@@ -93,6 +93,11 @@ DEFINE_bool(break_condition_truncate, true, "truncate value to 32-bits", "CPU");
 
 DEFINE_bool(break_on_debugbreak, true, "int3 on JITed __debugbreak requests.",
             "CPU");
+DEFINE_bool(
+    adpf_cpu_performance_hint, false,
+    "Android: register live guest CPU worker threads with an ADPF performance "
+    "hint session to stabilize CPU clocks under heavy load.",
+    "CPU");
 
 namespace xe {
 namespace cpu {

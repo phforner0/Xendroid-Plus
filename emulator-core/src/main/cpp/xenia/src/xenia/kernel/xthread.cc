@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xthread.h"
 
+#include <chrono>
+
 #if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID || XE_PLATFORM_MAC
 #include <pthread.h>
 #endif
@@ -41,6 +43,13 @@ DEFINE_bool(
     "instead of a plain sleep. Guest frame-pacing sleeps sit on the frame "
     "critical path, and a plain host sleep overshoots by the scheduler "
     "wakeup latency, inflating frame time directly.",
+    "Kernel");
+
+DEFINE_bool(
+    kernel_delay0_backoff, true,
+    "Back off KeDelayExecutionThread(0) spin-waits with progressive short "
+    "sleeps (100-500 us) when nothing else is runnable on the CPU, guarded by "
+    "kLateGuard against host scheduler contention.",
     "Kernel");
 
 #if 0
@@ -175,6 +184,11 @@ uint32_t XThread::GetCurrentThreadId() {
 }
 
 void XThread::OnHostThreadExitCleanup() {
+  if (guest_thread_ && !fiber_ && kernel_state() &&
+      kernel_state()->guest_scheduler()) {
+    kernel_state()->guest_scheduler()->cpu_tid_registry().UnregisterTid(
+        static_cast<int32_t>(xe::threading::current_thread_system_id()));
+  }
   running_ = false;
   current_thread_ = nullptr;
   current_xthread_tls_ = nullptr;
@@ -538,6 +552,11 @@ X_STATUS XThread::Create() {
       current_thread_ = this;
       cpu::ThreadState::Bind(this->thread_state());
       running_ = true;
+      if (guest_thread_ && kernel_state() &&
+          kernel_state()->guest_scheduler()) {
+        kernel_state()->guest_scheduler()->cpu_tid_registry().RegisterTid(
+            static_cast<int32_t>(xe::threading::current_thread_system_id()));
+      }
 
 #if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID || XE_PLATFORM_MAC
       pthread_cleanup_push(HostThreadExitCleanupThunk, this);
@@ -1378,7 +1397,30 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
     // deadline, returning early on a user APC when alertable.
     auto* scheduler = kernel_state()->guest_scheduler();
     if (timeout_ms == 0) {
-      scheduler->YieldCurrentThread(false);
+      const bool yielded = scheduler->YieldCurrentThread(false);
+      if (yielded) {
+        delay0_backoff_.Reset();
+      } else if (__atomic_load_n(&cvars::kernel_delay0_backoff,
+                                  __ATOMIC_RELAXED)) {
+        const uint64_t now_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        const uint32_t sleep_us =
+            delay0_backoff_.NextSleepUs(now_ns, /*nothing_else_to_run=*/true);
+        if (sleep_us > 0) {
+          xe::threading::NanoSleep(static_cast<int64_t>(sleep_us) * 1000);
+          const uint64_t after_ns = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count());
+          const uint64_t actual_ns =
+              after_ns >= now_ns ? (after_ns - now_ns) : 0;
+          delay0_backoff_.RecordSleepResult(after_ns, sleep_us, actual_ns);
+        }
+      } else {
+        delay0_backoff_.Reset();
+      }
       return X_STATUS_SUCCESS;
     }
     uint64_t deadline = Clock::QueryHostUptimeMillis() + timeout_ms;
@@ -1420,10 +1462,34 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable,
       }
       xe::threading::PreciseSleep(std::chrono::nanoseconds(timeout_ns));
     } else if (timeout_ms == 0) {
-      if (priority_ <= xe::threading::ThreadPriority::kBelowNormal) {
-        xe::threading::NanoSleep(100);
+      bool backed_off = false;
+      if (__atomic_load_n(&cvars::kernel_delay0_backoff, __ATOMIC_RELAXED)) {
+        const uint64_t now_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        const uint32_t sleep_us =
+            delay0_backoff_.NextSleepUs(now_ns, /*nothing_else_to_run=*/true);
+        if (sleep_us > 0) {
+          xe::threading::NanoSleep(static_cast<int64_t>(sleep_us) * 1000);
+          const uint64_t after_ns = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count());
+          const uint64_t actual_ns =
+              after_ns >= now_ns ? (after_ns - now_ns) : 0;
+          delay0_backoff_.RecordSleepResult(after_ns, sleep_us, actual_ns);
+          backed_off = true;
+        }
       } else {
-        xe::threading::MaybeYield();
+        delay0_backoff_.Reset();
+      }
+      if (!backed_off) {
+        if (priority_ <= xe::threading::ThreadPriority::kBelowNormal) {
+          xe::threading::NanoSleep(100);
+        } else {
+          xe::threading::MaybeYield();
+        }
       }
     } else {
       xe::threading::Sleep(std::chrono::milliseconds(timeout_ms));

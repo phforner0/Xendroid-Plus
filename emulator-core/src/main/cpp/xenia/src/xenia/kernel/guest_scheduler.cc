@@ -422,7 +422,9 @@ void GuestScheduler::EnsureStarted() {
 }
 
 void GuestScheduler::Shutdown() {
+  adpf_session_.Shutdown();
   if (!started_.load() && !io_started_.load()) {
+    cpu_tid_registry_.Clear();
     return;
   }
   if (stopped_.load()) {
@@ -550,6 +552,7 @@ void GuestScheduler::Shutdown() {
     XObject::AbandonCooperativeWait(t);
     t->ReclaimExited();
   }
+  cpu_tid_registry_.Clear();
   stopped_.store(true);
 }
 
@@ -1777,8 +1780,18 @@ void GuestScheduler::RereadyBlocked(int cpu_index, bool poked) {
 void GuestScheduler::RunLoop(int cpu_index) {
   t_current_cpu = cpu_index;
   Cpu& cpu = cpus_[cpu_index];
-  cpu.host_tid.store(xe::threading::current_thread_system_id(),
+  const int32_t host_tid =
+      static_cast<int32_t>(xe::threading::current_thread_system_id());
+  cpu.host_tid.store(static_cast<uint32_t>(host_tid),
                      std::memory_order_relaxed);
+  struct CpuTidGuard {
+    GuestCpuTidRegistry& registry;
+    int32_t tid;
+    CpuTidGuard(GuestCpuTidRegistry& reg, int32_t t) : registry(reg), tid(t) {
+      registry.RegisterTid(tid);
+    }
+    ~CpuTidGuard() { registry.UnregisterTid(tid); }
+  } tid_guard(cpu_tid_registry_, host_tid);
   // Adopt this host thread's stack as this CPU's idle fiber.
   cpu.idle_fiber = xe::threading::Fiber::CreateFromThread();
   XELOGI("GuestScheduler: CPU {} dispatch loop started", cpu_index);

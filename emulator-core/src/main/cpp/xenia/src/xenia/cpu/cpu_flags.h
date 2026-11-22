@@ -45,6 +45,7 @@ DECLARE_string(break_condition_op);
 DECLARE_bool(break_condition_truncate);
 
 DECLARE_bool(break_on_debugbreak);
+DECLARE_bool(adpf_cpu_performance_hint);
 
 namespace xe {
 namespace cpu {
