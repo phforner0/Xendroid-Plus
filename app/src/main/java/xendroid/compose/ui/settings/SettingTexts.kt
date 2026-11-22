@@ -120,6 +120,9 @@ private val TITLES: Map<String, Int> = mapOf(
     "Kernel|file_read_no_apc_inline" to R.string.st_t_kernel_file_read_no_apc_inline,
     "GPU|gpu_texture_lod_bias" to R.string.st_t_gpu_gpu_texture_lod_bias,
     "Vulkan|vulkan_android_present_divisor" to R.string.st_t_vulkan_vulkan_android_present_divisor,
+    "GPU|vulkan_defer_resolve_clears" to R.string.st_t_gpu_vulkan_defer_resolve_clears,
+    "GPU|vulkan_auto_vrs_thermal" to R.string.st_t_gpu_vulkan_auto_vrs_thermal,
+    "CPU|adpf_cpu_performance_hint" to R.string.st_t_cpu_adpf_cpu_performance_hint,
 )
 
 private val DESCRIPTIONS: Map<String, Int> = mapOf(
@@ -227,6 +230,9 @@ private val DESCRIPTIONS: Map<String, Int> = mapOf(
     "Kernel|file_read_no_apc_inline" to R.string.st_d_kernel_file_read_no_apc_inline,
     "GPU|gpu_texture_lod_bias" to R.string.st_d_gpu_gpu_texture_lod_bias,
     "Vulkan|vulkan_android_present_divisor" to R.string.st_d_vulkan_vulkan_android_present_divisor,
+    "GPU|vulkan_defer_resolve_clears" to R.string.st_d_gpu_vulkan_defer_resolve_clears,
+    "GPU|vulkan_auto_vrs_thermal" to R.string.st_d_gpu_vulkan_auto_vrs_thermal,
+    "CPU|adpf_cpu_performance_hint" to R.string.st_d_cpu_adpf_cpu_performance_hint,
 )
 
 private val CATEGORIES: Map<String, Int> = mapOf(

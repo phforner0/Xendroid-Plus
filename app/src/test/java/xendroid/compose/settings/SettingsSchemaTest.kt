@@ -18,19 +18,21 @@ class SettingsSchemaTest {
     // less APU|mute and GPU|readback_memexport, which the core never defined (ajustes-2.md).
     // Display|host_present_from_non_ui_thread is intentionally absent (forced true natively).
     // Plus adds Vulkan|zerofg_mode, System link's Network|systemlink + Network|systemlink_peers (176),
-    // the 19 Plus Ultra Track A/B/C/D canonical engine cvars (195), and the 2 Wave 1 mobile
-    // optimization cvars (GPU|gpu_texture_lod_bias, Vulkan|vulkan_android_present_divisor): 197.
-    @Test fun total_entry_count_is_197() {
-        assertEquals(197, all.size)
+    // the 19 Plus Ultra Track A/B/C/D canonical engine cvars (195), the 2 Wave 1 mobile
+    // optimization cvars (GPU|gpu_texture_lod_bias, Vulkan|vulkan_android_present_divisor) (197),
+    // and the 3 Wave 2 mobile render/thermal/ADPF cvars (GPU|vulkan_defer_resolve_clears,
+    // GPU|vulkan_auto_vrs_thermal, CPU|adpf_cpu_performance_hint): 200.
+    @Test fun total_entry_count_is_200() {
+        assertEquals(200, all.size)
         assertEquals(
-            197,
+            200,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
     }
 
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(138, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra bool cvars
+        assertEquals(141, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra + 3 Wave 2 bool cvars
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
         assertEquals(34, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start + 2 Wave 1 list cvars
         assertEquals(2, all.count { it is Setting.Action })
@@ -205,6 +207,21 @@ class SettingsSchemaTest {
         )
         assertTrue(presentDiv.desc.isNotBlank())
         assertFalse(presentDiv.key in SettingsSchema.playerKeys)
+    }
+
+    @Test fun wave2_mobile_thermal_opts_match_contract() {
+        fun assertWave2Bool(key: String, expectedDefault: Boolean) {
+            val s = SettingsSchema.byKey[key] as? Setting.Bool
+            assertNotNull("missing Wave 2 setting: $key", s)
+            assertEquals(key, expectedDefault, s!!.default)
+            assertTrue("$key title must be non-blank", s.title.isNotBlank())
+            assertTrue("$key desc must be non-blank", s.desc.isNotBlank())
+            assertFalse("$key must not be in playerKeys", s.key in SettingsSchema.playerKeys)
+        }
+        assertWave2Bool("GPU|vulkan_defer_resolve_clears", true)
+        assertWave2Bool("GPU|vulkan_auto_vrs_thermal", false)
+        assertWave2Bool("CPU|adpf_cpu_performance_hint", false)
+        assertNull(SettingsSchema.byKey["Kernel|kernel_delay0_backoff"])
     }
 
     /** vulkan_texture_cache reads -1 (no override) and 0..5 (off, 1x..16x). */

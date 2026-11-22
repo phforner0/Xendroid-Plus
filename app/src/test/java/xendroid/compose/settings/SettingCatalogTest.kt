@@ -28,14 +28,26 @@ class SettingCatalogTest {
         assertEquals(SettingsSchema.allSettings.size, x.size)
     }
 
-    @Test fun thirty_one_new_cvars_and_two_new_values() {
-        assertEquals(31, SettingCatalog.newCount)
+    @Test fun thirty_four_new_cvars_and_two_new_values() {
+        assertEquals(34, SettingCatalog.newCount)
         assertEquals(2, SettingCatalog.newOptionCount)
         listOf("GPU|gpu_texture_lod_bias", "Vulkan|vulkan_android_present_divisor").forEach { key ->
             val meta = SettingCatalog.meta(key)
             assertEquals(SettingLevel.ADVANCED, meta.level)
             assertTrue("$key must be marked isNew", meta.isNew)
         }
+        listOf(
+            "GPU|vulkan_defer_resolve_clears",
+            "GPU|vulkan_auto_vrs_thermal",
+            "CPU|adpf_cpu_performance_hint",
+        ).forEach { key ->
+            val meta = SettingCatalog.meta(key)
+            assertEquals(SettingGroup.PERFORMANCE, meta.group)
+            assertEquals(SettingLevel.ADVANCED, meta.level)
+            assertTrue("$key must be marked isNew", meta.isNew)
+            assertFalse("$key must not be marked live", meta.live)
+        }
+        assertFalse("Kernel|kernel_delay0_backoff" in SettingCatalog.placedKeys)
     }
 
     @Test fun dependencies_name_real_settings_and_values() {

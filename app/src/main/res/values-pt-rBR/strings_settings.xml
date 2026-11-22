@@ -312,4 +312,10 @@
     <string name="st_d_gpu_gpu_texture_lod_bias">Desloca o nível de detalhe de mipmaps em texturas 3D para economizar banda da GPU no celular (0 mantém o padrão do jogo; +1 usa mips em meia resolução). Vale a partir da próxima abertura.</string>
     <string name="st_t_vulkan_vulkan_android_present_divisor">Divisor de tamanho do swapchain</string>
     <string name="st_d_vulkan_vulkan_android_present_divisor">Reduz o tamanho do swapchain em telas de alta densidade por um fator inteiro, mantendo no mínimo a resolução de renderização do jogo (economiza GPU em telas QHD+ e tablets). Automático escolhe sozinho; Painel nativo desativa.</string>
+    <string name="st_t_gpu_vulkan_defer_resolve_clears">Adiar limpezas de resolve</string>
+    <string name="st_d_gpu_vulkan_defer_resolve_clears">Agrupa limpezas elegíveis de resolve da EDRAM no próximo render pass de desenho via LOAD_OP_CLEAR ou limpeza no pass, reduzindo tráfego em GPUs mobile.</string>
+    <string name="st_t_gpu_vulkan_auto_vrs_thermal">Auto-VRS térmico</string>
+    <string name="st_d_gpu_vulkan_auto_vrs_thermal">Escala dinamicamente a taxa de shading da cena 3D multisampled (1x1 -> 2x1 -> 2x2) sob pressão térmica no Android (nunca afeta pós-processamento 1x ou HUD). Vale a partir da próxima abertura.</string>
+    <string name="st_t_cpu_adpf_cpu_performance_hint">Dica de desempenho de CPU guest (ADPF)</string>
+    <string name="st_d_cpu_adpf_cpu_performance_hint">Registra threads ativas de CPU guest em uma sessão ADPF do Android para estabilizar clocks sob carga pesada de CPU.</string>
 </resources>

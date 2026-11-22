@@ -206,5 +206,8 @@ object SettingDescriptions {
         "file_read_no_apc_inline" to "Queues asynchronous NtReadFile I/O completion APCs instead of firing them inline before returning, fixing hangs in Peter Jackson's King Kong",
         "gpu_texture_lod_bias" to "Shifts mipmap detail level on 3D textures to save GPU bandwidth on mobile devices (0 keeps game default; +1 uses half-res mips). Applies from next launch",
         "vulkan_android_present_divisor" to "Reduces high-DPI panel swapchain size by an integer factor while keeping at least the game's render resolution (saves GPU time on QHD+/tablet displays). Auto picks automatically; Native panel disables",
+        "vulkan_defer_resolve_clears" to "Folds eligible EDRAM resolve clears into the next draw render pass via LOAD_OP_CLEAR or in-pass clears, cutting tile-memory round-trips on mobile GPUs",
+        "vulkan_auto_vrs_thermal" to "Dynamically scales 3D multisampled scene shading rate (1x1 -> 2x1 -> 2x2) when Android thermal pressure rises (never affects 1x post-processing or HUD). Applies from next launch",
+        "adpf_cpu_performance_hint" to "Registers live guest CPU worker threads with an Android ADPF performance hint session to stabilize clocks under heavy CPU load",
     )
 }

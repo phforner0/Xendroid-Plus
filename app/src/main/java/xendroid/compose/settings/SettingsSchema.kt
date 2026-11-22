@@ -282,6 +282,8 @@ object SettingsSchema {
             b("GPU", "spirv_texture_iscale_specialization", "Specialize integer-scaled texture fetches", true),
             b("GPU", "vulkan_shader_register_ssa", "Promote Xenos GPRs to SPIR-V SSA", true),
             b("GPU", "vulkan_fable2_float24_depth", "Quantize float24 fragment depth (Fable II)", false),
+            b("GPU", "vulkan_defer_resolve_clears", "Defer resolve clears", true),
+            b("GPU", "vulkan_auto_vrs_thermal", "Thermal auto-VRS", false),
         )),
 
         SettingsCategory("CPU", listOf(
@@ -303,6 +305,7 @@ object SettingsSchema {
             b("CPU", "collapse_memory_delay_spins", "Collapse memory delay countdowns", true),
             b("CPU", "log_delay_collapse_rejects", "Log delay-collapse rejects", false),
             b("CPU", "log_safepoint_pc", "Record safepoint addresses (wedge diagnosis)", false),
+            b("CPU", "adpf_cpu_performance_hint", "Guest CPU performance hint (ADPF)", false),
         )),
 
         SettingsCategory("Logging", listOf(

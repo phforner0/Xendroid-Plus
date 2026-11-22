@@ -117,7 +117,7 @@ object SettingsProfiles {
         "GPU|texture_cache_memory_limit_soft", "GPU|texture_cache_memory_limit_hard",
         "GPU|spirv_forward_jump_segments", "GPU|spirv_nonfinite_safe_fmul",
         "GPU|spirv_texture_iscale_specialization", "GPU|vulkan_shader_register_ssa",
-        "GPU|vulkan_fable2_float24_depth",
+        "GPU|vulkan_fable2_float24_depth", "GPU|vulkan_defer_resolve_clears", "GPU|vulkan_auto_vrs_thermal",
         "Vulkan|turnip_debug", "Vulkan|vulkan_async_skip_draws", "Vulkan|vulkan_placeholder_pipelines",
         "Vulkan|vulkan_dynamic_pipeline_state", "Vulkan|vulkan_pipeline_creation_threads",
         "Vulkan|vulkan_in_pass_resolve", "Vulkan|vulkan_resolve_to_texture_promote",
@@ -138,6 +138,7 @@ object SettingsProfiles {
         "Kernel|file_read_no_apc_inline",
         "CPU|collapse_memory_delay_spins",
         "CPU|a64_call_aware_volatile_gprs", "CPU|a64_fast_vmx_estimates", "CPU|enable_early_precompilation",
+        "CPU|adpf_cpu_performance_hint",
         "APU|xma_decoder", "APU|use_dedicated_xma_thread", "APU|apu_pump_topup",
         "APU|apu_max_queued_frames", "APU|apu_aaudio_buffer_bursts",
     )
