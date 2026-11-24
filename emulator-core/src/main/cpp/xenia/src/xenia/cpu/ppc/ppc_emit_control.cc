@@ -11,6 +11,7 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
@@ -76,22 +77,24 @@ static bool TryInlineGprlrSaverest(PPCHIRBuilder& f, uint64_t cia,
     return false;
   }
   Value* r1 = f.LoadGPR(1);
+  const bool allow_skew_flag = cvars::a64_skip_stack_skew_fixup &&
+                               xe::memory::allocation_granularity() > 0x1000;
   if (function->IsSave() && lk && (cvars::inline_gprlr_saverest_parts & 1)) {
     // bl __savegprlr_N: LR <- cia+4 architecturally, though the real return
     // path goes through the r12 slot the restore reloads.
     for (int r = n; r <= 31; ++r) {
       const int64_t disp = -0x98 + 8 * (r - 14);
       Value* offset = f.LoadConstantInt64(disp);
-      const uint32_t flags = (cvars::a64_skip_stack_skew_fixup &&
-                              IsSafeStackDispAccess(1, disp, false))
-                                 ? LOAD_STORE_NO_PHYSICAL_SKEW
-                                 : 0u;
+      const uint32_t flags =
+          (allow_skew_flag && IsSafeStackDispAccess(1, disp, false))
+              ? LOAD_STORE_NO_PHYSICAL_SKEW
+              : 0u;
       f.StoreOffset(r1, offset, f.ByteSwap(f.LoadGPR(r)), flags);
     }
-    const uint32_t lr_store_flags = (cvars::a64_skip_stack_skew_fixup &&
-                                     IsSafeStackDispAccess(1, -8, false))
-                                        ? LOAD_STORE_NO_PHYSICAL_SKEW
-                                        : 0u;
+    const uint32_t lr_store_flags =
+        (allow_skew_flag && IsSafeStackDispAccess(1, -8, false))
+            ? LOAD_STORE_NO_PHYSICAL_SKEW
+            : 0u;
     f.StoreOffset(r1, f.LoadConstantInt64(-8),
                   f.ByteSwap(f.Truncate(f.LoadGPR(12), INT32_TYPE)),
                   lr_store_flags);
@@ -105,16 +108,16 @@ static bool TryInlineGprlrSaverest(PPCHIRBuilder& f, uint64_t cia,
     for (int r = n; r <= 31; ++r) {
       const int64_t disp = -0x98 + 8 * (r - 14);
       Value* offset = f.LoadConstantInt64(disp);
-      const uint32_t flags = (cvars::a64_skip_stack_skew_fixup &&
-                              IsSafeStackDispAccess(1, disp, false))
-                                 ? LOAD_STORE_NO_PHYSICAL_SKEW
-                                 : 0u;
+      const uint32_t flags =
+          (allow_skew_flag && IsSafeStackDispAccess(1, disp, false))
+              ? LOAD_STORE_NO_PHYSICAL_SKEW
+              : 0u;
       f.StoreGPR(r, f.ByteSwap(f.LoadOffset(r1, offset, INT64_TYPE, flags)));
     }
-    const uint32_t lr_load_flags = (cvars::a64_skip_stack_skew_fixup &&
-                                    IsSafeStackDispAccess(1, -8, false))
-                                       ? LOAD_STORE_NO_PHYSICAL_SKEW
-                                       : 0u;
+    const uint32_t lr_load_flags =
+        (allow_skew_flag && IsSafeStackDispAccess(1, -8, false))
+            ? LOAD_STORE_NO_PHYSICAL_SKEW
+            : 0u;
     Value* ret = f.ZeroExtend(
         f.ByteSwap(f.LoadOffset(r1, f.LoadConstantInt64(-8), INT32_TYPE,
                                 lr_load_flags)),

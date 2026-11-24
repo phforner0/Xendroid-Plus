@@ -881,6 +881,34 @@ void TestTomlOnlyCvarContracts(const std::filesystem::path& cpp_dir) {
   }
 }
 
+void TestStripNoPhysicalSkewContract(const std::filesystem::path& cpp_dir) {
+  const std::string skew_h = ReadSourceText(
+      cpp_dir / "xenia/src/xenia/cpu/backend/a64/a64_stack_skew_analysis.h");
+  WAVE3_CHECK(skew_h.find("bool IsLoadStoreOpcode(") != std::string::npos);
+  WAVE3_CHECK(skew_h.find("OPCODE_LOAD") != std::string::npos);
+  WAVE3_CHECK(skew_h.find("OPCODE_LOAD_OFFSET") != std::string::npos);
+  WAVE3_CHECK(skew_h.find("OPCODE_STORE") != std::string::npos);
+  WAVE3_CHECK(skew_h.find("OPCODE_STORE_OFFSET") != std::string::npos);
+
+  const size_t strip_pos = skew_h.find("StripNoPhysicalSkewFlags(");
+  WAVE3_CHECK(strip_pos != std::string::npos);
+  const std::string strip_body = skew_h.substr(strip_pos);
+  const size_t guard_pos = strip_body.find("IsLoadStoreOpcode(");
+  const size_t clear_pos = strip_body.find("LOAD_STORE_NO_PHYSICAL_SKEW");
+  WAVE3_CHECK(guard_pos != std::string::npos);
+  WAVE3_CHECK(clear_pos != std::string::npos);
+  WAVE3_CHECK(guard_pos < clear_pos);
+
+  const std::string ppc_mem_cc =
+      ReadSourceText(cpp_dir / "xenia/src/xenia/cpu/ppc/ppc_emit_memory.cc");
+  const std::string ppc_ctrl_cc =
+      ReadSourceText(cpp_dir / "xenia/src/xenia/cpu/ppc/ppc_emit_control.cc");
+  WAVE3_CHECK(ppc_mem_cc.find("allocation_granularity() > 0x1000") !=
+              std::string::npos);
+  WAVE3_CHECK(ppc_ctrl_cc.find("allocation_granularity() > 0x1000") !=
+              std::string::npos);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -895,6 +923,7 @@ int main(int argc, char** argv) {
   TestJumpTableRecoveryPatterns();
   TestStackSkewGuardAndHirFlags();
   TestTomlOnlyCvarContracts(cpp_dir);
+  TestStripNoPhysicalSkewContract(cpp_dir);
 
   std::puts("wave3_jit_hle_logic_test: PASS");
   return 0;

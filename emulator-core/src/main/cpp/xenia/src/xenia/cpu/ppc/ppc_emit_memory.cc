@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
@@ -68,6 +69,7 @@ using xe::cpu::hir::Value;
 
 inline uint32_t StackSkewLoadStoreFlag(uint32_t ra, int64_t simm) {
   return (cvars::a64_skip_stack_skew_fixup &&
+          xe::memory::allocation_granularity() > 0x1000 &&
           IsSafeStackDispAccess(ra, simm, false))
              ? LOAD_STORE_NO_PHYSICAL_SKEW
              : 0u;

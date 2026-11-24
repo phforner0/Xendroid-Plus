@@ -141,6 +141,11 @@ inline bool EvalStackR1Value(
   }
 }
 
+inline constexpr bool IsLoadStoreOpcode(hir::Opcode op) {
+  return op == hir::OPCODE_LOAD || op == hir::OPCODE_LOAD_OFFSET ||
+         op == hir::OPCODE_STORE || op == hir::OPCODE_STORE_OFFSET;
+}
+
 inline void AnalyzeStackSkewSafety(hir::HIRBuilder* builder,
                                    bool* out_uses_no_skew,
                                    bool* out_has_unsafe_r1_write) {
@@ -308,8 +313,7 @@ inline void AnalyzeStackSkewSafety(hir::HIRBuilder* builder,
             cur.max_delta = new_iv.max_delta;
           }
         }
-      } else if ((op == hir::OPCODE_LOAD || op == hir::OPCODE_LOAD_OFFSET ||
-                  op == hir::OPCODE_STORE || op == hir::OPCODE_STORE_OFFSET) &&
+      } else if (IsLoadStoreOpcode(op) &&
                  (instr->flags & hir::LOAD_STORE_NO_PHYSICAL_SKEW) != 0) {
         uses_no_skew = true;
         if (cur.tainted) {
@@ -380,8 +384,7 @@ inline void AnalyzeStackSkewSafety(hir::HIRBuilder* builder,
     for (const hir::Instr* instr = blocks[i]->instr_head; instr;
          instr = instr->next) {
       const hir::Opcode op = instr->GetOpcodeNum();
-      if ((op == hir::OPCODE_LOAD || op == hir::OPCODE_LOAD_OFFSET ||
-           op == hir::OPCODE_STORE || op == hir::OPCODE_STORE_OFFSET) &&
+      if (IsLoadStoreOpcode(op) &&
           (instr->flags & hir::LOAD_STORE_NO_PHYSICAL_SKEW) != 0) {
         uses_no_skew = true;
         has_unsafe_r1_write = true;
@@ -396,7 +399,8 @@ inline void AnalyzeStackSkewSafety(hir::HIRBuilder* builder,
 inline void StripNoPhysicalSkewFlags(hir::HIRBuilder* builder) {
   for (hir::Block* block = builder->first_block(); block; block = block->next) {
     for (hir::Instr* instr = block->instr_head; instr; instr = instr->next) {
-      if (instr->flags & hir::LOAD_STORE_NO_PHYSICAL_SKEW) {
+      if (IsLoadStoreOpcode(instr->GetOpcodeNum()) &&
+          (instr->flags & hir::LOAD_STORE_NO_PHYSICAL_SKEW)) {
         instr->flags &=
             ~static_cast<uint16_t>(hir::LOAD_STORE_NO_PHYSICAL_SKEW);
       }

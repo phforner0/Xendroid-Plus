@@ -603,4 +603,73 @@ TEST_CASE("WAVE3_STACK_SKEW_ANALYSIS_ADVERSARIAL", "[wave3][stack]") {
     REQUIRE(has_unsafe);
   }
 }
+
+TEST_CASE("WAVE3_STRIP_NO_PHYSICAL_SKEW_PRESERVES_NON_LOAD_STORE_FLAGS",
+          "[wave3][stack]") {
+  using xe::cpu::backend::a64::kR1ContextOffset;
+  using xe::cpu::backend::a64::StripNoPhysicalSkewFlags;
+
+  HIRBuilder b;
+  auto* next_lbl = b.NewLabel();
+  auto* r1 = b.LoadContext(kR1ContextOffset, INT64_TYPE);
+  auto* loaded = b.LoadOffset(r1, b.LoadConstantInt64(0x10), INT32_TYPE,
+                              LOAD_STORE_NO_PHYSICAL_SKEW | LOAD_STORE_BYTE_SWAP);
+  b.StoreOffset(r1, b.LoadConstantInt64(0x18), loaded,
+                LOAD_STORE_NO_PHYSICAL_SKEW);
+  auto* vec = b.LoadConstantVec128(vec128q(0, 1));
+  b.Swizzle(vec, INT32_TYPE, MakeSwizzleMask(3, 2, 1, 0));
+  b.Extract(vec, uint8_t{0}, INT64_TYPE);
+  b.Branch(next_lbl, BRANCH_LIKELY);
+  b.MarkLabel(next_lbl);
+  b.CallIndirect(b.LoadConstantUint64(0x82001000u),
+                 CALL_TAIL | CALL_POSSIBLE_RETURN);
+  REQUIRE(b.Finalize());
+
+  StripNoPhysicalSkewFlags(&b);
+
+  int load_count = 0;
+  int store_count = 0;
+  int swizzle_count = 0;
+  int extract_count = 0;
+  int branch_count = 0;
+  int call_count = 0;
+  for (hir::Block* block = b.first_block(); block; block = block->next) {
+    for (hir::Instr* instr = block->instr_head; instr; instr = instr->next) {
+      switch (instr->GetOpcodeNum()) {
+        case OPCODE_LOAD_OFFSET:
+          ++load_count;
+          REQUIRE(instr->flags == LOAD_STORE_BYTE_SWAP);
+          break;
+        case OPCODE_STORE_OFFSET:
+          ++store_count;
+          REQUIRE(instr->flags == 0);
+          break;
+        case OPCODE_SWIZZLE:
+          ++swizzle_count;
+          REQUIRE(instr->flags == INT32_TYPE);
+          break;
+        case OPCODE_EXTRACT:
+          ++extract_count;
+          REQUIRE(instr->flags == INT64_TYPE);
+          break;
+        case OPCODE_BRANCH:
+          ++branch_count;
+          REQUIRE(instr->flags == BRANCH_LIKELY);
+          break;
+        case OPCODE_CALL_INDIRECT:
+          ++call_count;
+          REQUIRE(instr->flags == (CALL_TAIL | CALL_POSSIBLE_RETURN));
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  REQUIRE(load_count == 1);
+  REQUIRE(store_count == 1);
+  REQUIRE(swizzle_count == 1);
+  REQUIRE(extract_count == 1);
+  REQUIRE(branch_count == 1);
+  REQUIRE(call_count == 1);
+}
 #endif  // XE_ARCH_ARM64
