@@ -318,4 +318,6 @@
     <string name="st_d_gpu_vulkan_auto_vrs_thermal">Escala dinamicamente a taxa de shading da cena 3D multisampled (1x1 -> 2x1 -> 2x2) sob pressão térmica no Android (nunca afeta pós-processamento 1x ou HUD). Vale a partir da próxima abertura.</string>
     <string name="st_t_cpu_adpf_cpu_performance_hint">Dica de desempenho de CPU guest (ADPF)</string>
     <string name="st_d_cpu_adpf_cpu_performance_hint">Registra threads ativas de CPU guest em uma sessão ADPF do Android para estabilizar clocks sob carga pesada de CPU.</string>
+    <string name="st_t_cpu_jit_warmup_jprof">Perfil de aquecimento JIT (.jprof)</string>
+    <string name="st_d_cpu_jit_warmup_jprof">Salva por jogo os endereços de funções PowerPC descobertas (.jprof) e as pré-traduz em segundo plano na próxima abertura para reduzir engasgos do JIT.</string>
 </resources>

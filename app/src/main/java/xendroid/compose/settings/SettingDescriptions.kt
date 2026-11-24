@@ -209,5 +209,6 @@ object SettingDescriptions {
         "vulkan_defer_resolve_clears" to "Folds eligible EDRAM resolve clears into the next draw render pass via LOAD_OP_CLEAR or in-pass clears, cutting tile-memory round-trips on mobile GPUs",
         "vulkan_auto_vrs_thermal" to "Dynamically scales 3D multisampled scene shading rate (1x1 -> 2x1 -> 2x2) when Android thermal pressure rises (never affects 1x post-processing or HUD). Applies from next launch",
         "adpf_cpu_performance_hint" to "Registers live guest CPU worker threads with an Android ADPF performance hint session to stabilize clocks under heavy CPU load",
+        "jit_warmup_jprof" to "Saves discovered PowerPC function addresses per game (.jprof) and pre-translates them in the background on next launch to cut gameplay JIT stutter",
     )
 }

@@ -102,6 +102,7 @@ object SettingCatalog {
             e("CPU|a64_call_aware_volatile_gprs", A),
             e("CPU|a64_fast_vmx_estimates", A),
             e("CPU|enable_early_precompilation", A),
+            e("CPU|jit_warmup_jprof", A, isNew = true),
             e("CPU|adpf_cpu_performance_hint", A, isNew = true),
             e("Memory|shm_coalesce_writewatch_pages", A),
             e("Storage|iso_stream_pread", A),

@@ -27,6 +27,7 @@
     "CPU|adpf_cpu_performance_hint",
     "CPU|collapse_memory_delay_spins",
     "CPU|enable_early_precompilation",
+    "CPU|jit_warmup_jprof",
     "Console|internal_display_resolution",
     "Console|widescreen",
     "Display|postprocess_antialiasing",

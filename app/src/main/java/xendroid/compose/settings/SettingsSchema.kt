@@ -306,6 +306,7 @@ object SettingsSchema {
             b("CPU", "log_delay_collapse_rejects", "Log delay-collapse rejects", false),
             b("CPU", "log_safepoint_pc", "Record safepoint addresses (wedge diagnosis)", false),
             b("CPU", "adpf_cpu_performance_hint", "Guest CPU performance hint (ADPF)", false),
+            b("CPU", "jit_warmup_jprof", "JIT warmup profile cache (.jprof)", true),
         )),
 
         SettingsCategory("Logging", listOf(

@@ -138,7 +138,7 @@ object SettingsProfiles {
         "Kernel|file_read_no_apc_inline",
         "CPU|collapse_memory_delay_spins",
         "CPU|a64_call_aware_volatile_gprs", "CPU|a64_fast_vmx_estimates", "CPU|enable_early_precompilation",
-        "CPU|adpf_cpu_performance_hint",
+        "CPU|jit_warmup_jprof", "CPU|adpf_cpu_performance_hint",
         "APU|xma_decoder", "APU|use_dedicated_xma_thread", "APU|apu_pump_topup",
         "APU|apu_max_queued_frames", "APU|apu_aaudio_buffer_bursts",
     )

@@ -123,6 +123,7 @@ private val TITLES: Map<String, Int> = mapOf(
     "GPU|vulkan_defer_resolve_clears" to R.string.st_t_gpu_vulkan_defer_resolve_clears,
     "GPU|vulkan_auto_vrs_thermal" to R.string.st_t_gpu_vulkan_auto_vrs_thermal,
     "CPU|adpf_cpu_performance_hint" to R.string.st_t_cpu_adpf_cpu_performance_hint,
+    "CPU|jit_warmup_jprof" to R.string.st_t_cpu_jit_warmup_jprof,
 )
 
 private val DESCRIPTIONS: Map<String, Int> = mapOf(
@@ -233,6 +234,7 @@ private val DESCRIPTIONS: Map<String, Int> = mapOf(
     "GPU|vulkan_defer_resolve_clears" to R.string.st_d_gpu_vulkan_defer_resolve_clears,
     "GPU|vulkan_auto_vrs_thermal" to R.string.st_d_gpu_vulkan_auto_vrs_thermal,
     "CPU|adpf_cpu_performance_hint" to R.string.st_d_cpu_adpf_cpu_performance_hint,
+    "CPU|jit_warmup_jprof" to R.string.st_d_cpu_jit_warmup_jprof,
 )
 
 private val CATEGORIES: Map<String, Int> = mapOf(

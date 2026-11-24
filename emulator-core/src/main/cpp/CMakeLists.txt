@@ -43,6 +43,51 @@ endif()
 add_library(hardware_ProcessorInfo SHARED hardware_ProcessorInfo.cpp)
 target_link_libraries(hardware_ProcessorInfo PRIVATE vulkan)
 
+# Optional Release Profile-Guided Optimization (PGO). Default OFF so standard
+# :app:assembleRelease and Debug builds stay 100% unchanged.
+set(XENDROID_PGO_MODE "OFF" CACHE STRING "Optional Release PGO mode: OFF, GENERATE, USE")
+set_property(CACHE XENDROID_PGO_MODE PROPERTY STRINGS OFF GENERATE USE)
+set(XENDROID_PGO_PROFILE "" CACHE FILEPATH "Path to merged .profdata file when XENDROID_PGO_MODE=USE")
+set(XENDROID_PGO_PROFILE_DIR "/data/local/tmp/xendroid-pgo" CACHE STRING
+    "Default runtime .profraw output dir when XENDROID_PGO_MODE=GENERATE (overridden by LLVM_PROFILE_FILE)")
+
+string(TOUPPER "${XENDROID_PGO_MODE}" _xe_pgo_mode)
+if(_xe_pgo_mode STREQUAL "OFF" OR _xe_pgo_mode STREQUAL "")
+  # Default path: zero changes to :app:assembleRelease or configureCMakeDebug.
+elseif(_xe_pgo_mode STREQUAL "GENERATE")
+  add_compile_options(
+    $<$<CONFIG:Release,RelWithDebInfo>:-fprofile-generate=${XENDROID_PGO_PROFILE_DIR}>
+  )
+  add_link_options(
+    $<$<CONFIG:Release,RelWithDebInfo>:-fprofile-generate=${XENDROID_PGO_PROFILE_DIR}>
+  )
+  message(STATUS "XenDroid Release PGO: GENERATE -> ${XENDROID_PGO_PROFILE_DIR}")
+elseif(_xe_pgo_mode STREQUAL "USE")
+  if(NOT XENDROID_PGO_PROFILE)
+    message(FATAL_ERROR "XENDROID_PGO_MODE=USE requires -DXENDROID_PGO_PROFILE=<path/to/default.profdata>")
+  endif()
+  if(NOT EXISTS "${XENDROID_PGO_PROFILE}" OR IS_DIRECTORY "${XENDROID_PGO_PROFILE}")
+    message(FATAL_ERROR "XENDROID_PGO_PROFILE does not exist or is a directory: '${XENDROID_PGO_PROFILE}'")
+  endif()
+  add_compile_options(
+    $<$<CONFIG:Release,RelWithDebInfo>:-fprofile-use=${XENDROID_PGO_PROFILE}>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-backend-plugin>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-profile-instr-unprofiled>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-profile-instr-out-of-date>
+  )
+  # ThinLTO (-flto=thin) defers optimization/inlining to lld at link time,
+  # so lld also needs -fprofile-use and the -Wno-* flags under -Werror.
+  add_link_options(
+    $<$<CONFIG:Release,RelWithDebInfo>:-fprofile-use=${XENDROID_PGO_PROFILE}>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-backend-plugin>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-profile-instr-unprofiled>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-profile-instr-out-of-date>
+  )
+  message(STATUS "XenDroid Release PGO: USE -> ${XENDROID_PGO_PROFILE}")
+else()
+  message(FATAL_ERROR "Invalid XENDROID_PGO_MODE='${XENDROID_PGO_MODE}' (expected OFF, GENERATE, or USE)")
+endif()
+
 add_library(emu SHARED)
 set_target_properties(emu PROPERTIES OUTPUT_NAME "e")
 
