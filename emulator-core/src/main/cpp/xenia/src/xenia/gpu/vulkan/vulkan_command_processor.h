@@ -163,6 +163,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
+  void WaitUntilGpuIdleForBench() override;
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 

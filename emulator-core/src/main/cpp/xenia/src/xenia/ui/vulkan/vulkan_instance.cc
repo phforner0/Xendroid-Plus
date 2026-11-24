@@ -190,6 +190,12 @@ DEFINE_bool(
     "that the hardware supports in silicon.",
     "Vulkan");
 
+DEFINE_bool(
+    gpu_headless, false,
+    "Disable host window presentation and prefer headless Vulkan / "
+    "VK_EXT_headless_surface for CI and automated smoke testing.",
+    "Vulkan");
+
 namespace xe {
 namespace ui {
 namespace vulkan {
@@ -481,6 +487,15 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
   requested_extensions.emplace(
       "VK_KHR_portability_enumeration",
       &vulkan_instance->extensions_.ext_KHR_portability_enumeration);
+  if (cvars::gpu_headless) {
+#ifdef VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME
+    requested_extensions.emplace(
+        "VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
+    requested_extensions.emplace(
+        VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME,
+        &vulkan_instance->extensions_.ext_EXT_headless_surface);
+#endif
+  }
   if (with_surface) {
     // #1.
     requested_extensions.emplace("VK_KHR_surface",
@@ -885,6 +900,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
   if (vulkan_instance->extensions_.ext_EXT_debug_utils) {
 #include "xenia/ui/vulkan/functions/instance_ext_debug_utils.inc"
   }
+#ifdef VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME
+  if (vulkan_instance->extensions_.ext_EXT_headless_surface) {
+    XE_UI_VULKAN_FUNCTION(vkCreateHeadlessSurfaceEXT)
+  }
+#endif
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION
@@ -896,8 +916,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
 
   // Check whether a surface can be created.
 
-  if (with_surface && !VulkanPresenter::GetSurfaceTypesSupportedByInstance(
-                          vulkan_instance->extensions_)) {
+  if (with_surface &&
+      !VulkanPresenter::GetSurfaceTypesSupportedByInstance(
+          vulkan_instance->extensions_) &&
+      !(cvars::gpu_headless &&
+        vulkan_instance->extensions_.ext_EXT_headless_surface)) {
     XELOGE("The Vulkan instance doesn't support surface types used by Xenia");
     return nullptr;
   }
@@ -1017,6 +1040,25 @@ void VulkanInstance::EnumeratePhysicalDevices(
         get_physical_devices_result == VK_SUCCESS ? physical_device_count : 0);
     return;
   }
+}
+
+bool VulkanInstance::CreateHeadlessSurface(VkSurfaceKHR* out_surface) const {
+  if (!out_surface) {
+    return false;
+  }
+  *out_surface = VK_NULL_HANDLE;
+#ifdef VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME
+  if (!extensions_.ext_EXT_headless_surface ||
+      !functions_.vkCreateHeadlessSurfaceEXT) {
+    return false;
+  }
+  VkHeadlessSurfaceCreateInfoEXT info = {};
+  info.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT;
+  return functions_.vkCreateHeadlessSurfaceEXT(instance_, &info, nullptr,
+                                                out_surface) == VK_SUCCESS;
+#else
+  return false;
+#endif
 }
 
 VkBool32 VulkanInstance::DebugUtilsMessengerCallback(

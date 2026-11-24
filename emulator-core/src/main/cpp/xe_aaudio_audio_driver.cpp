@@ -42,6 +42,10 @@ DEFINE_bool(apu_aaudio_log_stats, false,
             "Log Android audio callback statistics (gaps, queue depth, "
             "underruns) once a second.",
             "APU");
+DEFINE_bool(apu_audio_sanity_log, false,
+            "Log periodic AudioSanity lines (RMS, peak, sustained silence, "
+            "clipping, concealed blocks, xruns) once a second.",
+            "APU");
 
 namespace xe {
 namespace apu {
@@ -349,6 +353,28 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
 
   driver->ApplyLoudnessGuardAndRamp(output_buffer, numFrames, begin_ns);
 
+  if (cvars::apu_audio_sanity_log && numFrames > 0) {
+    driver->audio_sanity_.Observe(output_buffer, uint32_t(numFrames),
+                                  driver->frame_frequency_);
+    driver->sanity_frames_accum_ += uint32_t(numFrames);
+    if (driver->sanity_frames_accum_ >= driver->frame_frequency_) {
+      driver->sanity_frames_accum_ = 0;
+      const auto snap = driver->audio_sanity_.SnapshotAndReset();
+      driver->sanity_rms_milli_.store(
+          uint32_t(std::clamp(snap.rms * 1000.0f, 0.0f, 999999.0f)),
+          std::memory_order_relaxed);
+      driver->sanity_peak_milli_.store(
+          uint32_t(std::clamp(snap.peak * 1000.0f, 0.0f, 999999.0f)),
+          std::memory_order_relaxed);
+      driver->sanity_silence_ms_.store(snap.silence_ms,
+                                       std::memory_order_relaxed);
+      driver->sanity_clipped_.store(snap.clipped_samples,
+                                    std::memory_order_relaxed);
+      driver->sanity_nans_.store(snap.nan_samples, std::memory_order_relaxed);
+      driver->sanity_ready_.store(true, std::memory_order_release);
+    }
+  }
+
   // One tick per block consumed, so pacing holds when the callback size is
   // not a whole block. Tick once on underrun to keep the guest engine running.
   uint32_t releases = result.blocks;
@@ -511,6 +537,19 @@ void AAudioAudioDriver::RecoveryThreadMain() {
         }
         if (cvars::apu_aaudio_log_stats) {
           LogAndResetStats();
+        }
+        if (cvars::apu_audio_sanity_log &&
+            sanity_ready_.exchange(false, std::memory_order_acquire)) {
+          XELOGI(
+              "AudioSanity: rms={:.3f} peak={:.3f} silence_ms={} clipped={} "
+              "concealed={} xruns={} nans={}",
+              double(sanity_rms_milli_.load(std::memory_order_relaxed)) / 1000.0,
+              double(sanity_peak_milli_.load(std::memory_order_relaxed)) / 1000.0,
+              sanity_silence_ms_.load(std::memory_order_relaxed),
+              sanity_clipped_.load(std::memory_order_relaxed),
+              ae::RunStats().concealed.load(std::memory_order_relaxed),
+              xruns_published_,
+              sanity_nans_.load(std::memory_order_relaxed));
         }
         continue;
       }

@@ -267,6 +267,9 @@ class CommandProcessor {
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
   virtual void ClearReadbackBuffers();
+  // Synchronizes all submitted GPU work and flushes frame/submission timing
+  // counters (used by TraceBench between loops/ABBA blocks).
+  virtual void WaitUntilGpuIdleForBench() {}
 
   TraceWriter& trace_writer() { return trace_writer_; }
 

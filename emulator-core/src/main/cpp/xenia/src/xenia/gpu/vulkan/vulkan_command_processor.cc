@@ -542,6 +542,18 @@ namespace vulkan {
 
 namespace {
 
+bool IsGpuTraceBenchEnabled() {
+  if (!cvar::ConfigVars) {
+    return false;
+  }
+  auto it = cvar::ConfigVars->find("gpu_trace_bench");
+  if (it == cvar::ConfigVars->end() || !it->second) {
+    return false;
+  }
+  const std::string val = it->second->effective_value();
+  return !val.empty() && val != "\"\"";
+}
+
 #if defined(__ANDROID__)
 void PollDebugPropertyOverride(const char* property, const char* cvar_name,
                                bool& cvar) {
@@ -938,6 +950,20 @@ void PollDebugPropertyOverrides(CommandProcessor& command_processor) {
              bounded);
     }
   }
+  // Live virtual pad impulse (`debug.xendroid.pad = START:150`) and PadScript.
+  char pad_value[PROP_VALUE_MAX] = {};
+  const int pad_len = __system_property_get("debug.xendroid.pad", pad_value);
+  if (auto cb = xe::internal::pad_live_callback().load(
+          std::memory_order_acquire)) {
+    cb(pad_len > 0 ? pad_value : "");
+  }
+  char pad_script_value[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.xendroid.pad_script", pad_script_value) > 0) {
+    if (auto cb = xe::internal::pad_script_live_callback().load(
+            std::memory_order_acquire)) {
+      cb(pad_script_value);
+    }
+  }
 #endif
 }
 
@@ -1052,6 +1078,10 @@ void VulkanCommandProcessor::InsertDebugMarker(const char* format, ...) {
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   cache_clear_requested_ = true;
+}
+
+void VulkanCommandProcessor::WaitUntilGpuIdleForBench() {
+  AwaitAllQueueOperationsCompletion();
 }
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
@@ -2354,7 +2384,7 @@ bool VulkanCommandProcessor::SetupContext() {
   EnsureZPDQueryResources();
 
   // Per-submission GPU timestamps for the frame time breakdown diagnostics.
-  if (cvars::log_gpu_frame_time_breakdown &&
+  if ((cvars::log_gpu_frame_time_breakdown || IsGpuTraceBenchEnabled()) &&
       vulkan_device->properties().timestampPeriod > 0.0f) {
     VkQueryPoolCreateInfo timestamp_pool_create_info = {
         VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -3368,6 +3398,8 @@ void VulkanCommandProcessor::WriteFrameDumpVertexScans() {
 }
 
 void VulkanCommandProcessor::PollFrameDump() {
+  xe::internal::last_frame_draw_count().store(frame_draw_index_,
+                                             std::memory_order_relaxed);
   frame_draw_index_ = 0;
   shared_memory_->SetHistoryFrame(uint32_t(frame_current_));
   if (resolve_log_file_ &&
@@ -10533,6 +10565,8 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
         if (ts_bottom > ts_top) {
           const uint64_t exec_ns = uint64_t((ts_bottom - ts_top) * period_ns);
           vk_frame_sync_stats_.gpu_exec_ns += exec_ns;
+          xe::internal::last_bench_gpu_exec_ns().fetch_add(
+              exec_ns, std::memory_order_relaxed);
           vk_frame_sync_stats_.gpu_exec_max_ns =
               std::max(vk_frame_sync_stats_.gpu_exec_max_ns, exec_ns);
           vk_frame_sync_stats_.gpu_samples++;

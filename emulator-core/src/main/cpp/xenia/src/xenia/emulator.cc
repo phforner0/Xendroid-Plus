@@ -32,6 +32,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/debugging.h"
 #include "xenia/base/exception_handler.h"
+#include "xenia/base/frame_stats.h"
 #include "xenia/base/literals.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/mapped_memory.h"
@@ -50,6 +51,7 @@
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/guest_scheduler.h"
+#include "xenia/kernel/hle_census.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
@@ -159,6 +161,7 @@ DEFINE_bool(guest_crash_is_fatal, true,
 
 DECLARE_string(gpu);
 DECLARE_string(apu);
+DECLARE_bool(gpu_headless);
 
 DECLARE_bool(allow_plugins);
 
@@ -278,6 +281,7 @@ void Emulator::Shutdown() {
   audio_media_player_.reset();
 
   kernel_state_.reset();
+  kernel::ShutdownHleCensus();
   file_system_.reset();
   patcher_.reset();
   plugin_loader_.reset();
@@ -289,6 +293,7 @@ void Emulator::Shutdown() {
   ExceptionHandler::Uninstall(Emulator::ExceptionCallbackThunk, this);
 
   title_id_ = std::nullopt;
+  internal::active_title_id_atomic().store(0, std::memory_order_relaxed);
   title_name_.clear();
   title_version_.clear();
   game_info_database_.reset();
@@ -434,6 +439,7 @@ X_STATUS Emulator::Setup(
     LOAD_KERNEL_MODULE(xbdm::XbdmModule);
   }
 #undef LOAD_KERNEL_MODULE
+  kernel::InstallHleCensus(export_resolver_.get());
   plugin_loader_ = std::make_unique<xe::patcher::PluginLoader>(
       kernel_state_.get(), storage_root() / "plugins");
 
@@ -476,10 +482,21 @@ X_STATUS Emulator::SetupSubsystems() {
 
   if (graphics_system_) {
     XELOGI("{}: Starting graphics_system...", __func__);
+    bool trace_bench_active = false;
+    if (cvar::ConfigVars) {
+      auto it = cvar::ConfigVars->find("gpu_trace_bench");
+      if (it != cvar::ConfigVars->end() && it->second) {
+        const std::string val = it->second->effective_value();
+        trace_bench_active = !val.empty() && val != "\"\"";
+      }
+    }
+    const bool with_presentation =
+        (!cvars::gpu_headless && display_window_ != nullptr) ||
+        trace_bench_active;
     result = graphics_system_->Setup(
         processor_.get(), kernel_state_.get(),
         display_window_ ? &display_window_->app_context() : nullptr,
-        display_window_ != nullptr);
+        with_presentation);
     if (result) {
       XELOGE("{}: Failed to setup graphics_system!", __func__);
       return result;
@@ -2741,6 +2758,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
       title_version_ = format_version(title_version);
     }
   }
+  internal::active_title_id_atomic().store(title_id_.value_or(0),
+                                           std::memory_order_relaxed);
 
   // XMountUtilityDrive creates \Device\cacheN on Harddisk0\CacheN and links
   // cache: to it.

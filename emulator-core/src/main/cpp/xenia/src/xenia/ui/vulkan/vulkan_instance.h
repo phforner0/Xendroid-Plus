@@ -24,6 +24,7 @@
 #endif
 
 DECLARE_bool(vulkan_adreno_bcenabler);
+DECLARE_bool(gpu_headless);
 
 namespace xe {
 namespace ui {
@@ -100,6 +101,10 @@ class VulkanInstance {
 #include "xenia/ui/vulkan/functions/instance_1_1_khr_get_physical_device_properties2.inc"
     // VK_EXT_debug_utils (#129)
 #include "xenia/ui/vulkan/functions/instance_ext_debug_utils.inc"
+    // VK_EXT_headless_surface (#293)
+#ifdef VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME
+    PFN_vkCreateHeadlessSurfaceEXT vkCreateHeadlessSurfaceEXT = nullptr;
+#endif
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };
@@ -131,6 +136,7 @@ class VulkanInstance {
     bool ext_KHR_get_surface_capabilities2 = false;            // #120
     bool ext_EXT_debug_utils = false;                          // #129
     bool ext_KHR_portability_enumeration = false;              // #395
+    bool ext_EXT_headless_surface = false;                     // #293
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -143,6 +149,9 @@ class VulkanInstance {
 
   void EnumeratePhysicalDevices(
       std::vector<VkPhysicalDevice>& physical_devices_out) const;
+
+  // Creates a headless VkSurfaceKHR when VK_EXT_headless_surface is active.
+  bool CreateHeadlessSurface(VkSurfaceKHR* out_surface) const;
 
  private:
   explicit VulkanInstance() = default;

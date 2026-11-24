@@ -111,6 +111,7 @@ target_sources(emu
         xe_android_util.cpp
         xe_opensles_audio_driver.cpp
         xe_opensles_audio_system.cpp
+        xe_pad_script.cpp
         xe_crash_record.cpp
         xe_system_xendroid.cpp
         xenia/src/xenia/app/emulator_window.cc

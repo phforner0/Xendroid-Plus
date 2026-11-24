@@ -32,6 +32,7 @@
 #include "xenia/patcher/patcher.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
+#include "xenia/gpu/trace_bench_runner.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/null/null_graphics_system.h"
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
@@ -52,6 +53,7 @@
 
 #include "xendroid_emu.h"
 #include "xe_changed_settings_cvars.h"
+#include "xe_pad_script.h"
 //#include "nlohmann/json.hpp"
 
 #define LOG_TAG "xendroid_native"
@@ -120,6 +122,7 @@ DECLARE_bool(debug);
 // stale/edited global config can't black-screen the app.
 DECLARE_bool(host_present_from_non_ui_thread);
 DECLARE_string(vulkan_lib_path);
+DECLARE_bool(gpu_headless);
 
 DEFINE_bool(discord, false, "Enable Discord rich presence", "General");
 
@@ -372,6 +375,9 @@ bool EmulatorApp::OnInitialize() {
     // global config says -- otherwise nothing presents (black screen, audio/input OK).
     cvars::host_present_from_non_ui_thread = true;
 
+    xendroid::PadScriptInstallCallbacks();
+    xendroid::PadScriptStart(storage_root, cvars::pad_script);
+
     // Must precede any title boot: without a provider XamShowKeyboardUI answers
     // itself with the title's own default text.
     if (cvars::android_soft_keyboard) {
@@ -546,8 +552,16 @@ void EmulatorApp::emu_thr_main() {
         return;
     }
     ae::subsystems_ready.store(true, std::memory_order_release);
-    app_context().CallInUIThread(
-            [this]() { emu_window->SetupGraphicsSystemPresenterPainting(); });
+    if (!cvars::gpu_headless) {
+        app_context().CallInUIThread(
+                [this]() { emu_window->SetupGraphicsSystemPresenterPainting(); });
+    }
+    if (!cvars::gpu_trace_bench.empty()) {
+        xe::gpu::RunTraceBench(emu->graphics_system(), emu->storage_root());
+        xendroid::PadScriptShutdown();
+        app_context().RequestDeferredQuit();
+        return;
+    }
     const auto fs = emu->file_system();
 
     if (cvars::mount_scratch) {
@@ -756,6 +770,7 @@ void EmulatorApp::emu_thr_main() {
     }
 
     XELOGI("QUIT");
+    xendroid::PadScriptShutdown();
     app_context().QuitFromUIThread();
 }
 
