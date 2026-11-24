@@ -124,12 +124,14 @@ const SourceMapEntry* GuestFunction::LookupMachineCodeOffset(
 
 uint32_t GuestFunction::MapGuestAddressToMachineCodeOffset(
     uint32_t guest_address) const {
+  std::lock_guard<std::mutex> lock(source_map_mutex_);
   auto entry = LookupGuestAddress(guest_address);
   return entry ? entry->code_offset : 0;
 }
 
 uintptr_t GuestFunction::MapGuestAddressToMachineCode(
     uint32_t guest_address) const {
+  std::lock_guard<std::mutex> lock(source_map_mutex_);
   auto entry = LookupGuestAddress(guest_address);
 
   if (entry) {
@@ -141,6 +143,7 @@ uintptr_t GuestFunction::MapGuestAddressToMachineCode(
 
 uint32_t GuestFunction::MapMachineCodeToGuestAddress(
     uintptr_t host_address) const {
+  std::lock_guard<std::mutex> lock(source_map_mutex_);
   void* code = machine_code();
   if (!code) {
     return address();

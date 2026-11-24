@@ -10,9 +10,12 @@
 #ifndef XENIA_CPU_BACKEND_A64_A64_CODE_CACHE_H_
 #define XENIA_CPU_BACKEND_A64_A64_CODE_CACHE_H_
 
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "xenia/cpu/backend/code_cache_base.h"
 
@@ -31,7 +34,27 @@ class A64CodeCache : public CodeCacheBase<A64CodeCache> {
 
   // CRTP hooks for CodeCacheBase.
   void FillCode(void* write_address, size_t size);
-  void FlushCodeRange(void* address, size_t size);
+  void FlushCodeRange(void* write_address, void* execute_address, size_t size);
+  void FlushPatchedInstruction(void* write_address, void* execute_address);
+
+  // Direct call site registry for atomic bl/b <rel26> back-patching and
+  // rollback on InvalidateCodeRange / ForgetSymbol.
+  struct DirectCallSite {
+    uintptr_t call_site_rx;
+    uint32_t original_stub_insn;
+    bool is_tail;
+    uintptr_t tail_stub_rx = 0;
+  };
+  void RegisterDirectCallSite(uint32_t target_guest_addr,
+                              uintptr_t call_site_rx,
+                              uint32_t original_stub_insn, bool is_tail,
+                              uintptr_t tail_stub_rx = 0);
+  void BackpatchDirectCallSites(uint32_t target_guest_addr,
+                                void* target_execute_address);
+  bool TryPatchDirectCallSite(uint32_t target_guest_addr,
+                              uintptr_t call_site_rx,
+                              void* target_execute_address);
+  void RevertDirectCallSitesInRange(uint32_t guest_start, uint32_t guest_end);
 
   // Writes one simpleperf "generic JIT symbols" map entry per placed
   // function (perf-<pid>.map) so profilers can attribute guest code by name
@@ -55,6 +78,12 @@ class A64CodeCache : public CodeCacheBase<A64CodeCache> {
   std::mutex perf_map_mutex_;
   FILE* perf_map_file_ = nullptr;
   bool perf_map_open_failed_ = false;
+
+  std::mutex direct_call_sites_mutex_;
+  std::unordered_map<uint32_t, std::vector<DirectCallSite>>
+      pending_direct_call_sites_;
+  std::unordered_map<uint32_t, std::vector<DirectCallSite>>
+      patched_direct_call_sites_;
 };
 
 }  // namespace a64

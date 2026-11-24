@@ -613,10 +613,12 @@ static T MMIOAwareLoad(void* _ctx, unsigned int guestaddr) {
 // ============================================================================
 struct LOAD_I8 : Sequence<LOAD_I8, I<OPCODE_LOAD, I8Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     e.ldrb(i.dest, ptr(e.GetMembaseReg(), addr));
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.mov(e.w2, i.dest);
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI8));
@@ -625,13 +627,15 @@ struct LOAD_I8 : Sequence<LOAD_I8, I<OPCODE_LOAD, I8Op, I64Op>> {
 };
 struct LOAD_I16 : Sequence<LOAD_I16, I<OPCODE_LOAD, I16Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     e.ldrh(i.dest, ptr(e.GetMembaseReg(), addr));
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev16(i.dest, i.dest);
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.mov(e.w2, i.dest);
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI16));
@@ -640,6 +644,8 @@ struct LOAD_I16 : Sequence<LOAD_I16, I<OPCODE_LOAD, I16Op, I64Op>> {
 };
 struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -681,7 +687,7 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       e.b(done);
       e.L(normal_access);
       {
-        auto addr = ComputeMemoryAddress(e, i.src1);
+        auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
         e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           e.rev(i.dest, i.dest);
@@ -689,13 +695,13 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       }
       e.L(done);
     } else {
-      auto addr = ComputeMemoryAddress(e, i.src1);
+      auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.rev(i.dest, i.dest);
       }
       if (IsTracingData()) {
-        addr = ComputeMemoryAddress(e, i.src1);
+        addr = ComputeMemoryAddress(e, i.src1, skip_skew);
         e.mov(e.w2, i.dest);
         e.mov(e.w1, WReg(addr.getIdx()));
         e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI32));
@@ -705,13 +711,15 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
 };
 struct LOAD_I64 : Sequence<LOAD_I64, I<OPCODE_LOAD, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev(i.dest, i.dest);
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.mov(e.x2, i.dest);
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI64));
@@ -720,7 +728,9 @@ struct LOAD_I64 : Sequence<LOAD_I64, I<OPCODE_LOAD, I64Op, I64Op>> {
 };
 struct LOAD_F32 : Sequence<LOAD_F32, I<OPCODE_LOAD, F32Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.ldr(e.w0, ptr(e.GetMembaseReg(), addr));
       e.rev(e.w0, e.w0);
@@ -729,7 +739,7 @@ struct LOAD_F32 : Sequence<LOAD_F32, I<OPCODE_LOAD, F32Op, I64Op>> {
       e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.mov(VReg(0).b16, VReg(i.dest.reg().getIdx()).b16);
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadF32));
@@ -738,7 +748,9 @@ struct LOAD_F32 : Sequence<LOAD_F32, I<OPCODE_LOAD, F32Op, I64Op>> {
 };
 struct LOAD_F64 : Sequence<LOAD_F64, I<OPCODE_LOAD, F64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.ldr(e.x0, ptr(e.GetMembaseReg(), addr));
       e.rev(e.x0, e.x0);
@@ -747,7 +759,7 @@ struct LOAD_F64 : Sequence<LOAD_F64, I<OPCODE_LOAD, F64Op, I64Op>> {
       e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.mov(VReg(0).b16, VReg(i.dest.reg().getIdx()).b16);
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadF64));
@@ -756,7 +768,9 @@ struct LOAD_F64 : Sequence<LOAD_F64, I<OPCODE_LOAD, F64Op, I64Op>> {
 };
 struct LOAD_V128 : Sequence<LOAD_V128, I<OPCODE_LOAD, V128Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       // Reverse bytes within each 32-bit word (PPC BE -> ARM64 LE).
@@ -764,7 +778,7 @@ struct LOAD_V128 : Sequence<LOAD_V128, I<OPCODE_LOAD, V128Op, I64Op>> {
       e.rev32(VReg16B(idx), VReg16B(idx));
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.add(e.x2, e.GetMembaseReg(), addr);
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadV128));
@@ -779,7 +793,9 @@ EMITTER_OPCODE_TABLE(OPCODE_LOAD, LOAD_I8, LOAD_I16, LOAD_I32, LOAD_I64,
 // ============================================================================
 struct STORE_I8 : Sequence<STORE_I8, I<OPCODE_STORE, VoidOp, I64Op, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     if (i.src2.is_constant) {
       e.mov(e.w17, static_cast<uint64_t>(i.src2.constant() & 0xFF));
       e.strb(e.w17, ptr(e.GetMembaseReg(), addr));
@@ -787,7 +803,7 @@ struct STORE_I8 : Sequence<STORE_I8, I<OPCODE_STORE, VoidOp, I64Op, I8Op>> {
       e.strb(i.src2, ptr(e.GetMembaseReg(), addr));
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.ldrb(e.w2, ptr(e.GetMembaseReg(), addr));
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI8));
@@ -796,7 +812,9 @@ struct STORE_I8 : Sequence<STORE_I8, I<OPCODE_STORE, VoidOp, I64Op, I8Op>> {
 };
 struct STORE_I16 : Sequence<STORE_I16, I<OPCODE_STORE, VoidOp, I64Op, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src2.is_constant) {
         uint16_t val = xe::byte_swap(static_cast<uint16_t>(i.src2.constant()));
@@ -814,7 +832,7 @@ struct STORE_I16 : Sequence<STORE_I16, I<OPCODE_STORE, VoidOp, I64Op, I16Op>> {
       }
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.ldrh(e.w2, ptr(e.GetMembaseReg(), addr));
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI16));
@@ -823,6 +841,8 @@ struct STORE_I16 : Sequence<STORE_I16, I<OPCODE_STORE, VoidOp, I64Op, I16Op>> {
 };
 struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareStore<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -874,7 +894,7 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
       e.b(done);
       e.L(normal_access);
       {
-        auto addr = ComputeMemoryAddress(e, i.src1);
+        auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           if (i.src2.is_constant) {
             uint32_t val =
@@ -896,7 +916,7 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
       }
       e.L(done);
     } else {
-      auto addr = ComputeMemoryAddress(e, i.src1);
+      auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src2.is_constant) {
           uint32_t val =
@@ -916,7 +936,7 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
         }
       }
       if (IsTracingData()) {
-        addr = ComputeMemoryAddress(e, i.src1);
+        addr = ComputeMemoryAddress(e, i.src1, skip_skew);
         e.ldr(e.w2, ptr(e.GetMembaseReg(), addr));
         e.mov(e.w1, WReg(addr.getIdx()));
         e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI32));
@@ -926,7 +946,9 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
 };
 struct STORE_I64 : Sequence<STORE_I64, I<OPCODE_STORE, VoidOp, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src2.is_constant) {
         uint64_t val = xe::byte_swap(static_cast<uint64_t>(i.src2.constant()));
@@ -944,7 +966,7 @@ struct STORE_I64 : Sequence<STORE_I64, I<OPCODE_STORE, VoidOp, I64Op, I64Op>> {
       }
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.ldr(e.x2, ptr(e.GetMembaseReg(), addr));
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI64));
@@ -953,7 +975,9 @@ struct STORE_I64 : Sequence<STORE_I64, I<OPCODE_STORE, VoidOp, I64Op, I64Op>> {
 };
 struct STORE_F32 : Sequence<STORE_F32, I<OPCODE_STORE, VoidOp, I64Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src2.is_constant) {
         uint32_t val =
@@ -973,7 +997,7 @@ struct STORE_F32 : Sequence<STORE_F32, I<OPCODE_STORE, VoidOp, I64Op, F32Op>> {
       }
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.ldr(e.s0, ptr(e.GetMembaseReg(), addr));
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreF32));
@@ -982,7 +1006,9 @@ struct STORE_F32 : Sequence<STORE_F32, I<OPCODE_STORE, VoidOp, I64Op, F32Op>> {
 };
 struct STORE_F64 : Sequence<STORE_F64, I<OPCODE_STORE, VoidOp, I64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src2.is_constant) {
         uint64_t val =
@@ -1002,7 +1028,7 @@ struct STORE_F64 : Sequence<STORE_F64, I<OPCODE_STORE, VoidOp, I64Op, F64Op>> {
       }
     }
     if (IsTracingData()) {
-      addr = ComputeMemoryAddress(e, i.src1);
+      addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.ldr(e.d0, ptr(e.GetMembaseReg(), addr));
       e.mov(e.w1, WReg(addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreF64));
@@ -1012,7 +1038,9 @@ struct STORE_F64 : Sequence<STORE_F64, I<OPCODE_STORE, VoidOp, I64Op, F64Op>> {
 struct STORE_V128
     : Sequence<STORE_V128, I<OPCODE_STORE, VoidOp, I64Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       // Reverse bytes within each 32-bit word, store via scratch v0.
       int idx = SrcVReg(e, i.src2, 0);
@@ -1027,7 +1055,7 @@ struct STORE_V128
       }
     }
     if (IsTracingData()) {
-      auto trace_addr = ComputeMemoryAddress(e, i.src1);
+      auto trace_addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.add(e.x2, e.GetMembaseReg(), trace_addr);
       e.mov(e.w1, WReg(trace_addr.getIdx()));
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreV128));
@@ -1060,10 +1088,12 @@ EMITTER_OPCODE_TABLE(OPCODE_LOAD_CLOCK, LOAD_CLOCK);
 struct LOAD_OFFSET_I8
     : Sequence<LOAD_OFFSET_I8, I<OPCODE_LOAD_OFFSET, I8Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    ComputeMemoryAddressOffset(e, i.src1, i.src2);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
     e.ldrb(i.dest, ptr(e.GetMembaseReg(), e.x0));
     if (IsTracingData()) {
-      ComputeMemoryAddressOffset(e, i.src1, i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
       e.mov(e.w2, i.dest);
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI8));
@@ -1073,13 +1103,15 @@ struct LOAD_OFFSET_I8
 struct LOAD_OFFSET_I16
     : Sequence<LOAD_OFFSET_I16, I<OPCODE_LOAD_OFFSET, I16Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    ComputeMemoryAddressOffset(e, i.src1, i.src2);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
     e.ldrh(i.dest, ptr(e.GetMembaseReg(), e.x0));
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev16(i.dest, i.dest);
     }
     if (IsTracingData()) {
-      ComputeMemoryAddressOffset(e, i.src1, i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
       e.mov(e.w2, i.dest);
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI16));
@@ -1089,6 +1121,8 @@ struct LOAD_OFFSET_I16
 struct LOAD_OFFSET_I32
     : Sequence<LOAD_OFFSET_I32, I<OPCODE_LOAD_OFFSET, I32Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -1147,7 +1181,7 @@ struct LOAD_OFFSET_I32
       e.b(done);
       e.L(normal_access);
       {
-        ComputeMemoryAddressOffset(e, i.src1, i.src2);
+        ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
         e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           e.rev(i.dest, i.dest);
@@ -1155,13 +1189,13 @@ struct LOAD_OFFSET_I32
       }
       e.L(done);
     } else {
-      ComputeMemoryAddressOffset(e, i.src1, i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
       e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.rev(i.dest, i.dest);
       }
       if (IsTracingData()) {
-        ComputeMemoryAddressOffset(e, i.src1, i.src2);
+        ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
         e.mov(e.w2, i.dest);
         e.mov(e.w1, e.w0);
         e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI32));
@@ -1172,13 +1206,15 @@ struct LOAD_OFFSET_I32
 struct LOAD_OFFSET_I64
     : Sequence<LOAD_OFFSET_I64, I<OPCODE_LOAD_OFFSET, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    ComputeMemoryAddressOffset(e, i.src1, i.src2);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
     e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev(i.dest, i.dest);
     }
     if (IsTracingData()) {
-      ComputeMemoryAddressOffset(e, i.src1, i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
       e.mov(e.x2, i.dest);
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryLoadI64));
@@ -1192,7 +1228,9 @@ struct STORE_OFFSET_I8
     : Sequence<STORE_OFFSET_I8,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    ComputeMemoryAddressOffset(e, i.src1, i.src2);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
     if (i.src3.is_constant) {
       e.mov(e.w17, static_cast<uint64_t>(i.src3.constant() & 0xFF));
       e.strb(e.w17, ptr(e.GetMembaseReg(), e.x0));
@@ -1200,7 +1238,7 @@ struct STORE_OFFSET_I8
       e.strb(i.src3, ptr(e.GetMembaseReg(), e.x0));
     }
     if (IsTracingData()) {
-      ComputeMemoryAddressOffset(e, i.src1, i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
       e.ldrb(e.w2, ptr(e.GetMembaseReg(), e.x0));
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI8));
@@ -1211,7 +1249,9 @@ struct STORE_OFFSET_I16
     : Sequence<STORE_OFFSET_I16,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    ComputeMemoryAddressOffset(e, i.src1, i.src2);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src3.is_constant) {
         uint16_t val = xe::byte_swap(static_cast<uint16_t>(i.src3.constant()));
@@ -1229,7 +1269,7 @@ struct STORE_OFFSET_I16
       }
     }
     if (IsTracingData()) {
-      ComputeMemoryAddressOffset(e, i.src1, i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
       e.ldrh(e.w2, ptr(e.GetMembaseReg(), e.x0));
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI16));
@@ -1240,6 +1280,8 @@ struct STORE_OFFSET_I32
     : Sequence<STORE_OFFSET_I32,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareStore<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -1308,7 +1350,7 @@ struct STORE_OFFSET_I32
       e.b(done);
       e.L(normal_access);
       {
-        ComputeMemoryAddressOffset(e, i.src1, i.src2);
+        ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           if (i.src3.is_constant) {
             uint32_t val =
@@ -1330,7 +1372,7 @@ struct STORE_OFFSET_I32
       }
       e.L(done);
     } else {
-      ComputeMemoryAddressOffset(e, i.src1, i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src3.is_constant) {
           uint32_t val =
@@ -1350,7 +1392,7 @@ struct STORE_OFFSET_I32
         }
       }
       if (IsTracingData()) {
-        ComputeMemoryAddressOffset(e, i.src1, i.src2);
+        ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
         e.ldr(e.w2, ptr(e.GetMembaseReg(), e.x0));
         e.mov(e.w1, e.w0);
         e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI32));
@@ -1362,7 +1404,9 @@ struct STORE_OFFSET_I64
     : Sequence<STORE_OFFSET_I64,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    ComputeMemoryAddressOffset(e, i.src1, i.src2);
+    const bool skip_skew =
+        (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src3.is_constant) {
         uint64_t val = xe::byte_swap(static_cast<uint64_t>(i.src3.constant()));
@@ -1380,7 +1424,7 @@ struct STORE_OFFSET_I64
       }
     }
     if (IsTracingData()) {
-      ComputeMemoryAddressOffset(e, i.src1, i.src2);
+      ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
       e.ldr(e.x2, ptr(e.GetMembaseReg(), e.x0));
       e.mov(e.w1, e.w0);
       e.CallNative(reinterpret_cast<void*>(TraceMemoryStoreI64));

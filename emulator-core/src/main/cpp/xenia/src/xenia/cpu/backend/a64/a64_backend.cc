@@ -42,8 +42,10 @@
 #include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/mmio_handler.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/ppc/ppc_frontend.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/stack_walker.h"
+#include "xenia/cpu/test_module.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/xex_module.h"
 
@@ -102,6 +104,12 @@ DEFINE_bool(a64_vmx_nan_fixup, false,
             "a64");
 UPDATE_from_bool(a64_vmx_nan_fixup, 2026, 10, 7, 11, true);
 
+DEFINE_bool(
+    a64_direct_calls, true,
+    "Emit single-instruction bl/b <rel26> direct calls with atomic "
+    "back-patching for targets within +-128 MiB.",
+    "CPU");
+
 namespace xe {
 namespace cpu {
 namespace backend {
@@ -110,6 +118,10 @@ namespace a64 {
 // Resolve a guest function at runtime. Called by the resolve thunk when
 // a guest address has not yet been compiled.
 uint64_t ResolveFunction(void* raw_context, uint64_t target_address);
+uint64_t PatchAndResolveDirectCall(void* raw_context, uint64_t target_address,
+                                   uintptr_t call_site_rx);
+uint64_t ResolveFunctionWithoutStackSkewSkip(void* raw_context,
+                                             uint64_t target_address);
 
 uint32_t FindStackpointSyncDepth(const A64BackendStackpoint* stackpoints,
                                  uint32_t current_depth, uint32_t guest_sp) {
@@ -142,6 +154,8 @@ class A64HelperEmitter : public A64Emitter {
   GuestToHostThunk EmitGuestToHostThunk();
   GuestToHostThunk EmitGuestToHostThunkNoVec();
   ResolveFunctionThunk EmitResolveFunctionThunk();
+  void* EmitPatchDirectCallThunk();
+  void* EmitReemitWithoutStackSkewThunk();
   void* EmitGuestAndHostSynchronizeStackHelper();
   void* EmitReturnToHostHelper();
   void* EmitVRsqrtefpHelper(void** out_vector_entry);
@@ -560,6 +574,134 @@ ResolveFunctionThunk A64HelperEmitter::EmitResolveFunctionThunk() {
 
   void* fn = Emplace(func_info);
   return reinterpret_cast<ResolveFunctionThunk>(fn);
+}
+
+// --------------------------------------------------------------------------
+// PatchDirectCallThunk
+// --------------------------------------------------------------------------
+// Called from an unpatched direct-call tail stub (bl <tail_stub>):
+//   w16 = guest PPC target address
+//   x20 = PPCContext*
+//   x30 = call_site_rx + 4
+// Resolves the target and atomically patches the caller's bl instruction
+// unless the target is a longjmp mid-body reentry or out of +-128 MiB range.
+void* A64HelperEmitter::EmitPatchDirectCallThunk() {
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  code_offsets.prolog = getSize();
+
+  const size_t thunk_stack = StackLayout::THUNK_STACK_SIZE;
+  sub(sp, sp, static_cast<uint32_t>(thunk_stack));
+  code_offsets.prolog_stack_alloc = getSize();
+
+  // Save x29/x30 (call_site_rx + 4) and x0 (guest return address) / x19.
+  stp(x29, x30, ptr(sp, 0x50));
+  stp(x0, x19, ptr(sp, 0x00));
+
+  code_offsets.body = getSize();
+
+  // PatchAndResolveDirectCall(context, target_address, call_site_rx).
+  mov(x0, x20);     // x0 = PPCContext*
+  mov(w1, w16);     // x1 = guest address (zero-extended 32->64)
+  sub(x2, x30, 4);  // x2 = call_site_rx = x30 - 4
+  mov(x9, reinterpret_cast<uint64_t>(&PatchAndResolveDirectCall));
+  blr(x9);
+  mov(x9, x0);
+
+  code_offsets.epilog = getSize();
+
+  // Restore x0 (guest return address) and saved regs (preserving x30).
+  ldp(x0, x19, ptr(sp, 0x00));
+  ldp(x29, x30, ptr(sp, 0x50));
+  add(sp, sp, static_cast<uint32_t>(thunk_stack));
+
+  cbz(x9, 8);
+  br(x9);
+  brk(0xF000);
+
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = thunk_stack;
+  func_info.lr_save_offset = 0x058;  // stp x29, x30, [sp, #0x50]
+
+  return Emplace(func_info);
+}
+
+// --------------------------------------------------------------------------
+// ReemitWithoutStackSkewThunk
+// --------------------------------------------------------------------------
+// Called from the prolog r1 range guard cold tail stub when entry r1 is outside
+// [0x70000000, 0x7F000000). Frame has already been popped by the stub.
+//   w16 = guest PPC function address
+//   x20 = PPCContext*
+//   x0  = guest return address
+//   x30 = host return address
+void* A64HelperEmitter::EmitReemitWithoutStackSkewThunk() {
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  code_offsets.prolog = getSize();
+
+  const size_t thunk_stack = StackLayout::THUNK_STACK_SIZE;
+  sub(sp, sp, static_cast<uint32_t>(thunk_stack));
+  code_offsets.prolog_stack_alloc = getSize();
+
+  stp(x29, x30, ptr(sp, 0x50));
+  stp(x0, x19, ptr(sp, 0x00));
+
+  code_offsets.body = getSize();
+
+  EmitEnterHostFpcr();
+  mov(x0, x20);  // x0 = PPCContext*
+  mov(w1, w16);  // w1 = guest function address
+  mov(x9, reinterpret_cast<uint64_t>(&ResolveFunctionWithoutStackSkewSkip));
+  blr(x9);
+  mov(x9, x0);
+  EmitRestoreGuestFpcr();
+
+  code_offsets.epilog = getSize();
+
+  ldp(x0, x19, ptr(sp, 0x00));
+  ldp(x29, x30, ptr(sp, 0x50));
+  add(sp, sp, static_cast<uint32_t>(thunk_stack));
+
+  cbz(x9, 8);
+  br(x9);
+  brk(0xF000);
+
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = thunk_stack;
+  func_info.lr_save_offset = 0x058;  // stp x29, x30, [sp, #0x50]
+
+  return Emplace(func_info);
 }
 
 // --------------------------------------------------------------------------
@@ -1442,6 +1584,121 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   return reinterpret_cast<uint64_t>(code);
 }
 
+uint64_t PatchAndResolveDirectCall(void* raw_context, uint64_t target_address,
+                                   uintptr_t call_site_rx) {
+  auto guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  auto thread_state = guest_context->thread_state;
+  assert_not_zero(target_address);
+
+  auto* processor = thread_state->processor();
+  if (cvars::a64_enable_host_guest_stack_synchronization &&
+      target_address <= 0xFFFFFFFFu) {
+    auto* module_for_address =
+        processor->LookupModule(static_cast<uint32_t>(target_address));
+    auto* xexmod = dynamic_cast<XexModule*>(module_for_address);
+    if (xexmod) {
+      InfoCacheFlags* flags = xexmod->GetInstructionAddressFlags(
+          static_cast<uint32_t>(target_address));
+      if (flags && flags->is_return_site) {
+        if (uint64_t host_address = ResolveLongjmp(
+                guest_context, static_cast<uint32_t>(target_address), 0)) {
+          // Do not patch the direct-call site for a mid-body longjmp reentry.
+          return host_address;
+        }
+      }
+    }
+  }
+
+  const uint64_t sweep_count = processor->code_sweep_count();
+  uint32_t address = static_cast<uint32_t>(target_address);
+  auto fn = processor->ResolveCallTarget(guest_context, &address);
+  if (!fn) {
+    XELOGE("No guest code at {:08X} for a direct call", address);
+    return 0;
+  }
+
+  auto guest_fn = static_cast<GuestFunction*>(fn);
+  auto code = guest_fn->machine_code();
+  if (!code) {
+    return 0;
+  }
+
+  if (cvars::a64_direct_calls &&
+      address == static_cast<uint32_t>(target_address)) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (processor->code_sweep_count() == sweep_count) {
+      auto* backend = static_cast<A64Backend*>(processor->backend());
+      if (auto* code_cache = backend->code_cache()) {
+        code_cache->TryPatchDirectCallSite(address, call_site_rx, code);
+      }
+    }
+  }
+  return reinterpret_cast<uint64_t>(code);
+}
+
+uint64_t ResolveFunctionWithoutStackSkewSkip(void* raw_context,
+                                             uint64_t target_address) {
+  auto* guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  if (!guest_context || !guest_context->processor) {
+    return 0;
+  }
+  auto* processor = guest_context->processor;
+  auto* backend = static_cast<A64Backend*>(processor->backend());
+  const uint32_t address = static_cast<uint32_t>(target_address);
+
+  std::lock_guard<std::mutex> reemit_lock(backend->stack_skew_reemit_mutex());
+
+  Function* fn = processor->QueryFunction(address);
+  if (backend->IsStackSkewSkipForbidden(address) && fn && fn->is_guest()) {
+    auto* a64_fn = static_cast<A64Function*>(fn);
+    if (a64_fn->forbid_stack_skew_skip()) {
+      if (uint8_t* code = a64_fn->machine_code()) {
+        return reinterpret_cast<uint64_t>(code);
+      }
+    }
+  }
+
+  backend->MarkForbidStackSkewSkip(address);
+
+  if (!fn || !fn->is_guest()) {
+    fn = processor->ResolveFunction(address);
+    if (!fn || !fn->is_guest()) {
+      return 0;
+    }
+    auto* a64_fn = static_cast<A64Function*>(fn);
+    if (a64_fn->forbid_stack_skew_skip()) {
+      return reinterpret_cast<uint64_t>(a64_fn->machine_code());
+    }
+  }
+
+  auto* a64_fn = static_cast<A64Function*>(fn);
+  a64_fn->set_forbid_stack_skew_skip(true);
+
+  // Revert any patched direct call sites / dynamic call cache entries pointing
+  // to the guarded code so callers route to the unguarded re-emit once
+  // BackpatchDirectCallSites runs inside A64Assembler::Assemble.
+  backend->InvalidateDynamicCalls(address, address);
+
+  Module* module = a64_fn->module();
+  if (dynamic_cast<TestModule*>(module)) {
+    module->ForgetSymbol(address);
+    processor->RemoveFunctionByAddress(address);
+    Function* recompiled = processor->ResolveFunction(address);
+    if (!recompiled || !recompiled->is_guest()) {
+      return 0;
+    }
+    return reinterpret_cast<uint64_t>(
+        static_cast<A64Function*>(recompiled)->machine_code());
+  }
+
+  if (!processor->frontend()->DefineFunction(a64_fn, 0)) {
+    XELOGE("A64Backend: failed to re-emit {:08X} without stack skew skip",
+           address);
+    return 0;
+  }
+  return reinterpret_cast<uint64_t>(a64_fn->machine_code());
+}
+
 // Where a dynamic code branch to kHostReturnAddress continues, or 0. Guest code
 // can divert its return and branch to the saved address from deeper frames, as
 // XeFu's trap handler does, so the branch returns to host code from the
@@ -1846,12 +2103,16 @@ bool A64Backend::Initialize(Processor* processor) {
   // it: the table reads zero where nothing wrote a slot, as for code the guest
   // writes at run time, which no module commits a range for.
   resolve_function_thunk_ = thunk_emitter.EmitResolveFunctionThunk();
+  patch_direct_call_thunk_ = thunk_emitter.EmitPatchDirectCallThunk();
+  reemit_without_stack_skew_thunk_ =
+      thunk_emitter.EmitReemitWithoutStackSkewThunk();
   host_to_guest_thunk_ = thunk_emitter.EmitHostToGuestThunk();
   guest_to_host_thunk_ = thunk_emitter.EmitGuestToHostThunk();
   guest_to_host_thunk_no_vec_ = thunk_emitter.EmitGuestToHostThunkNoVec();
 
   if (!host_to_guest_thunk_ || !guest_to_host_thunk_ ||
-      !guest_to_host_thunk_no_vec_ || !resolve_function_thunk_) {
+      !guest_to_host_thunk_no_vec_ || !resolve_function_thunk_ ||
+      !patch_direct_call_thunk_ || !reemit_without_stack_skew_thunk_) {
     XELOGE("A64Backend: Failed to generate thunks");
     return false;
   }
@@ -1932,6 +2193,16 @@ bool A64Backend::Initialize(Processor* processor) {
 void A64Backend::CommitExecutableRange(uint32_t guest_low,
                                        uint32_t guest_high) {
   code_cache_->CommitExecutableRange(guest_low, guest_high);
+}
+
+bool A64Backend::IsStackSkewSkipForbidden(uint32_t guest_address) const {
+  std::lock_guard<std::mutex> lock(stack_skew_forbid_mutex_);
+  return forbid_stack_skew_skip_addresses_.count(guest_address) != 0;
+}
+
+void A64Backend::MarkForbidStackSkewSkip(uint32_t guest_address) {
+  std::lock_guard<std::mutex> lock(stack_skew_forbid_mutex_);
+  forbid_stack_skew_skip_addresses_.insert(guest_address);
 }
 
 std::unique_ptr<Assembler> A64Backend::CreateAssembler() {
@@ -2045,6 +2316,9 @@ void A64Backend::DeinitializeBackendContext(void* ctx) {
 }
 
 void A64Backend::InvalidateDynamicCalls(uint32_t start, uint32_t end) {
+  if (code_cache_) {
+    code_cache_->RevertDirectCallSitesInRange(start, end);
+  }
   auto global_lock = global_critical_region_.Acquire();
   // A range with fewer instructions than the cache has slots only checks the
   // slots those hash to.

@@ -288,7 +288,8 @@ inline int SrcVReg(A64Emitter& e, const T& op, int scratch_idx) {
 
 // Compute a guest memory address, returning the XReg for [x21, xN] addressing.
 // For constants, loads the address into x0 (scratch).
-inline XReg ComputeMemoryAddress(A64Emitter& e, const I64Op& guest) {
+inline XReg ComputeMemoryAddress(A64Emitter& e, const I64Op& guest,
+                                 bool skip_physical_skew = false) {
   using namespace Xbyak_aarch64;
   if (guest.is_constant) {
     uint32_t address = static_cast<uint32_t>(guest.constant());
@@ -303,7 +304,7 @@ inline XReg ComputeMemoryAddress(A64Emitter& e, const I64Op& guest) {
     // Guest addresses are always 32-bit. Clear any stale upper bits before
     // applying the host membase so guest pointers can't escape above 4 GB.
     e.mov(e.w0, WReg(src.getIdx()));
-    if (xe::memory::allocation_granularity() > 0x1000) {
+    if (xe::memory::allocation_granularity() > 0x1000 && !skip_physical_skew) {
       // Branch-free: w17 = w0 + 0x1000, kept only when w0 >= 0xE0000000.
       e.mov(e.w17, 0xE0000000u);
       e.cmp(e.w0, e.w17);
@@ -379,13 +380,14 @@ inline void EmitGuestOffsetAdd(A64Emitter& e, const WReg& base,
 // (x64_seq_memory.cc, ComputeMemoryAddressOffset); that latent divergence
 // predates this helper and is intentionally left unchanged here.
 inline XReg ComputeMemoryAddressOffset(A64Emitter& e, const I64Op& guest,
-                                       const I64Op& offset) {
+                                       const I64Op& offset,
+                                       bool skip_physical_skew = false) {
   using namespace Xbyak_aarch64;
   if (!offset.is_constant) {
     // Register offset (no current PPC producer, but reachable through HIR):
     // zero-extend/fix up the base as usual, then one W-register add wraps the
     // guest arithmetic at 32 bits.
-    ComputeMemoryAddress(e, guest);
+    ComputeMemoryAddress(e, guest, skip_physical_skew);
     e.add(e.w0, e.w0, WReg(offset.reg().getIdx()));
     return e.x0;
   }
@@ -401,15 +403,15 @@ inline XReg ComputeMemoryAddressOffset(A64Emitter& e, const I64Op& guest,
     e.mov(e.x0, static_cast<uint64_t>(address));
     return e.x0;
   }
-  if (xe::memory::allocation_granularity() > 0x1000) {
+  if (xe::memory::allocation_granularity() > 0x1000 && !skip_physical_skew) {
     // The runtime fixup must see the zero-extended base before the offset is
     // applied; ComputeMemoryAddress emits exactly that block into w0.
-    ComputeMemoryAddress(e, guest);
+    ComputeMemoryAddress(e, guest, false);
     EmitGuestOffsetAdd(e, e.w0, offset_const);
   } else {
-    // Hot path (4 KiB pages, no fixup instructions): fold the zero-extending
-    // base copy into the offset add itself - typically a single
-    // 'add/sub w0, wBASE, #imm'.
+    // Hot path (4 KiB pages, or proven non-0xE0000000 r1 stack access):
+    // fold the zero-extending base copy into the offset add itself -
+    // typically a single 'add/sub w0, wBASE, #imm'.
     EmitGuestOffsetAdd(e, WReg(guest.reg().getIdx()), offset_const);
   }
   return e.x0;

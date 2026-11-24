@@ -77,8 +77,9 @@ struct EmitFunctionInfo {
 //   void FillCode(void* address, size_t size)
 //     Fill unused code regions with trap instructions (0xCC / BRK).
 //
-//   void FlushCodeRange(void* address, size_t size)
-//     Flush I-cache after writing code (no-op on x86, required on ARM64).
+//   void FlushCodeRange(void* write_address, void* execute_address, size_t size)
+//     Flush I-cache after writing code (no-op on x86, required on ARM64;
+//     receives both the RW write VA and RX execute VA for W^X dual-mappings).
 //
 //   UnwindReservation RequestUnwindReservation(uint8_t* entry_address)
 //     Reserve space for platform-specific unwind info.
@@ -141,6 +142,33 @@ class CodeCacheBase : public CodeCache {
                : (execute_address_high() | kGeneratedCodeExecuteBaseLow);
   }
   size_t total_size() const override { return kGeneratedCodeSize; }
+
+  bool IsInExecuteRange(uintptr_t execute_address) const {
+    if (!generated_code_execute_base_) {
+      return false;
+    }
+    const uintptr_t base =
+        reinterpret_cast<uintptr_t>(generated_code_execute_base_);
+    if (execute_address < base || (execute_address & 3u) != 0) {
+      return false;
+    }
+    const uintptr_t offset = execute_address - base;
+    return offset + sizeof(uint32_t) <= kGeneratedCodeSize;
+  }
+
+  uint32_t* WriteSlotForExecuteAddress(uintptr_t execute_address) const {
+    if (!generated_code_write_base_ || !IsInExecuteRange(execute_address)) {
+      return nullptr;
+    }
+    const uintptr_t offset =
+        execute_address -
+        reinterpret_cast<uintptr_t>(generated_code_execute_base_);
+    if (offset + sizeof(uint32_t) >
+        generated_code_commit_mark_.load(std::memory_order_acquire)) {
+      return nullptr;
+    }
+    return reinterpret_cast<uint32_t*>(generated_code_write_base_ + offset);
+  }
 
   bool has_indirection_table() { return indirection_table_base_ != nullptr; }
 
@@ -544,11 +572,30 @@ class CodeCacheBase : public CodeCache {
 #endif
 
       // Flush I-cache for code and fill regions.
-      self().FlushCodeRange(code_write_address, func_info.code_size.total);
+      if constexpr (requires {
+                      self().FlushCodeRange(code_write_address,
+                                            code_execute_address,
+                                            func_info.code_size.total);
+                    }) {
+        self().FlushCodeRange(code_write_address, code_execute_address,
+                              func_info.code_size.total);
+      } else {
+        self().FlushCodeRange(code_write_address, func_info.code_size.total);
+      }
       if (tail_write_address < end_write_address) {
-        self().FlushCodeRange(
-            tail_write_address,
-            static_cast<size_t>(end_write_address - tail_write_address));
+        auto tail_execute_address =
+            code_execute_address + (tail_write_address - code_write_address);
+        const size_t tail_size =
+            static_cast<size_t>(end_write_address - tail_write_address);
+        if constexpr (requires {
+                        self().FlushCodeRange(tail_write_address,
+                                              tail_execute_address, tail_size);
+                      }) {
+          self().FlushCodeRange(tail_write_address, tail_execute_address,
+                                tail_size);
+        } else {
+          self().FlushCodeRange(tail_write_address, tail_size);
+        }
       }
     }
 

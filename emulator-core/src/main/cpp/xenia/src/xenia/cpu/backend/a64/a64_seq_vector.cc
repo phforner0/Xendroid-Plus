@@ -1963,7 +1963,8 @@ struct LVL_V128 : Sequence<LVL_V128, I<OPCODE_LVL, V128Op, I64Op>> {
     // Inline LVL using TBL.  The bswap-within-lanes base pattern plus the
     // address offset gives a TBL control vector.  Indices >= 16 naturally
     // produce zero from TBL, which is the correct LVL behaviour.
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    // LVL/LVR/STVL/STVR are X-form vector accesses; keep skip_physical_skew=false.
+    auto addr = ComputeMemoryAddress(e, i.src1, /*skip_physical_skew=*/false);
     int d = i.dest.reg().getIdx();
 
     // x0 = host address
@@ -1994,7 +1995,8 @@ struct LVR_V128 : Sequence<LVR_V128, I<OPCODE_LVR, V128Op, I64Op>> {
     // Indices 0-15 read zeros (from v0), 16-31 read mem (from v1).
     // base + offset produces indices > 15 exactly where LVR should output
     // the memory bytes, and <= 15 where it should output zero.
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    // LVL/LVR/STVL/STVR are X-form vector accesses; keep skip_physical_skew=false.
+    auto addr = ComputeMemoryAddress(e, i.src1, /*skip_physical_skew=*/false);
     int d = i.dest.reg().getIdx();
     // Unqualified Label here is hir::Label.
     Xbyak_aarch64::Label endpoint;
@@ -2095,7 +2097,8 @@ struct STVL_V128 : Sequence<STVL_V128, I<OPCODE_STVL, VoidOp, I64Op, V128Op>> {
     e.str(QReg(0),
           ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
 
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    // STVL is an X-form vector access; keep skip_physical_skew=false.
+    auto addr = ComputeMemoryAddress(e, i.src1, /*skip_physical_skew=*/false);
     e.add(e.x0, e.GetMembaseReg(), addr);
     e.and_(e.w2, e.w0, 0xF);
     e.mov(e.w1, 16);
@@ -2120,7 +2123,8 @@ struct STVR_V128 : Sequence<STVR_V128, I<OPCODE_STVR, VoidOp, I64Op, V128Op>> {
     e.str(QReg(0),
           ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
 
-    auto addr = ComputeMemoryAddress(e, i.src1);
+    // STVR is an X-form vector access; keep skip_physical_skew=false.
+    auto addr = ComputeMemoryAddress(e, i.src1, /*skip_physical_skew=*/false);
     e.add(e.x0, e.GetMembaseReg(), addr);
     e.and_(e.w2, e.w0, 0xF);
     e.and_(e.x0, e.x0, ~0xFull);

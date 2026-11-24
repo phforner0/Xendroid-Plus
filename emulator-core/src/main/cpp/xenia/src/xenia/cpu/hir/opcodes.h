@@ -37,6 +37,7 @@ enum RoundMode {
 
 enum LoadStoreFlags {
   LOAD_STORE_BYTE_SWAP = 1 << 0,
+  LOAD_STORE_NO_PHYSICAL_SKEW = 1 << 1,
 };
 
 enum CacheControlType {

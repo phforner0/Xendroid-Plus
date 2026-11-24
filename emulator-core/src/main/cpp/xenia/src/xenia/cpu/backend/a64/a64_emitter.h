@@ -320,7 +320,21 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];
 
+  struct PendingDirectCall {
+    size_t branch_code_offset = 0;
+    size_t stub_code_offset = SIZE_MAX;
+    uint32_t target_guest_addr = 0;
+    GuestFunction* target_fn = nullptr;
+    bool is_tail = false;
+  };
+  void SetPendingDirectCallStubOffset(size_t index, size_t offset) {
+    if (index < pending_direct_calls_.size()) {
+      pending_direct_calls_[index].stub_code_offset = offset;
+    }
+  }
+
   std::vector<TailEmitter> tail_code_;
+  std::vector<PendingDirectCall> pending_direct_calls_;
   std::vector<Xbyak_aarch64::Label*> label_cache_;
 
   // v128 constants needing a literal, with labels owned by label_cache_.
@@ -343,6 +357,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // Set per attempt while a guest function is emitted (the helper thunks keep
   // the long-range form).
   bool near_branches_ = false;
+  bool uses_stack_skew_skip_ = false;
 };
 
 }  // namespace a64

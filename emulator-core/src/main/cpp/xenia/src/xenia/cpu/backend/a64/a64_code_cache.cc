@@ -13,6 +13,7 @@
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/platform.h"
+#include "xenia/cpu/backend/a64/a64_direct_call.h"
 #include "xenia/cpu/function.h"
 #if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
@@ -112,19 +113,220 @@ void A64CodeCache::FillCode(void* write_address, size_t size) {
   }
 }
 
-void A64CodeCache::FlushCodeRange(void* address, size_t size) {
+void A64CodeCache::FlushCodeRange(void* write_address, void* execute_address,
+                                  size_t size) {
+  if (!size) {
+    return;
+  }
 #if XE_PLATFORM_WIN32
-  FlushInstructionCache(GetCurrentProcess(), address, size);
+  void* target = execute_address ? execute_address : write_address;
+  FlushInstructionCache(GetCurrentProcess(), target, size);
+#elif XE_ARCH_ARM64 && !XE_PLATFORM_MAC
+  uint64_t ctr_el0 = 0;
+  asm volatile("mrs %0, ctr_el0" : "=r"(ctr_el0));
+  const size_t dline = size_t(4) << ((ctr_el0 >> 16) & 0xFu);
+  const size_t iline = size_t(4) << (ctr_el0 & 0xFu);
+
+  if (write_address) {
+    const uintptr_t d_start =
+        reinterpret_cast<uintptr_t>(write_address) & ~(dline - 1);
+    const uintptr_t d_end = reinterpret_cast<uintptr_t>(write_address) + size;
+    for (uintptr_t p = d_start; p < d_end; p += dline) {
+      asm volatile("dc cvau, %0" : : "r"(p) : "memory");
+    }
+  }
+  asm volatile("dsb ish" : : : "memory");
+
+  if (execute_address) {
+    const uintptr_t i_start =
+        reinterpret_cast<uintptr_t>(execute_address) & ~(iline - 1);
+    const uintptr_t i_end =
+        reinterpret_cast<uintptr_t>(execute_address) + size;
+    for (uintptr_t p = i_start; p < i_end; p += iline) {
+      asm volatile("ic ivau, %0" : : "r"(p) : "memory");
+    }
+  }
+  asm volatile("dsb ish\nisb" : : : "memory");
 #else
-
-
 #if XE_PLATFORM_xendroid
-    //XELOGI("ASM:\n{}", aarch64_disasm(reinterpret_cast<uint64_t>(address),reinterpret_cast<uint32_t*>(address),size/4));
+  // XELOGI("ASM:\n{}", aarch64_disasm(...));
 #endif
-    __builtin___clear_cache(
-      reinterpret_cast<char*>(address),
-      reinterpret_cast<char*>(static_cast<uint8_t*>(address) + size));
+  void* target = execute_address ? execute_address : write_address;
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(target),
+      reinterpret_cast<char*>(static_cast<uint8_t*>(target) + size));
 #endif
+}
+
+void A64CodeCache::FlushPatchedInstruction(void* write_address,
+                                           void* execute_address) {
+  FlushCodeRange(write_address, execute_address, sizeof(uint32_t));
+}
+
+void A64CodeCache::RegisterDirectCallSite(uint32_t target_guest_addr,
+                                          uintptr_t call_site_rx,
+                                          uint32_t original_stub_insn,
+                                          bool is_tail,
+                                          uintptr_t tail_stub_rx) {
+  if (!IsInExecuteRange(call_site_rx)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(direct_call_sites_mutex_);
+  auto& sites = pending_direct_call_sites_[target_guest_addr];
+  for (const auto& existing : sites) {
+    if (existing.call_site_rx == call_site_rx) {
+      return;
+    }
+  }
+  sites.push_back(DirectCallSite{call_site_rx, original_stub_insn, is_tail,
+                                 tail_stub_rx});
+}
+
+void A64CodeCache::BackpatchDirectCallSites(uint32_t target_guest_addr,
+                                            void* target_execute_address) {
+  if (!target_execute_address) {
+    return;
+  }
+  const uintptr_t target_rx =
+      reinterpret_cast<uintptr_t>(target_execute_address);
+  if (!IsInExecuteRange(target_rx)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(direct_call_sites_mutex_);
+  auto it = pending_direct_call_sites_.find(target_guest_addr);
+  if (it == pending_direct_call_sites_.end()) {
+    return;
+  }
+  std::vector<DirectCallSite> remaining;
+  for (const auto& site : it->second) {
+    if (!IsInExecuteRange(site.call_site_rx)) {
+      continue;
+    }
+    int64_t diff = 0;
+    if (!ComputeA64Rel26Offset(site.call_site_rx, target_rx, &diff)) {
+      // Target is > +-128 MiB away: bypass PatchDirectCallThunk permanently by
+      // switching the non-tail stub's entry branch to NOP (falling into the
+      // indirection table lookup) and drop this unpatchable site from pending.
+      if (!site.is_tail && site.tail_stub_rx != 0 &&
+          IsInExecuteRange(site.tail_stub_rx)) {
+        if (uint32_t* stub_rw = WriteSlotForExecuteAddress(site.tail_stub_rx)) {
+          constexpr uint32_t kA64NopInsn = 0xD503201Fu;
+          if (PatchA64InstructionAtomic(stub_rw, kA64NopInsn)) {
+            FlushPatchedInstruction(
+                stub_rw, reinterpret_cast<void*>(site.tail_stub_rx));
+          }
+        }
+      }
+      continue;
+    }
+    uint32_t* rw_slot = WriteSlotForExecuteAddress(site.call_site_rx);
+    if (!rw_slot) {
+      remaining.push_back(site);
+      continue;
+    }
+    const uint32_t branch_insn = EncodeA64BranchRel26(diff, !site.is_tail);
+    if (PatchA64InstructionAtomic(rw_slot, branch_insn)) {
+      FlushPatchedInstruction(rw_slot,
+                              reinterpret_cast<void*>(site.call_site_rx));
+      patched_direct_call_sites_[target_guest_addr].push_back(site);
+    } else {
+      remaining.push_back(site);
+    }
+  }
+  if (remaining.empty()) {
+    pending_direct_call_sites_.erase(it);
+  } else {
+    it->second = std::move(remaining);
+  }
+}
+
+bool A64CodeCache::TryPatchDirectCallSite(uint32_t target_guest_addr,
+                                          uintptr_t call_site_rx,
+                                          void* target_execute_address) {
+  if (!target_execute_address || !IsInExecuteRange(call_site_rx)) {
+    return false;
+  }
+  const uintptr_t target_rx =
+      reinterpret_cast<uintptr_t>(target_execute_address);
+  if (!IsInExecuteRange(target_rx)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(direct_call_sites_mutex_);
+  auto it = pending_direct_call_sites_.find(target_guest_addr);
+  if (it == pending_direct_call_sites_.end()) {
+    return false;
+  }
+  auto& pending = it->second;
+  for (size_t i = 0; i < pending.size(); ++i) {
+    if (pending[i].call_site_rx != call_site_rx) {
+      continue;
+    }
+    int64_t diff = 0;
+    if (!ComputeA64Rel26Offset(call_site_rx, target_rx, &diff)) {
+      const DirectCallSite site = pending[i];
+      if (!site.is_tail && site.tail_stub_rx != 0 &&
+          IsInExecuteRange(site.tail_stub_rx)) {
+        if (uint32_t* stub_rw = WriteSlotForExecuteAddress(site.tail_stub_rx)) {
+          constexpr uint32_t kA64NopInsn = 0xD503201Fu;
+          if (PatchA64InstructionAtomic(stub_rw, kA64NopInsn)) {
+            FlushPatchedInstruction(
+                stub_rw, reinterpret_cast<void*>(site.tail_stub_rx));
+          }
+        }
+      }
+      pending[i] = pending.back();
+      pending.pop_back();
+      if (pending.empty()) {
+        pending_direct_call_sites_.erase(it);
+      }
+      return false;
+    }
+    uint32_t* rw_slot = WriteSlotForExecuteAddress(call_site_rx);
+    if (!rw_slot) {
+      return false;
+    }
+    const DirectCallSite site = pending[i];
+    const uint32_t branch_insn = EncodeA64BranchRel26(diff, !site.is_tail);
+    if (!PatchA64InstructionAtomic(rw_slot, branch_insn)) {
+      return false;
+    }
+    FlushPatchedInstruction(rw_slot, reinterpret_cast<void*>(call_site_rx));
+    patched_direct_call_sites_[target_guest_addr].push_back(site);
+    pending[i] = pending.back();
+    pending.pop_back();
+    if (pending.empty()) {
+      pending_direct_call_sites_.erase(it);
+    }
+    return true;
+  }
+  return false;
+}
+
+void A64CodeCache::RevertDirectCallSitesInRange(uint32_t guest_start,
+                                                uint32_t guest_end) {
+  if (guest_start > guest_end) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(direct_call_sites_mutex_);
+  for (auto it = patched_direct_call_sites_.begin();
+       it != patched_direct_call_sites_.end();) {
+    const uint32_t target_addr = it->first;
+    if (target_addr < guest_start || target_addr > guest_end) {
+      ++it;
+      continue;
+    }
+    auto& pending = pending_direct_call_sites_[target_addr];
+    for (const auto& site : it->second) {
+      uint32_t* rw_slot = WriteSlotForExecuteAddress(site.call_site_rx);
+      if (rw_slot &&
+          PatchA64InstructionAtomic(rw_slot, site.original_stub_insn)) {
+        FlushPatchedInstruction(rw_slot,
+                                reinterpret_cast<void*>(site.call_site_rx));
+      }
+      pending.push_back(site);
+    }
+    it = patched_direct_call_sites_.erase(it);
+  }
 }
 
 }  // namespace a64

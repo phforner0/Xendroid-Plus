@@ -21,16 +21,20 @@
 #include "xenia/cpu/backend/a64/a64_function.h"
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
+#include "xenia/cpu/backend/a64/a64_stack_skew_analysis.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/hir/hir_builder.h"
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/ppc/ppc_stack_skew_guard.h"
 #include "xenia/cpu/processor.h"
 
 DECLARE_int64(a64_max_stackpoints);
 DECLARE_bool(a64_enable_host_guest_stack_synchronization);
 DECLARE_bool(a64_near_branches);
+DECLARE_bool(a64_direct_calls);
+DECLARE_bool(a64_skip_stack_skew_fixup);
 
 DEFINE_bool(
     log_safepoint_pc, false,
@@ -131,6 +135,26 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   // an unencodable operand needs catching here too. Conditional branches are
   // emitted direct first; a function too large for them to reach across is
   // emitted again with the long-range form.
+  bool uses_no_skew = false;
+  bool has_unsafe_r1_write = false;
+  AnalyzeStackSkewSafety(builder, &uses_no_skew, &has_unsafe_r1_write);
+  auto* a64_fn = static_cast<A64Function*>(function);
+  const bool forbid_skew_skip =
+      a64_fn->forbid_stack_skew_skip() ||
+      backend_->IsStackSkewSkipForbidden(function->address());
+  if (forbid_skew_skip) {
+    a64_fn->set_forbid_stack_skew_skip(true);
+  }
+  const bool allow_skew_skip =
+      xe::memory::allocation_granularity() > 0x1000 &&
+      cvars::a64_skip_stack_skew_fixup && !forbid_skew_skip &&
+      !has_unsafe_r1_write;
+  if (uses_no_skew && !allow_skew_skip) {
+    StripNoPhysicalSkewFlags(builder);
+    uses_no_skew = false;
+  }
+  uses_stack_skew_skip_ = allow_skew_skip && uses_no_skew;
+
   EmitFunctionInfo func_info = {};
   bool emitted = false;
   // Once: it turns every local into its stack offset (a constant of another
@@ -142,6 +166,7 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
     stack_size_ = StackLayout::GUEST_STACK_SIZE;
     source_map_arena_.Reset();
     tail_code_.clear();
+    pending_direct_calls_.clear();
     fpcr_mode_ = FPCRMode::Unknown;
     func_info = {};
     try {
@@ -162,6 +187,7 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
     break;
   }
   near_branches_ = false;
+  uses_stack_skew_skip_ = false;
   if (!emitted) {
     // Emplace only runs on success, so a failed compile has to reset too.
     ResetPerFunctionState();
@@ -240,6 +266,37 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
 
   // Record stackpoint for longjmp recovery.
   PushStackpoint();
+
+  if (uses_stack_skew_skip_) {
+    // Guard entry r1 against [0x70000000, 0x7F000000). On a 16 KB host, any
+    // call entering with r1 outside the guest stack window pops the frame and
+    // re-emits this function without LOAD_STORE_NO_PHYSICAL_SKEW.
+    static_assert(kR1ContextOffset < 16380,
+                  "r[1] offset must fit A64 ldr unsigned imm12");
+    auto& fallback_label = AddToTail([](A64Emitter& e, Label&) {
+      e.PopStackpoint();
+      e.ldr(e.x0,
+            ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+      e.ldr(e.x30,
+            ptr(e.sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
+      if (e.stack_size() <= 4095) {
+        e.add(e.sp, e.sp, static_cast<uint32_t>(e.stack_size()));
+      } else {
+        e.mov(e.x17, static_cast<uint64_t>(e.stack_size()));
+        e.add(e.sp, e.sp, e.x17, UXTX);
+      }
+      e.mov(e.w16, e.current_guest_function());
+      e.mov(e.x9, reinterpret_cast<uint64_t>(
+                      e.backend()->reemit_without_stack_skew_thunk()));
+      e.br(e.x9);
+    });
+    ldr(w17, ptr(x20, static_cast<uint32_t>(kR1ContextOffset)));
+    mov(w16, ppc::kGuestStackRangeBegin);
+    sub(w17, w17, w16);
+    mov(w16, ppc::kGuestStackRangeEnd - ppc::kGuestStackRangeBegin);
+    cmp(w17, w16);
+    b(HS, fallback_label);
+  }
 
   // ========================================================================
   // BODY
@@ -450,6 +507,33 @@ void* A64Emitter::Emplace(const EmitFunctionInfo& func_info,
         new_execute_address, new_write_address);
   }
 
+  if (function && !pending_direct_calls_.empty()) {
+    const uintptr_t base_rx = reinterpret_cast<uintptr_t>(new_execute_address);
+    for (const auto& entry : pending_direct_calls_) {
+      const uintptr_t call_site_rx = base_rx + entry.branch_code_offset;
+      const uintptr_t tail_stub_rx =
+          entry.stub_code_offset != SIZE_MAX
+              ? (base_rx + entry.stub_code_offset)
+              : 0;
+      uint32_t* rw_slot = code_cache_->WriteSlotForExecuteAddress(call_site_rx);
+      if (!rw_slot) {
+        continue;
+      }
+      const uint32_t original_stub_insn = *rw_slot;
+      code_cache_->RegisterDirectCallSite(entry.target_guest_addr, call_site_rx,
+                                          original_stub_insn, entry.is_tail,
+                                          tail_stub_rx);
+      if (entry.target_fn) {
+        uint8_t* target_code =
+            static_cast<A64Function*>(entry.target_fn)->machine_code();
+        if (target_code) {
+          code_cache_->BackpatchDirectCallSites(entry.target_guest_addr,
+                                                target_code);
+        }
+      }
+    }
+  }
+
   // In xbyak_aarch64, labels are resolved at define time (backpatching),
   // so all relative offsets are already correct. We just need to reset
   // the codegen state for the next function.
@@ -461,6 +545,7 @@ void* A64Emitter::Emplace(const EmitFunctionInfo& func_info,
 void A64Emitter::ResetPerFunctionState() {
   reset();
   tail_code_.clear();
+  pending_direct_calls_.clear();
 
   // Clean up cached labels.
   epilog_label_ = nullptr;
@@ -599,6 +684,128 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   const bool rewritable = processor()->dynamic_code_enabled() &&
                           code_cache_->has_indirection_table() &&
                           !code_cache_->HasIndirectionSlot(function->address());
+  if (cvars::a64_direct_calls && !rewritable &&
+      code_cache_->has_indirection_table() &&
+      code_cache_->HasIndirectionSlot(function->address())) {
+    const uint32_t target_guest_addr = function->address();
+    const bool is_tail = (instr->flags & hir::CALL_TAIL) != 0;
+    const bool encoded_indirection = code_cache_->encoded_indirection();
+    if (!is_tail) {
+      const uint64_t patch_thunk =
+          reinterpret_cast<uint64_t>(backend()->patch_direct_call_thunk());
+      const size_t call_idx = pending_direct_calls_.size();
+      Label& tail_stub_label = AddToTail(
+          [call_idx, target_guest_addr, patch_thunk, encoded_indirection](
+              A64Emitter& e, Label&) {
+            e.SetPendingDirectCallStubOffset(call_idx, e.getSize());
+            Label do_patch;
+            // Entry instruction is patched to NOP if target is > +-128 MiB so
+            // subsequent calls bypass PatchDirectCallThunk via indirection.
+            e.CodeGenerator::b(do_patch);
+
+            e.mov(e.w16, target_guest_addr);
+            if (!encoded_indirection) {
+              e.ldr(e.w9, ptr(e.x16, static_cast<uint32_t>(0)));
+            } else {
+              Label external_target;
+              Label indirection_ready;
+
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   indirection_table_base_bias))));
+              e.add(e.x14, e.x14, e.w16, UXTW);
+              e.ldr(e.w9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.tbnz(e.w9, 31, external_target);
+
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   code_cache_execute_base))));
+              e.add(e.x9, e.x14, e.w9, UXTW);
+              e.CodeGenerator::b(indirection_ready);
+
+              e.L(external_target);
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   external_indirection_table_base))));
+              e.lsl(e.x15, e.x15, 3);
+              e.add(e.x14, e.x14, e.x15);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+
+              e.L(indirection_ready);
+            }
+            e.br(e.x9);
+
+            e.L(do_patch);
+            e.mov(e.w16, target_guest_addr);
+            e.mov(e.x9, patch_thunk);
+            e.br(e.x9);
+          });
+      ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
+      const size_t branch_code_offset = getSize();
+      bl(tail_stub_label);
+      synchronize_stack_on_next_instruction_ = true;
+      pending_direct_calls_.push_back(
+          {branch_code_offset, SIZE_MAX, target_guest_addr, function, false});
+    } else {
+      Label& tail_stub_label = AddToTail(
+          [target_guest_addr, encoded_indirection](A64Emitter& e, Label&) {
+            e.mov(e.w16, target_guest_addr);
+            if (!encoded_indirection) {
+              e.ldr(e.w9, ptr(e.x16, static_cast<uint32_t>(0)));
+            } else {
+              Label external_target;
+              Label indirection_ready;
+
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   indirection_table_base_bias))));
+              e.add(e.x14, e.x14, e.w16, UXTW);
+              e.ldr(e.w9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.tbnz(e.w9, 31, external_target);
+
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   code_cache_execute_base))));
+              e.add(e.x9, e.x14, e.w9, UXTW);
+              e.CodeGenerator::b(indirection_ready);
+
+              e.L(external_target);
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   external_indirection_table_base))));
+              e.lsl(e.x15, e.x15, 3);
+              e.add(e.x14, e.x14, e.x15);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+
+              e.L(indirection_ready);
+            }
+            e.br(e.x9);
+          });
+      PopStackpoint();
+      ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+      ldr(x30, ptr(sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
+      if (stack_size() <= 4095) {
+        add(sp, sp, static_cast<uint32_t>(stack_size()));
+      } else {
+        mov(x17, static_cast<uint64_t>(stack_size()));
+        add(sp, sp, x17, UXTX);
+      }
+      const size_t branch_code_offset = getSize();
+      b(tail_stub_label);
+      pending_direct_calls_.push_back(
+          {branch_code_offset, SIZE_MAX, target_guest_addr, function, true});
+    }
+    return;
+  }
+
   if (fn->machine_code() && !rewritable) {
     // Direct call — function is already compiled.
     mov(x9, reinterpret_cast<uint64_t>(fn->machine_code()));

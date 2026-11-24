@@ -25,6 +25,8 @@
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/processor.h"
 
+DECLARE_bool(a64_direct_calls);
+
 namespace xe {
 namespace cpu {
 namespace backend {
@@ -71,31 +73,43 @@ bool A64Assembler::Assemble(GuestFunction* function, HIRBuilder* builder,
   // Reset when we leave.
   xe::make_reset_scope(this);
 
-  // Lower HIR -> ARM64.
+  // Lower HIR -> ARM64 into a local source map first so concurrent readers on
+  // an existing live A64Function (e.g. ResolveFunctionWithoutStackSkewSkip)
+  // never observe a torn/reallocated source_map_ or mismatched machine_code_.
   void* machine_code = nullptr;
   size_t code_size = 0;
+  std::vector<SourceMapEntry> new_source_map;
   if (!emitter_->Emit(function, builder, debug_info_flags, debug_info.get(),
-                      &machine_code, &code_size, &function->source_map())) {
+                      &machine_code, &code_size, &new_source_map)) {
     return false;
   }
 
   // Stash generated machine code.
   if (debug_info_flags & DebugInfoFlags::kDebugInfoDisasmMachineCode) {
-    DumpMachineCode(machine_code, code_size, function->source_map(),
-                    &string_buffer_);
+    DumpMachineCode(machine_code, code_size, new_source_map, &string_buffer_);
     debug_info->set_machine_code_disasm(xe_strdup(string_buffer_.buffer()));
     string_buffer_.Reset();
   }
 
   function->set_debug_info(std::move(debug_info));
-  static_cast<A64Function*>(function)->Setup(
-      reinterpret_cast<uint8_t*>(machine_code), code_size,
-      emitter_->stack_size());
+  {
+    std::vector<SourceMapEntry> old_source_map;
+    std::lock_guard<std::mutex> lock(function->source_map_mutex());
+    old_source_map = std::move(function->source_map());
+    function->source_map() = std::move(new_source_map);
+    static_cast<A64Function*>(function)->Setup(
+        reinterpret_cast<uint8_t*>(machine_code), code_size,
+        emitter_->stack_size());
+  }
 
   // Install into indirection table (supports code cache at any 64-bit VA).
-  reinterpret_cast<A64CodeCache*>(backend_->code_cache())
-      ->AddIndirection64(function->address(),
-                         reinterpret_cast<uint64_t>(machine_code));
+  auto* a64_code_cache =
+      reinterpret_cast<A64CodeCache*>(backend_->code_cache());
+  a64_code_cache->AddIndirection64(function->address(),
+                                   reinterpret_cast<uint64_t>(machine_code));
+  if (cvars::a64_direct_calls) {
+    a64_code_cache->BackpatchDirectCallSites(function->address(), machine_code);
+  }
 
   return true;
 }
