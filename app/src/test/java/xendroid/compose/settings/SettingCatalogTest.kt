@@ -28,8 +28,8 @@ class SettingCatalogTest {
         assertEquals(SettingsSchema.allSettings.size, x.size)
     }
 
-    @Test fun thirty_four_new_cvars_and_two_new_values() {
-        assertEquals(34, SettingCatalog.newCount)
+    @Test fun thirty_five_new_cvars_and_two_new_values() {
+        assertEquals(35, SettingCatalog.newCount)
         assertEquals(2, SettingCatalog.newOptionCount)
         listOf("GPU|gpu_texture_lod_bias", "Vulkan|vulkan_android_present_divisor").forEach { key ->
             val meta = SettingCatalog.meta(key)
@@ -40,6 +40,7 @@ class SettingCatalogTest {
             "GPU|vulkan_defer_resolve_clears",
             "GPU|vulkan_auto_vrs_thermal",
             "CPU|adpf_cpu_performance_hint",
+            "CPU|jit_warmup_jprof",
         ).forEach { key ->
             val meta = SettingCatalog.meta(key)
             assertEquals(SettingGroup.PERFORMANCE, meta.group)
@@ -48,6 +49,19 @@ class SettingCatalogTest {
             assertFalse("$key must not be marked live", meta.live)
         }
         assertFalse("Kernel|kernel_delay0_backoff" in SettingCatalog.placedKeys)
+        listOf(
+            "CPU|dse_cross_block_context",
+            "CPU|dse_cross_block_vec128",
+            "CPU|a64_loop_context_promotion",
+            "CPU|a64_loop_promote_max_regs",
+            "CPU|a64_loop_promote_defer_stores_across_memory",
+            "CPU|context_promote_vec128",
+            "CPU|jit_warmup_jprof_threads",
+            "CPU|jit_warmup_jprof_save_interval_ms",
+            "CPU|jit_warmup_jprof_save_batch",
+        ).forEach { key ->
+            assertFalse("$key must stay TOML-only", key in SettingCatalog.placedKeys)
+        }
     }
 
     @Test fun dependencies_name_real_settings_and_values() {

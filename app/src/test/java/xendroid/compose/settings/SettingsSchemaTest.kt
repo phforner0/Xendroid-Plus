@@ -21,18 +21,19 @@ class SettingsSchemaTest {
     // the 19 Plus Ultra Track A/B/C/D canonical engine cvars (195), the 2 Wave 1 mobile
     // optimization cvars (GPU|gpu_texture_lod_bias, Vulkan|vulkan_android_present_divisor) (197),
     // and the 3 Wave 2 mobile render/thermal/ADPF cvars (GPU|vulkan_defer_resolve_clears,
-    // GPU|vulkan_auto_vrs_thermal, CPU|adpf_cpu_performance_hint): 200.
-    @Test fun total_entry_count_is_200() {
-        assertEquals(200, all.size)
+    // GPU|vulkan_auto_vrs_thermal, CPU|adpf_cpu_performance_hint): 200,
+    // plus Wave 4 CPU|jit_warmup_jprof: 201.
+    @Test fun total_entry_count_is_201() {
+        assertEquals(201, all.size)
         assertEquals(
-            200,
+            201,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
     }
 
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(141, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra + 3 Wave 2 bool cvars
+        assertEquals(142, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra + 3 Wave 2 + 1 Wave 4 bool cvars
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
         assertEquals(34, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start + 2 Wave 1 list cvars
         assertEquals(2, all.count { it is Setting.Action })
@@ -222,6 +223,29 @@ class SettingsSchemaTest {
         assertWave2Bool("GPU|vulkan_auto_vrs_thermal", false)
         assertWave2Bool("CPU|adpf_cpu_performance_hint", false)
         assertNull(SettingsSchema.byKey["Kernel|kernel_delay0_backoff"])
+    }
+
+    @Test fun wave4_jprof_and_toml_only_contract() {
+        val jprof = SettingsSchema.byKey["CPU|jit_warmup_jprof"] as? Setting.Bool
+        assertNotNull("missing Wave 4 setting: CPU|jit_warmup_jprof", jprof)
+        assertEquals(true, jprof!!.default)
+        assertTrue("CPU|jit_warmup_jprof title must be non-blank", jprof.title.isNotBlank())
+        assertTrue("CPU|jit_warmup_jprof desc must be non-blank", jprof.desc.isNotBlank())
+        assertFalse("CPU|jit_warmup_jprof must not be in playerKeys", jprof.key in SettingsSchema.playerKeys)
+
+        listOf(
+            "CPU|dse_cross_block_context",
+            "CPU|dse_cross_block_vec128",
+            "CPU|a64_loop_context_promotion",
+            "CPU|a64_loop_promote_max_regs",
+            "CPU|a64_loop_promote_defer_stores_across_memory",
+            "CPU|context_promote_vec128",
+            "CPU|jit_warmup_jprof_threads",
+            "CPU|jit_warmup_jprof_save_interval_ms",
+            "CPU|jit_warmup_jprof_save_batch",
+        ).forEach { key ->
+            assertNull("$key must stay TOML-only", SettingsSchema.byKey[key])
+        }
     }
 
     /** vulkan_texture_cache reads -1 (no override) and 0..5 (off, 1x..16x). */

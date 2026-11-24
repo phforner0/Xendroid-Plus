@@ -73,6 +73,8 @@ done
 "$build/wave2_native_port_opts_test" "$cpp"
 "${cxx[@]}" "${flags[@]}" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/wave3_jit_hle_logic_test.cc" -o "$build/wave3_jit_hle_logic_test"
 "$build/wave3_jit_hle_logic_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/wave4_crossblock_jprof_logic_test.cc" -o "$build/wave4_crossblock_jprof_logic_test"
+"$build/wave4_crossblock_jprof_logic_test" "$cpp" "$build/wave4-scratch"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then
