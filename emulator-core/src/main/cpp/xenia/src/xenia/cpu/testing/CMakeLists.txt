@@ -13,3 +13,13 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET xenia-cpu-tests)
   target_link_libraries(xenia-cpu-tests PRIVATE xenia-apu-sdl)
 endif()
+if(ANDROID AND TARGET xenia-cpu-tests)
+  target_link_libraries(xenia-cpu-tests PRIVATE
+    xenia-apu-nop
+    xenia-gpu-null
+    xenia-hid-nop
+    xxhash
+    android
+    log
+  )
+endif()
