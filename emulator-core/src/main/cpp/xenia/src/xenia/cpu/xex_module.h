@@ -244,6 +244,12 @@ class XexModule : public xe::cpu::Module {
   // code patching and before the entry point runs.
   void PrecompileStaticInitializers();
 
+  uint32_t low_address() const { return low_address_; }
+  uint32_t high_address() const { return high_address_; }
+  bool IsCodeAddress(uint32_t address) const {
+    return !(address & 3) && address >= low_address_ && address < high_address_;
+  }
+
  protected:
   std::unique_ptr<Function> CreateFunction(uint32_t address) override;
 
@@ -251,9 +257,6 @@ class XexModule : public xe::cpu::Module {
   void PrecompileKnownFunctions();
   void PrecompileDiscoveredFunctions();
   std::vector<uint32_t> FindStaticInitializers() const;
-  bool IsCodeAddress(uint32_t address) const {
-    return !(address & 3) && address >= low_address_ && address < high_address_;
-  }
   std::vector<uint32_t> PreanalyzeCode();
   friend struct XexInfoCache;
   void ReadSecurityInfo();

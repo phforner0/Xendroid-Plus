@@ -98,6 +98,24 @@ DEFINE_bool(
     "Android: register live guest CPU worker threads with an ADPF performance "
     "hint session to stabilize CPU clocks under heavy load.",
     "CPU");
+DEFINE_bool(
+    jit_warmup_jprof, true,
+    "Persist discovered guest function addresses in a per-title .jprof cache "
+    "and pre-translate them in the background on next launch.",
+    "CPU");
+DEFINE_uint32(
+    jit_warmup_jprof_threads, 2,
+    "Background worker threads for .jprof JIT pre-translation (clamped 1..4).",
+    "CPU");
+DEFINE_uint32(
+    jit_warmup_jprof_save_interval_ms, 10000,
+    "Minimum interval in ms between periodic .jprof LMK-safe checkpoints.",
+    "CPU");
+DEFINE_uint32(
+    jit_warmup_jprof_save_batch, 256,
+    "New resolved functions required before triggering a periodic .jprof "
+    "checkpoint.",
+    "CPU");
 
 namespace xe {
 namespace cpu {

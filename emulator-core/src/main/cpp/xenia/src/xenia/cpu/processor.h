@@ -176,6 +176,15 @@ class Processor {
   // Changes whenever compiled code may have been dropped. A function resolved
   // before a change may have been dropped before it could be cached.
   uint64_t code_sweep_count() const { return code_sweep_count_.load(); }
+  void BumpCodeSweepCount() {
+    code_sweep_count_.fetch_add(1, std::memory_order_seq_cst);
+  }
+
+  // Configures per-title .jprof address collection for the active executable
+  // module, and drains newly compiled addresses into |out|.
+  void SetJitProfileFilter(const Module* module, uint32_t low_address,
+                           uint32_t high_address);
+  void DrainJitProfileAddresses(std::vector<uint32_t>& out);
 
   // The exclusive end of the swept range an address falls in, or 0 for none.
   uint32_t SweptCodeEnd(uint32_t address);
@@ -408,6 +417,13 @@ class Processor {
   std::vector<Breakpoint*> breakpoints_;
 
   Irql irql_;
+
+  std::atomic<bool> jprof_filter_active_{false};
+  std::mutex jprof_mutex_;
+  const Module* jprof_module_ = nullptr;
+  uint32_t jprof_low_addr_ = 0;
+  uint32_t jprof_high_addr_ = 0;
+  std::vector<uint32_t> jprof_pending_addresses_;
 };
 
 }  // namespace cpu

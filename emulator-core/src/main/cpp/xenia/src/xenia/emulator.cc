@@ -12,8 +12,13 @@
 #include "xenia/emulator.h"
 
 #include <algorithm>
+#include <chrono>
+#include <unordered_set>
 #if XE_PLATFORM_LINUX
 #include <fstream>
+#endif
+#if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID
+#include <sys/resource.h>
 #endif
 #if XE_PLATFORM_xendroid
 #include <queue>
@@ -37,7 +42,9 @@
 #include "xenia/cpu/backend/code_cache.h"
 #include "xenia/cpu/backend/null_backend.h"
 #include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/jit_profile_file.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/cpu/xex_module.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_driver.h"
@@ -244,6 +251,10 @@ void Emulator::Shutdown() {
     XELOGI("Emulator::Shutdown: on_before_shutdown fired (relaunch teardown)");
 #endif
   }
+
+  // Stop and flush the .jprof warmup/checkpoint session before tearing down
+  // kernel_state_ (which owns UserModule/XexModule) or processor_.
+  StopJitProfileSession(true);
 
   // Note that we delete things in the reverse order they were initialized.
 
@@ -511,6 +522,7 @@ X_STATUS Emulator::TerminateTitle() {
     return X_STATUS_UNSUCCESSFUL;
   }
 
+  StopJitProfileSession(true);
   kernel_state_->TerminateTitle();
   title_id_ = std::nullopt;
   title_name_ = "";
@@ -2915,12 +2927,233 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     module->xex_module()->PrecompileStaticInitializers();
   }
 
+  // Arm the .jprof JIT profile filter and warmup worker before resuming the
+  // guest main thread so cold-boot resolutions are never missed.
+  StartJitProfileSession(module.get());
+
   // Resume the main thread now.
   // If the debugger has requested a suspend this will just decrement the
   // suspend count without resuming it until the debugger wants.
   main_thread_->Resume();
 
   return X_STATUS_SUCCESS;
+}
+
+void Emulator::StartJitProfileSession(kernel::UserModule* module) {
+  StopJitProfileSession(false);
+
+  if (!cvars::jit_warmup_jprof || !processor_ || !module ||
+      !module->xex_module() || !title_id_.has_value() || cache_root_.empty()) {
+    return;
+  }
+
+  cpu::XexModule* xex = module->xex_module();
+  const uint32_t low = xex->low_address();
+  const uint32_t high = xex->high_address();
+  if (low >= high) {
+    return;
+  }
+
+  const uint32_t title_id = title_id_.value();
+  const uint64_t module_hash = module->hash().value_or(0);
+  const std::filesystem::path jprof_path =
+      cache_root_ / "jit_profiles" / fmt::format("{:08X}.jprof", title_id);
+
+  auto loaded = cpu::jit_profile_file::Load(jprof_path, title_id, module_hash);
+  if (loaded.status != cpu::jit_profile_file::LoadStatus::kMissing &&
+      loaded.status != cpu::jit_profile_file::LoadStatus::kLoaded) {
+    XELOGW("JitProfile: discarding {} ({})", xe::path_to_utf8(jprof_path),
+           cpu::jit_profile_file::LoadStatusName(loaded.status));
+  }
+
+  std::vector<uint32_t> seeded_known;
+  std::vector<uint32_t> to_precompile;
+  if (loaded.status == cpu::jit_profile_file::LoadStatus::kLoaded) {
+    seeded_known.reserve(loaded.addresses.size());
+    to_precompile.reserve(loaded.addresses.size());
+    for (uint32_t addr : loaded.addresses) {
+      if (!xex->IsCodeAddress(addr)) {
+        continue;
+      }
+      seeded_known.push_back(addr);
+      auto* sym = xex->LookupSymbol(addr, false);
+      if (!sym || sym->status() != cpu::Symbol::Status::kDefined) {
+        to_precompile.push_back(addr);
+      }
+    }
+  }
+
+  processor_->SetJitProfileFilter(xex, low, high);
+
+  jprof_path_ = jprof_path;
+  jprof_title_id_ = title_id;
+  jprof_module_hash_ = module_hash;
+  jprof_known_addresses_ = std::move(seeded_known);
+  jprof_dirty_ = false;
+  jprof_stop_requested_.store(false, std::memory_order_release);
+  jprof_session_active_ = true;
+
+  cpu::Processor* proc = processor_.get();
+  jprof_thread_ = std::thread(
+      [this, proc, to_precompile = std::move(to_precompile)]() mutable {
+        xe::threading::set_name("JitProfileWarmup");
+#if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID
+        (void)setpriority(PRIO_PROCESS, 0, 5);
+#endif
+        std::unordered_set<uint32_t> known_set(jprof_known_addresses_.begin(),
+                                               jprof_known_addresses_.end());
+
+        if (!to_precompile.empty() &&
+            !jprof_stop_requested_.load(std::memory_order_acquire)) {
+          const auto warmup_start = std::chrono::steady_clock::now();
+          const uint32_t requested = cvars::jit_warmup_jprof_threads;
+          const size_t worker_count = std::min<size_t>(
+              to_precompile.size(),
+              std::clamp<uint32_t>(requested == 0 ? 1u : requested, 1u, 4u));
+          std::atomic<size_t> next_index{0};
+          std::atomic<size_t> compiled_count{0};
+
+          auto worker_fn = [&]() {
+            xe::threading::set_name("JitProfileWorker");
+#if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID
+            (void)setpriority(PRIO_PROCESS, 0, 5);
+#endif
+            while (!jprof_stop_requested_.load(std::memory_order_acquire)) {
+              const size_t idx =
+                  next_index.fetch_add(1, std::memory_order_relaxed);
+              if (idx >= to_precompile.size()) {
+                break;
+              }
+              if (proc->ResolveFunction(to_precompile[idx])) {
+                compiled_count.fetch_add(1, std::memory_order_relaxed);
+              }
+            }
+          };
+
+          std::vector<std::thread> workers;
+          if (worker_count > 1) {
+            workers.reserve(worker_count - 1);
+            for (size_t w = 1; w < worker_count; ++w) {
+              workers.emplace_back(worker_fn);
+            }
+          }
+          worker_fn();
+          for (auto& w : workers) {
+            w.join();
+          }
+
+          const auto elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - warmup_start)
+                  .count();
+          XELOGI("JitProfile: pre-translated {}/{} functions in {} ms ({} "
+                 "thread(s))",
+                 compiled_count.load(std::memory_order_relaxed),
+                 to_precompile.size(), elapsed_ms, worker_count);
+        }
+
+        size_t pending_new = 0;
+        auto last_save = std::chrono::steady_clock::now();
+        std::vector<uint32_t> drained;
+
+        while (!jprof_stop_requested_.load(std::memory_order_acquire)) {
+          const uint32_t interval_ms = std::clamp<uint32_t>(
+              cvars::jit_warmup_jprof_save_interval_ms, 250u, 60000u);
+          const uint32_t save_batch =
+              std::max<uint32_t>(cvars::jit_warmup_jprof_save_batch, 1u);
+
+          {
+            std::unique_lock<std::mutex> lock(jprof_session_mutex_);
+            jprof_session_cv_.wait_for(
+                lock, std::chrono::milliseconds(interval_ms), [this]() {
+                  return jprof_stop_requested_.load(std::memory_order_acquire);
+                });
+          }
+          if (jprof_stop_requested_.load(std::memory_order_acquire)) {
+            break;
+          }
+
+          drained.clear();
+          proc->DrainJitProfileAddresses(drained);
+          for (uint32_t addr : drained) {
+            if (addr != 0u && (addr & 3u) == 0u &&
+                known_set.insert(addr).second) {
+              jprof_known_addresses_.push_back(addr);
+              jprof_dirty_ = true;
+              ++pending_new;
+            }
+          }
+
+          const auto now = std::chrono::steady_clock::now();
+          const bool interval_elapsed =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now - last_save)
+                  .count() >= static_cast<int64_t>(interval_ms);
+          if (jprof_dirty_ &&
+              (pending_new >= save_batch || interval_elapsed)) {
+            if (cpu::jit_profile_file::WriteAtomically(
+                    jprof_path_, jprof_title_id_, jprof_module_hash_,
+                    jprof_known_addresses_)) {
+              jprof_dirty_ = false;
+              pending_new = 0;
+              last_save = now;
+            }
+          }
+        }
+      });
+}
+
+void Emulator::StopJitProfileSession(bool flush) {
+  jprof_stop_requested_.store(true, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(jprof_session_mutex_);
+    jprof_session_cv_.notify_all();
+  }
+  if (jprof_thread_.joinable()) {
+    jprof_thread_.join();
+  }
+  if (!jprof_session_active_) {
+    if (processor_) {
+      processor_->SetJitProfileFilter(nullptr, 0, 0);
+    }
+    return;
+  }
+
+  if (processor_) {
+    std::vector<uint32_t> drained;
+    processor_->DrainJitProfileAddresses(drained);
+    if (!drained.empty()) {
+      std::unordered_set<uint32_t> known_set(jprof_known_addresses_.begin(),
+                                             jprof_known_addresses_.end());
+      for (uint32_t addr : drained) {
+        if (addr != 0u && (addr & 3u) == 0u &&
+            known_set.insert(addr).second) {
+          jprof_known_addresses_.push_back(addr);
+          jprof_dirty_ = true;
+        }
+      }
+    }
+    processor_->SetJitProfileFilter(nullptr, 0, 0);
+  }
+
+  if (flush && jprof_dirty_ && !jprof_path_.empty() &&
+      !jprof_known_addresses_.empty()) {
+    if (cpu::jit_profile_file::WriteAtomically(
+            jprof_path_, jprof_title_id_, jprof_module_hash_,
+            jprof_known_addresses_)) {
+      XELOGI("JitProfile: saved {} functions to {}",
+             jprof_known_addresses_.size(), xe::path_to_utf8(jprof_path_));
+    } else {
+      XELOGW("JitProfile: failed to save {}", xe::path_to_utf8(jprof_path_));
+    }
+  }
+
+  jprof_known_addresses_.clear();
+  jprof_path_.clear();
+  jprof_title_id_ = 0;
+  jprof_module_hash_ = 0;
+  jprof_dirty_ = false;
+  jprof_session_active_ = false;
 }
 
 }  // namespace xe

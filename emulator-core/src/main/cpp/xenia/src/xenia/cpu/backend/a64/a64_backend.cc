@@ -1677,6 +1677,7 @@ uint64_t ResolveFunctionWithoutStackSkewSkip(void* raw_context,
   // Revert any patched direct call sites / dynamic call cache entries pointing
   // to the guarded code so callers route to the unguarded re-emit once
   // BackpatchDirectCallSites runs inside A64Assembler::Assemble.
+  backend->processor()->BumpCodeSweepCount();
   backend->InvalidateDynamicCalls(address, address);
 
   Module* module = a64_fn->module();

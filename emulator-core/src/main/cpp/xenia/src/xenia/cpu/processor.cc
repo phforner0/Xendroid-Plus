@@ -658,6 +658,29 @@ size_t Processor::ResolveFunctionsInParallel(
   return resolved_count.load(std::memory_order_relaxed);
 }
 
+void Processor::SetJitProfileFilter(const Module* module, uint32_t low_address,
+                                    uint32_t high_address) {
+  std::lock_guard<std::mutex> lock(jprof_mutex_);
+  jprof_module_ = module;
+  jprof_low_addr_ = low_address;
+  jprof_high_addr_ = high_address;
+  if (!module) {
+    jprof_pending_addresses_.clear();
+  }
+  jprof_filter_active_.store(module != nullptr && low_address < high_address,
+                             std::memory_order_release);
+}
+
+void Processor::DrainJitProfileAddresses(std::vector<uint32_t>& out) {
+  std::lock_guard<std::mutex> lock(jprof_mutex_);
+  if (jprof_pending_addresses_.empty()) {
+    return;
+  }
+  out.insert(out.end(), jprof_pending_addresses_.begin(),
+             jprof_pending_addresses_.end());
+  jprof_pending_addresses_.clear();
+}
+
 Function* Processor::ResolveFunction(uint32_t address) {
   Entry* entry;
   Entry::Status status = entry_table_.GetOrCreate(address, &entry);
@@ -723,6 +746,12 @@ Function* Processor::ResolveFunction(uint32_t address) {
       entry_table_.MarkReady(entry, function, function->end_address());
       if (dynamic) {
         RecordDynamicCode(function);
+      } else if (jprof_filter_active_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> jprof_lock(jprof_mutex_);
+        if (module == jprof_module_ && !(address & 3) &&
+            address >= jprof_low_addr_ && address < jprof_high_addr_) {
+          jprof_pending_addresses_.push_back(address);
+        }
       }
       return function;
     }
