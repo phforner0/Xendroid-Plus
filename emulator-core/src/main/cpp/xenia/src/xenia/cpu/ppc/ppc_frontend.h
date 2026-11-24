@@ -34,6 +34,9 @@ struct PPCBuiltins {
   Function* enter_global_lock;
   Function* leave_global_lock;
   Function* syscall_handler;
+  Function* hle_memcpy;
+  Function* hle_memset;
+  Function* hle_memmove;
 };
 
 class PPCFrontend {

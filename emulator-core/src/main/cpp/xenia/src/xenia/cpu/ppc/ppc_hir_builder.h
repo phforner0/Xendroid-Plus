@@ -13,6 +13,7 @@
 #include "xenia/base/string_buffer.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/hir/hir_builder.h"
+#include "xenia/cpu/ppc/ppc_hle_memory.h"
 
 namespace xe {
 namespace cpu {
@@ -38,7 +39,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
     // Emit comment nodes.
     EMIT_DEBUG_COMMENTS = 1 << 0,
   };
-  bool Emit(GuestFunction* function, uint32_t flags);
+  bool Emit(GuestFunction* function, uint32_t flags,
+            HleMemoryOp hle_memory_op = HleMemoryOp::kNone);
 
   GuestFunction* function() const { return function_; }
   Function* LookupFunction(uint32_t address);
