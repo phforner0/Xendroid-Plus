@@ -44,8 +44,10 @@ bool FinalizationPass::Run(HIRBuilder* builder) {
     if (tail && tail->opcode == &OPCODE_BRANCH_info) {
       // Jump. Check target.
       auto target = tail->src1.label;
-      if (target->block == block->next) {
-        // Jumping to subsequent block. Remove.
+      if (target->block == block->next &&
+          !builder->loop_promotion_plan().ReferencesInstr(tail)) {
+        // Jumping to subsequent block. Remove unless a loop promotion
+        // flush/exit point is anchored on this instruction.
         tail->UnlinkAndNOP();
       }
     }

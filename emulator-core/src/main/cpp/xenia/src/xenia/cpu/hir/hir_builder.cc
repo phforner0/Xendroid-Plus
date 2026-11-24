@@ -73,6 +73,7 @@ void HIRBuilder::Reset() {
   next_label_id_ = 0;
   next_value_ordinal_ = 0;
   locals_.clear();
+  loop_promotion_plan_.clear();
   block_head_ = block_tail_ = NULL;
   current_block_ = NULL;
 #if SCRIBBLE_ARENA_ON_RESET
@@ -672,6 +673,67 @@ void HIRBuilder::MergeAdjacentBlocks(Block* left, Block* right) {
   if (block_tail_ == right) {
     block_tail_ = left;
   }
+}
+
+Block* HIRBuilder::InsertBlockBefore(Block* target) {
+  Block* block = arena_->Alloc<Block>();
+  block->ordinal = UINT16_MAX;
+  block->incoming_values = nullptr;
+  block->arena = arena_;
+  block->prev = target ? target->prev : block_tail_;
+  block->next = target;
+  if (block->prev) {
+    block->prev->next = block;
+  } else {
+    block_head_ = block;
+  }
+  if (target) {
+    target->prev = block;
+  } else {
+    block_tail_ = block;
+  }
+  block->label_head = block->label_tail = NULL;
+  block->incoming_edge_head = block->outgoing_edge_head = NULL;
+  block->instr_head = block->instr_tail = NULL;
+  return block;
+}
+
+Block* HIRBuilder::InsertBlockAfter(Block* target) {
+  Block* block = arena_->Alloc<Block>();
+  block->ordinal = UINT16_MAX;
+  block->incoming_values = nullptr;
+  block->arena = arena_;
+  block->prev = target;
+  block->next = target ? target->next : nullptr;
+  if (target) {
+    target->next = block;
+  } else {
+    block_head_ = block;
+  }
+  if (block->next) {
+    block->next->prev = block;
+  } else {
+    block_tail_ = block;
+  }
+  block->label_head = block->label_tail = NULL;
+  block->incoming_edge_head = block->outgoing_edge_head = NULL;
+  block->instr_head = block->instr_tail = NULL;
+  return block;
+}
+
+void HIRBuilder::AppendBranchToLabel(Block* src, Label* target,
+                                     uint16_t branch_flags) {
+  Block* saved_current = current_block_;
+  current_block_ = src;
+  Branch(target, branch_flags);
+  current_block_ = saved_current;
+}
+
+void HIRBuilder::AppendReturn(Block* src) {
+  Block* saved_current = current_block_;
+  current_block_ = src;
+  Return();
+  current_block_ = saved_current;
 }
 
 Block* HIRBuilder::AppendBlock() {

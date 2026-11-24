@@ -27,7 +27,7 @@ A64Function::~A64Function() {
 
 void A64Function::Setup(uint8_t* machine_code, size_t machine_code_length,
                         size_t stack_size) {
-  stack_size_ = stack_size;
+  stack_size_.store(stack_size, std::memory_order_relaxed);
   machine_code_length_.store(machine_code_length, std::memory_order_relaxed);
   machine_code_.store(machine_code, std::memory_order_release);
 }

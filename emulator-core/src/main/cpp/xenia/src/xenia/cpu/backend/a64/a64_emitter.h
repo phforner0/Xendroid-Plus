@@ -288,6 +288,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   size_t LayOutLocals(hir::HIRBuilder* builder);
   bool Emit(hir::HIRBuilder* builder, size_t stack_size,
             EmitFunctionInfo& func_info);
+  void EmitLoadPinnedSlots(const hir::LoopPromotionRegion& region);
+  void EmitStorePinnedSlots(const hir::LoopPromotionRegion& region,
+                            uint32_t slot_mask);
+  bool TryEmitPinnedContextInstr(const hir::Instr* instr,
+                                 const hir::LoopPromotionRegion& region);
   // Whether a guest function has to be emitted again with long-range branches.
   bool IsNearBranchOutOfRange(const Xbyak_aarch64::Error& e) const;
 

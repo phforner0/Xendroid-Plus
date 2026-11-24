@@ -165,10 +165,16 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // compiler_->AddPass(std::make_unique<passes::DeadStoreEliminationPass>());
   // if (validate)
   // compiler_->AddPass(std::make_unique<passes::ValidationPass>());
-  // After context promotion, which turned same-block CR loads into SSA uses,
-  // so only reads that cross blocks keep a CR store live.
-  compiler_->AddPass(std::make_unique<passes::DeadCRStoreEliminationPass>());
+  // After context promotion, eliminate dead cross-block context stores and
+  // any computations that only fed them, then promote hot small-loop context
+  // slots into pinned host registers before register allocation.
+  compiler_->AddPass(
+      std::make_unique<passes::DeadContextStoreEliminationPass>());
   compiler_->AddPass(std::make_unique<passes::DeadCodeEliminationPass>());
+  if (validate) {
+    compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  }
+  compiler_->AddPass(std::make_unique<passes::LoopContextPromotionPass>());
   if (validate) {
     compiler_->AddPass(std::make_unique<passes::ValidationPass>());
   }

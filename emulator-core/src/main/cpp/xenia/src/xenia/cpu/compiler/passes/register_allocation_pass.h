@@ -30,6 +30,8 @@ class RegisterAllocationPass : public CompilerPass {
 
   bool Run(hir::HIRBuilder* builder) override;
 
+  static bool ClobbersVolatileGprs(const hir::Instr* instr);
+
  private:
   // TODO(benvanik): rewrite all this set shit -- too much indirection, the
   // complexity is not needed.
@@ -66,7 +68,6 @@ class RegisterAllocationPass : public CompilerPass {
                         hir::TypeName required_type, bool allow_volatile);
 
   bool CanUseVolatileRegister(const hir::Value* value) const;
-  static bool ClobbersVolatileGprs(const hir::Instr* instr);
 
   RegisterSetUsage* RegisterSetForValue(const hir::Value* value) const;
 
