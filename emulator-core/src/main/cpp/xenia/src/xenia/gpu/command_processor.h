@@ -330,9 +330,10 @@ class CommandProcessor {
   bool AwaitMemexportReadbacks(const char* reason) { return false; }
   bool MemexportReadbacksPending() const { return false; }
 
-  void RestoreRegisters(uint32_t first_register,
-                        const uint32_t* register_values,
-                        uint32_t register_count, bool execute_callbacks);
+  virtual void RestoreRegisters(uint32_t first_register,
+                                const uint32_t* register_values,
+                                uint32_t register_count,
+                                bool execute_callbacks);
   void RestoreGammaRamp(
       const reg::DC_LUT_30_COLOR* new_gamma_ramp_256_entry_table,
       const reg::DC_LUT_PWL_DATA* new_gamma_ramp_pwl_rgb,

@@ -66,6 +66,7 @@
 DECLARE_int32(adrenotools_turbo_reassert_seconds);
 #endif
 DECLARE_bool(clear_memory_page_state);
+DECLARE_bool(gpu_3d_to_2d_texture);
 DECLARE_bool(vulkan_in_pass_resolve_debug_read_usage);
 DECLARE_bool(log_gpu_frame_time_breakdown);
 DECLARE_bool(vulkan_resolve_clear_in_guest_pass);
@@ -1113,6 +1114,60 @@ void VulkanCommandProcessor::InitializeShaderStorage(
                                             nullptr);
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking,
                                            std::move(completion_callback));
+}
+
+void VulkanCommandProcessor::RestoreRegisters(uint32_t first_register,
+                                              const uint32_t* register_values,
+                                              uint32_t register_count,
+                                              bool execute_callbacks) {
+  CommandProcessor::RestoreRegisters(first_register, register_values,
+                                     register_count, execute_callbacks);
+  if (execute_callbacks || register_count == 0) {
+    return;
+  }
+  const uint64_t end_excl =
+      uint64_t(first_register) + uint64_t(register_count);
+  // Float constant banks (0..255 vertex, 256..511 pixel, 4 regs each).
+  constexpr uint32_t kPixelFloatBaseReg =
+      XE_GPU_REG_SHADER_CONSTANT_000_X + 256 * 4;
+  if (first_register < kPixelFloatBaseReg &&
+      end_excl > XE_GPU_REG_SHADER_CONSTANT_000_X) {
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex);
+  }
+  if (first_register <= XE_GPU_REG_SHADER_CONSTANT_511_W &&
+      end_excl > kPixelFloatBaseReg) {
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel);
+  }
+  if (first_register <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31 &&
+      end_excl > XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031) {
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
+  }
+  const uint32_t dirty_fetch_mask =
+      xendroid::ComputeRestoredFetchInvalidationMask(
+          first_register, register_count, XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0,
+          XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5);
+  if (dirty_fetch_mask != 0) {
+    const uint32_t keep_mask = ~dirty_fetch_mask;
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+    current_samplers_fetch_up_to_date_vertex_ &= keep_mask;
+    current_samplers_fetch_up_to_date_pixel_ &= keep_mask;
+    xendroid::InvalidatePixelSpecCacheFetches(pixel_spec_cache_, keep_mask);
+    fetch_constants_decode_needed_ |= dirty_fetch_mask;
+    if (texture_cache_) {
+      const uint32_t clamped_first = std::max<uint32_t>(
+          first_register, XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0);
+      const uint32_t clamped_last = static_cast<uint32_t>(
+          std::min<uint64_t>(end_excl - 1, XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5));
+      texture_cache_->TextureFetchConstantsWritten(
+          (clamped_first - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6,
+          std::min<uint32_t>(
+              31, (clamped_last - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6));
+    }
+  }
 }
 
 void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
@@ -12888,6 +12943,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           texture_cache_->texture_usage_generation();
       const uint64_t sampler_gen =
           texture_cache_->sampler_destroy_generation();
+      const bool cur_3d_to_2d = cvars::gpu_3d_to_2d_texture;
       const uint32_t used_mask_v =
           vertex_bindings_ready
               ? vertex_shader->GetUsedTextureMaskAfterTranslation()
@@ -12908,6 +12964,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
             !(textures_changed_v & used_mask_v) &&
             current_texture_set_usage_gen_vertex_ == tex_usage_gen &&
             current_texture_set_sampler_gen_vertex_ == sampler_gen &&
+            current_texture_set_3d_to_2d_vertex_ == cur_3d_to_2d &&
             current_written_samplers_vertex_ == current_samplers_vertex_;
         if (!vs_fast_hit) {
           texture_set_hash_vertex = compute_texture_set_hash(
@@ -12922,8 +12979,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           } else {
             current_textures_vertex_shader_ = vertex_shader;
             current_written_samplers_vertex_ = current_samplers_vertex_;
-            current_texture_set_usage_gen_vertex_ = tex_usage_gen;
-            current_texture_set_sampler_gen_vertex_ = sampler_gen;
+            current_texture_set_usage_gen_vertex_ =
+                texture_cache_->texture_usage_generation();
+            current_texture_set_sampler_gen_vertex_ =
+                texture_cache_->sampler_destroy_generation();
+            current_texture_set_3d_to_2d_vertex_ = cur_3d_to_2d;
             texture_cache_->ResetTextureBindingsChangedVertex(used_mask_v);
           }
         }
@@ -12940,6 +13000,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
             !(textures_changed_p & used_mask_p) &&
             current_texture_set_usage_gen_pixel_ == tex_usage_gen &&
             current_texture_set_sampler_gen_pixel_ == sampler_gen &&
+            current_texture_set_3d_to_2d_pixel_ == cur_3d_to_2d &&
             current_written_samplers_pixel_ == current_samplers_pixel_;
         if (!ps_fast_hit) {
           texture_set_hash_pixel = compute_texture_set_hash(
@@ -12954,8 +13015,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           } else {
             current_textures_pixel_shader_ = pixel_shader;
             current_written_samplers_pixel_ = current_samplers_pixel_;
-            current_texture_set_usage_gen_pixel_ = tex_usage_gen;
-            current_texture_set_sampler_gen_pixel_ = sampler_gen;
+            current_texture_set_usage_gen_pixel_ =
+                texture_cache_->texture_usage_generation();
+            current_texture_set_sampler_gen_pixel_ =
+                texture_cache_->sampler_destroy_generation();
+            current_texture_set_3d_to_2d_pixel_ = cur_3d_to_2d;
             texture_cache_->ResetTextureBindingsChangedPixel(used_mask_p);
           }
         }
@@ -13039,6 +13103,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
             texture_cache_->texture_usage_generation();
         current_texture_set_sampler_gen_vertex_ =
             texture_cache_->sampler_destroy_generation();
+        current_texture_set_3d_to_2d_vertex_ = cvars::gpu_3d_to_2d_texture;
         if (vertex_bindings_ready && !interpreter_placeholder) {
           texture_cache_->ResetTextureBindingsChangedVertex(
               vertex_shader->GetUsedTextureMaskAfterTranslation());
@@ -13062,6 +13127,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
             texture_cache_->texture_usage_generation();
         current_texture_set_sampler_gen_pixel_ =
             texture_cache_->sampler_destroy_generation();
+        current_texture_set_3d_to_2d_pixel_ = cvars::gpu_3d_to_2d_texture;
         if (pixel_shader && pixel_bindings_ready && !placeholder_pixel_shader) {
           texture_cache_->ResetTextureBindingsChangedPixel(
               pixel_shader->GetUsedTextureMaskAfterTranslation());
@@ -13341,6 +13407,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           texture_cache_->texture_usage_generation();
       current_texture_set_sampler_gen_vertex_ =
           texture_cache_->sampler_destroy_generation();
+      current_texture_set_3d_to_2d_vertex_ = cvars::gpu_3d_to_2d_texture;
       if (vertex_bindings_ready && !interpreter_placeholder) {
         texture_cache_->ResetTextureBindingsChangedVertex(
             vertex_shader->GetUsedTextureMaskAfterTranslation());
@@ -13390,6 +13457,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           texture_cache_->texture_usage_generation();
       current_texture_set_sampler_gen_pixel_ =
           texture_cache_->sampler_destroy_generation();
+      current_texture_set_3d_to_2d_pixel_ = cvars::gpu_3d_to_2d_texture;
       if (pixel_shader && pixel_bindings_ready && !placeholder_pixel_shader) {
         texture_cache_->ResetTextureBindingsChangedPixel(
             pixel_shader->GetUsedTextureMaskAfterTranslation());

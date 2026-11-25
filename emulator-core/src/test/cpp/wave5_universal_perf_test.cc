@@ -77,19 +77,66 @@ void TestInlineHleSyncClassificationAndGating() {
               K::kNone);
   WAVE5_CHECK(a64sync::ClassifyInlineHleSync("") == K::kNone);
 
-  constexpr uint32_t kLogMask = 0xC0000000u;
+  constexpr uint32_t kImplementedTag = 1u << 0;
+  constexpr uint32_t kBlockingTag = 1u << 5;
+  constexpr uint32_t kHighFreqTag = 1u << 3;
+  constexpr uint32_t kLogTag = 1u << 30;
+  constexpr uint32_t kLogResultTag = 1u << 31;
+
+  // Real xboxkrnl DECLARE_XBOXKRNL_EXPORT* permanently ORs ExportTag::kLog.
+  // High-frequency exports suppress logging at runtime unless
+  // log_high_frequency_kernel_calls is enabled or ExportTag::kLogResult is set.
+  const uint32_t kNormalSyncTags = kImplementedTag | kLogTag | kHighFreqTag;
+  const uint32_t kBlockingSyncTags =
+      kImplementedTag | kBlockingTag | kLogTag | kHighFreqTag;
+  const uint32_t kAlwaysLoggedTags = kImplementedTag | kLogTag;
+
+  WAVE5_CHECK(!a64sync::IsInlineHleSyncLoggingActive(
+      kNormalSyncTags, kLogTag, kLogResultTag, kHighFreqTag, false));
+  WAVE5_CHECK(!a64sync::IsInlineHleSyncLoggingActive(
+      kBlockingSyncTags, kLogTag, kLogResultTag, kHighFreqTag, false));
+  WAVE5_CHECK(a64sync::IsInlineHleSyncLoggingActive(
+      kNormalSyncTags, kLogTag, kLogResultTag, kHighFreqTag, true));
+  WAVE5_CHECK(a64sync::IsInlineHleSyncLoggingActive(
+      kAlwaysLoggedTags, kLogTag, kLogResultTag, kHighFreqTag, false));
+  WAVE5_CHECK(a64sync::IsInlineHleSyncLoggingActive(
+      kNormalSyncTags | kLogResultTag, kLogTag, kLogResultTag, kHighFreqTag,
+      false));
+
+  const char* kTargetExports[] = {
+      "KeRaiseIrqlToDpcLevel",
+      "KfLowerIrql",
+      "RtlEnterCriticalSection",
+      "RtlLeaveCriticalSection",
+      "RtlTryEnterCriticalSection",
+      "KeAcquireSpinLockAtRaisedIrql",
+      "KeReleaseSpinLockFromRaisedIrql",
+      "KfAcquireSpinLock",
+      "KfReleaseSpinLock",
+  };
+  for (const char* name : kTargetExports) {
+    const K kind = a64sync::ClassifyInlineHleSync(name);
+    WAVE5_CHECK(kind != K::kNone);
+    const bool log_off = a64sync::IsInlineHleSyncLoggingActive(
+        kNormalSyncTags, kLogTag, kLogResultTag, kHighFreqTag, false);
+    WAVE5_CHECK(
+        a64sync::ShouldEmitInlineHleSync(true, false, log_off, true, kind));
+    const bool log_on = a64sync::IsInlineHleSyncLoggingActive(
+        kNormalSyncTags, kLogTag, kLogResultTag, kHighFreqTag, true);
+    WAVE5_CHECK(
+        !a64sync::ShouldEmitInlineHleSync(true, false, log_on, true, kind));
+  }
+
+  WAVE5_CHECK(!a64sync::ShouldEmitInlineHleSync(
+      false, false, false, true, K::kRtlEnterCriticalSection));
+  WAVE5_CHECK(!a64sync::ShouldEmitInlineHleSync(
+      true, true, false, true, K::kRtlEnterCriticalSection));
+  WAVE5_CHECK(!a64sync::ShouldEmitInlineHleSync(
+      true, false, true, true, K::kRtlEnterCriticalSection));
+  WAVE5_CHECK(!a64sync::ShouldEmitInlineHleSync(
+      true, false, false, false, K::kRtlLeaveCriticalSection));
   WAVE5_CHECK(a64sync::ShouldEmitInlineHleSync(
-      true, false, 0, kLogMask, true, K::kRtlEnterCriticalSection));
-  WAVE5_CHECK(!a64sync::ShouldEmitInlineHleSync(
-      false, false, 0, kLogMask, true, K::kRtlEnterCriticalSection));
-  WAVE5_CHECK(!a64sync::ShouldEmitInlineHleSync(
-      true, true, 0, kLogMask, true, K::kRtlEnterCriticalSection));
-  WAVE5_CHECK(!a64sync::ShouldEmitInlineHleSync(
-      true, false, 0x80000000u, kLogMask, true, K::kRtlEnterCriticalSection));
-  WAVE5_CHECK(!a64sync::ShouldEmitInlineHleSync(
-      true, false, 0, kLogMask, false, K::kRtlLeaveCriticalSection));
-  WAVE5_CHECK(a64sync::ShouldEmitInlineHleSync(
-      true, false, 0, kLogMask, false, K::kKeRaiseIrqlToDpcLevel));
+      true, false, false, false, K::kKeRaiseIrqlToDpcLevel));
 }
 
 void TestPackFloatConstantsByRuns() {
@@ -139,6 +186,25 @@ void TestPixelSpecCacheState() {
   xendroid::InvalidatePixelSpecCacheFetches(st, ~(UINT32_C(1) << 2));
   WAVE5_CHECK(xendroid::EvaluatePixelSpecCacheHit(st, &shader_a, 0x15, 0x3));
   WAVE5_CHECK(!xendroid::EvaluatePixelSpecCacheHit(st, &shader_a, 0x15, 0x5));
+
+  // Simulated intra-frame RestoreRegisters(..., false) over fetch slots 1..2.
+  const uint32_t kFetch00 = 0x4800;
+  const uint32_t kFetch31_5 = 0x4800 + 32 * 6 - 1;
+  st.fetch_up_to_date = ~uint32_t(0);
+  const uint32_t dirty_mask = xendroid::ComputeRestoredFetchInvalidationMask(
+      kFetch00 + 6 + 3, 6, kFetch00, kFetch31_5);
+  WAVE5_CHECK(dirty_mask == ((UINT32_C(1) << 1) | (UINT32_C(1) << 2)));
+  xendroid::InvalidatePixelSpecCacheFetches(st, ~dirty_mask);
+  WAVE5_CHECK(xendroid::EvaluatePixelSpecCacheHit(st, &shader_a, 0x15, 0x1));
+  WAVE5_CHECK(!xendroid::EvaluatePixelSpecCacheHit(st, &shader_a, 0x15, 0x2));
+  WAVE5_CHECK(!xendroid::EvaluatePixelSpecCacheHit(st, &shader_a, 0x15, 0x4));
+  WAVE5_CHECK(xendroid::ComputeRestoredFetchInvalidationMask(
+                  0x2000, 16, kFetch00, kFetch31_5) == 0);
+
+  // fragmentStoresAndAtomics is required whenever local-read attachments are on.
+  WAVE5_CHECK(xendroid::ShouldEnableLocalReadAttachments(true, true, true, true, true));
+  WAVE5_CHECK(!xendroid::ShouldEnableLocalReadAttachments(true, true, true, true, false));
+  WAVE5_CHECK(!xendroid::ShouldEnableLocalReadAttachments(true, true, true, false, true));
 }
 
 void TestAudioAdaptiveQueueAndAAudioDrain() {
@@ -173,10 +239,20 @@ void TestAudioAdaptiveQueueAndAAudioDrain() {
   WAVE5_CHECK(calm.shrunk);
   WAVE5_CHECK(calm.target_blocks == 10);
 
-  WAVE5_CHECK(xendroid::ShouldRunEmergencySecondAudioTopup(1, 6, 4000, 5333));
-  WAVE5_CHECK(!xendroid::ShouldRunEmergencySecondAudioTopup(2, 6, 4000, 5333));
   WAVE5_CHECK(
-      !xendroid::ShouldRunEmergencySecondAudioTopup(1, 6, 11000, 5333));
+      xendroid::ShouldRunEmergencySecondAudioTopup(true, 1, 6, 4000, 5333));
+  WAVE5_CHECK(
+      !xendroid::ShouldRunEmergencySecondAudioTopup(false, 0, 6, 4000, 5333));
+  WAVE5_CHECK(
+      !xendroid::ShouldRunEmergencySecondAudioTopup(true, 2, 6, 4000, 5333));
+  WAVE5_CHECK(
+      !xendroid::ShouldRunEmergencySecondAudioTopup(true, 1, 6, 11000, 5333));
+
+  // topup_base > deepest must stay clamped <= deepest.
+  xendroid::AudioAdaptiveState clamp_st;
+  auto clamp_res = xendroid::StepAudioAdaptiveQueue(
+      clamp_st, true, true, true, 0, 8, 5, 0, 5333, 100);
+  WAVE5_CHECK(clamp_res.target_blocks == 5);
 }
 
 void TestSourceContracts(const fs::path& cpp_root) {
@@ -185,7 +261,10 @@ void TestSourceContracts(const fs::path& cpp_root) {
   WAVE5_CHECK(a64.find("DEFINE_bool(\n    a64_inline_hle_sync, true,") !=
               std::string::npos);
   WAVE5_CHECK(a64.find("TryEmitInlineHleSync(") != std::string::npos);
+  WAVE5_CHECK(a64.find("IsInlineHleSyncLoggingActive(") != std::string::npos);
   WAVE5_CHECK(a64.find("hle_census_active()") != std::string::npos);
+  WAVE5_CHECK(a64.find("log_high_frequency_kernel_calls()") !=
+              std::string::npos);
   WAVE5_CHECK(a64.find("tst(w_addr, 3)") != std::string::npos);
   WAVE5_CHECK(a64.find("kGuestPhysicalShiftBoundary") != std::string::npos);
   WAVE5_CHECK(a64.find("ldaxr(") != std::string::npos);
@@ -197,11 +276,37 @@ void TestSourceContracts(const fs::path& cpp_root) {
   WAVE5_CHECK(rtl.find("kRtlCsLockCountOffset") != std::string::npos);
   WAVE5_CHECK(rtl.find("xeRtlLeaveCriticalSectionWakeTrampoline") !=
               std::string::npos);
+  WAVE5_CHECK(rtl.find("DECLARE_XBOXKRNL_EXPORT2(RtlEnterCriticalSection, kNone, kImplemented,\n                         kHighFrequency)") !=
+              std::string::npos);
+  WAVE5_CHECK(rtl.find("DECLARE_XBOXKRNL_EXPORT2(RtlTryEnterCriticalSection, kNone, kImplemented,\n                         kHighFrequency)") !=
+              std::string::npos);
+  WAVE5_CHECK(rtl.find("DECLARE_XBOXKRNL_EXPORT2(RtlLeaveCriticalSection, kNone, kImplemented,\n                         kHighFrequency)") !=
+              std::string::npos);
 
   const std::string thr = ReadSourceText(
       cpp_root / "xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_threading.cc");
   WAVE5_CHECK(thr.find("kKpcrCurrentIrqlOffset") != std::string::npos);
   WAVE5_CHECK(thr.find("kKpcrCurrentThreadOffset") != std::string::npos);
+  for (const char* thr_exp :
+       {"KfAcquireSpinLock", "KfReleaseSpinLock",
+        "KeAcquireSpinLockAtRaisedIrql", "KeReleaseSpinLockFromRaisedIrql",
+        "KeRaiseIrqlToDpcLevel", "KfLowerIrql"}) {
+    const size_t pos = thr.find(std::string("DECLARE_XBOXKRNL_EXPORT") + "2(" +
+                                thr_exp);
+    const size_t pos3 = thr.find(std::string("DECLARE_XBOXKRNL_EXPORT") + "3(" +
+                                 thr_exp);
+    const size_t decl_pos = std::min(pos, pos3);
+    WAVE5_CHECK(decl_pos != std::string::npos);
+    const size_t semi = thr.find(';', decl_pos);
+    WAVE5_CHECK(semi != std::string::npos);
+    WAVE5_CHECK(thr.substr(decl_pos, semi - decl_pos).find("kHighFrequency") !=
+                std::string::npos);
+  }
+
+  const std::string xmod = ReadSourceText(
+      cpp_root / "xenia/src/xenia/kernel/xboxkrnl/xboxkrnl_module.cc");
+  WAVE5_CHECK(xmod.find("set_log_high_frequency_kernel_calls_ptr(") !=
+              std::string::npos);
 
   const std::string vcp = ReadSourceText(
       cpp_root / "xenia/src/xenia/gpu/vulkan/vulkan_command_processor.cc");
@@ -210,11 +315,17 @@ void TestSourceContracts(const fs::path& cpp_root) {
   WAVE5_CHECK(vcp.find("texture_bindings_changed_vertex()") !=
               std::string::npos);
   WAVE5_CHECK(vcp.find("texture_usage_generation()") != std::string::npos);
+  WAVE5_CHECK(vcp.find("void VulkanCommandProcessor::RestoreRegisters(") !=
+              std::string::npos);
+  WAVE5_CHECK(vcp.find("current_texture_set_3d_to_2d_vertex_") !=
+              std::string::npos);
 
   const std::string vrtc = ReadSourceText(
       cpp_root / "xenia/src/xenia/gpu/vulkan/vulkan_render_target_cache.cc");
   WAVE5_CHECK(vrtc.find("vulkan_in_pass_resolve, true,") != std::string::npos);
-  WAVE5_CHECK(vrtc.find("vulkan_in_pass_resolve_7e3, true,") !=
+  WAVE5_CHECK(vrtc.find("vulkan_in_pass_resolve_7e3, false,") !=
+              std::string::npos);
+  WAVE5_CHECK(vrtc.find("device_properties.fragmentStoresAndAtomics") !=
               std::string::npos);
 
   const std::string apu =
@@ -223,6 +334,10 @@ void TestSourceContracts(const fs::path& cpp_root) {
               std::string::npos);
   WAVE5_CHECK(apu.find("StepAudioAdaptiveQueue(") != std::string::npos);
   WAVE5_CHECK(apu.find("ShouldRunEmergencySecondAudioTopup(") !=
+              std::string::npos);
+  WAVE5_CHECK(apu.find("driver->ReportsQueuedFrameCount(),") !=
+              std::string::npos);
+  WAVE5_CHECK(apu.find("adaptive_queues[i] = xendroid::AudioAdaptiveState{};") !=
               std::string::npos);
 
   const std::string aaudio =

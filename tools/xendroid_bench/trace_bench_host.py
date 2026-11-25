@@ -159,16 +159,16 @@ def run_trace_bench_adb(
 
     dev.force_stop(package)
     dev.clear_debug_props()
+    if dev.file_uid(cfg_remote) is None:
+        raise RuntimeError(
+            f"{cfg_remote} not found on device; launch {package} once before running trace-bench."
+        )
+    raw_base = dev.run(["exec-out", "cat", cfg_remote], binary=False, check=True)
+    if not isinstance(raw_base, str):
+        raise RuntimeError(f"Unexpected non-text read from {cfg_remote}")
+    base_txt = raw_base
     therm_t0 = dev.wait_cooldown(max_start_temp_c, timeout_s=180, poll_s=10)
     bat0 = dev.read_battery_state()
-    use_inplace = dev.file_uid(cfg_remote) is not None
-    if use_inplace:
-        raw_base = dev.run(["exec-out", "cat", cfg_remote], binary=False, check=False)
-        base_txt = raw_base if isinstance(raw_base, str) else ""
-        had_cfg = True
-    else:
-        had_cfg = "OK" in dev.shell(f"[ -f '{cfg_remote}' ] && cp '{cfg_remote}' '{cfg_bak}' && echo OK", check=False)
-        base_txt = dev.shell(f"cat '{cfg_bak}'", check=False) if had_cfg else ""
 
     abort_info = None
     last_png_local = None
@@ -196,10 +196,7 @@ def run_trace_bench_adb(
         combined = merge_toml_sections(base_txt, updates)
         local_cfg = out_dir / "bench.config.toml"
         local_cfg.write_text(combined, encoding="utf-8")
-        if use_inplace:
-            dev.write_text_inplace(cfg_remote, combined)
-        else:
-            dev.run(["push", str(local_cfg), cfg_remote])
+        dev.write_text_inplace(cfg_remote, combined)
 
         dev.shell("input keyevent KEYCODE_WAKEUP", check=False)
         escaped_trace = trace_path_on_device.replace("'", "'\\''")
@@ -258,12 +255,7 @@ def run_trace_bench_adb(
         with contextlib.suppress(Exception):
             dev.clear_debug_props()
         with contextlib.suppress(Exception):
-            if use_inplace:
-                dev.write_text_inplace(cfg_remote, base_txt)
-            elif had_cfg:
-                dev.shell(f"mv '{cfg_bak}' '{cfg_remote}'", check=False)
-            else:
-                dev.shell(f"rm -f '{cfg_remote}'", check=False)
+            dev.write_text_inplace(cfg_remote, base_txt)
 
     therm_end = dev.read_thermal_state()
     bat1 = dev.read_battery_state()

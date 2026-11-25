@@ -56,7 +56,7 @@ class SettingsSchemaTest {
             "Kernel|precise_guest_delays", "APU|apu_performance_hint", "HID|vibration", "HID|guide_button",
             "GPU|readback_resolve_sync", "GPU|precise_interpolation", "Vulkan|vulkan_allow_reverse_z",
             "Vulkan|vulkan_dynamic_rendering", "Vulkan|vulkan_avoid_geometry_shaders", "Vulkan|vulkan_depth_unorm24",
-            "General|guest_crash_is_fatal").forEach { b(it, true) }
+            "Vulkan|vulkan_in_pass_resolve", "General|guest_crash_is_fatal").forEach { b(it, true) }
         listOf("GPU|depth_bias_shader_offset", "GPU|memexport_enable", "UI|achievement_notification_position_by_game",
             "Storage|mount_memory_unit", "Vulkan|vulkan_allow_present_mode_immediate",
             "Vulkan|vulkan_allow_present_mode_mailbox").forEach { b(it, false) }
@@ -154,7 +154,7 @@ class SettingsSchemaTest {
             assertEquals(0, it.min); assertEquals(100, it.max)
         }
         ir("APU|apu_max_queued_frames").let {
-            assertEquals(4, it.min); assertEquals(64, it.max)
+            assertEquals(4, it.min); assertEquals(64, it.max); assertEquals(12, it.default)
         }
     }
 

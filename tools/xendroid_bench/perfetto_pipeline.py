@@ -140,9 +140,10 @@ def parse_xe_perf_log(log_text: str) -> dict[str, Any]:
     }
 
 
-def _select_dominant_layer(candidates: list[Any]) -> Any | None:
+def _select_dominant_layer(candidates: list[Any], package: str = "") -> Any | None:
     best = None
     best_rank = None
+    pkg_l = (package or "").lower()
     for c in candidates:
         total = int(getattr(c, "total_frames", 0) or 0)
         if total <= 0:
@@ -153,9 +154,17 @@ def _select_dominant_layer(candidates: list[Any]) -> Any | None:
         fps = (total / wall_s) if wall_s > 0.5 else 0.0
         layer = str(getattr(c, "layer_name", "") or "").lower()
         proc = str(getattr(c, "proc_name", "") or "").lower()
-        is_xendroid = ("xendroid" in layer or "xendroid" in proc or "surfaceview" in layer)
+        is_target = bool(pkg_l and (pkg_l in proc or pkg_l in layer)) or (
+            "xendroid" in proc or "xendroid" in layer
+        )
+        is_surfaceview = "surfaceview" in layer
         active_game_rate = fps >= 10.0
-        rank = (1 if is_xendroid else 0, 1 if active_game_rate else 0, total)
+        rank = (
+            1 if is_target else 0,
+            1 if is_surfaceview else 0,
+            1 if active_game_rate else 0,
+            total,
+        )
         if best_rank is None or rank > best_rank:
             best_rank = rank
             best = c
@@ -195,12 +204,19 @@ def analyze_pftrace(
           MAX(s.ts + s.dur) AS last_ts,
           AVG(s.dur) / 1e6 AS avg_dur_ms,
           MAX(s.dur) / 1e6 AS max_dur_ms,
-          SUM(CASE WHEN s.jank_type IS NOT NULL AND s.jank_type NOT IN ('None', 'JankType.None') THEN 1 ELSE 0 END) AS janky_frames
+          SUM(CASE WHEN s.jank_type IS NOT NULL AND s.jank_type NOT IN ('None', 'JankType.None') THEN 1 ELSE 0 END) AS janky_frames,
+          p.name AS proc_name,
+          s.layer_name AS layer_name
         FROM actual_frame_timeline_slice s
         LEFT JOIN process p USING(upid)
-        WHERE p.name LIKE '%{safe_pkg}%' OR s.layer_name LIKE '%{safe_pkg}%';
+        WHERE p.name LIKE '%{safe_pkg}%' OR s.layer_name LIKE '%{safe_pkg}%'
+        GROUP BY p.name, s.layer_name
+        ORDER BY total_frames DESC
+        LIMIT 25;
         """
-        rows = list(tp.query(pkg_sql))
+        pkg_candidates = list(tp.query(pkg_sql))
+        picked_pkg = _select_dominant_layer(pkg_candidates, package=package)
+        rows = [picked_pkg] if picked_pkg is not None else []
         matched_by = "package"
         if not rows or not rows[0].total_frames:
             fallback_sql = """
@@ -222,7 +238,7 @@ def analyze_pftrace(
             ORDER BY total_frames DESC
             LIMIT 25;
             """
-            picked = _select_dominant_layer(list(tp.query(fallback_sql)))
+            picked = _select_dominant_layer(list(tp.query(fallback_sql)), package=package)
             rows = [picked] if picked is not None else []
             matched_by = "dominant_layer_fallback"
         if not rows or not rows[0].total_frames:
@@ -238,7 +254,7 @@ def analyze_pftrace(
         wall_s = (last_ts - first_ts) / 1e9 if last_ts > first_ts else 0.0
         janky = int(r.janky_frames or 0)
         fps = (total_frames / wall_s) if wall_s > 0 else 0.0
-        return {
+        result: dict[str, Any] = {
             "available": True,
             "total_frames": total_frames,
             "fps": round(fps, 2),
@@ -248,6 +264,13 @@ def analyze_pftrace(
             "jank_percent": round(100.0 * janky / total_frames, 2),
             "matched_by": matched_by,
         }
+        proc_name = getattr(r, "proc_name", None)
+        layer_name = getattr(r, "layer_name", None)
+        if proc_name:
+            result["proc_name"] = str(proc_name)
+        if layer_name:
+            result["layer_name"] = str(layer_name)
+        return result
     finally:
         tp.close()
 

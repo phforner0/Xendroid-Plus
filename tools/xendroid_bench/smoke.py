@@ -200,14 +200,22 @@ def run_smoke_adb(
 
     dev.force_stop(package)
     dev.clear_debug_props()
-    use_global_inplace = dev.file_uid(global_cfg) is not None
-    if use_global_inplace:
-        raw_base = dev.run(["exec-out", "cat", global_cfg], binary=False, check=False)
-        base_cfg = raw_base if isinstance(raw_base, str) else ""
-        had_cfg = True
-    else:
-        had_cfg = "OK" in dev.shell(f"[ -f '{cfg_remote}' ] && cp '{cfg_remote}' '{cfg_bak}' && echo OK", check=False)
-        base_cfg = dev.shell(f"cat '{cfg_bak}'", check=False) if had_cfg else ""
+    if dev.file_uid(global_cfg) is None:
+        raise RuntimeError(
+            f"{global_cfg} not found on device; launch {package} once to initialize app-owned storage before running smoke."
+        )
+    raw_base = dev.run(["exec-out", "cat", global_cfg], binary=False, check=True)
+    if not isinstance(raw_base, str):
+        raise RuntimeError(f"Unexpected non-text read from {global_cfg}")
+    base_cfg = raw_base
+
+    has_title_cfg = dev.file_uid(cfg_remote) is not None
+    base_title_cfg: str | None = None
+    if has_title_cfg:
+        raw_title = dev.run(["exec-out", "cat", cfg_remote], binary=False, check=True)
+        if not isinstance(raw_title, str):
+            raise RuntimeError(f"Unexpected non-text read from {cfg_remote}")
+        base_title_cfg = raw_title
 
     @contextlib.contextmanager
     def restore_guard():
@@ -219,18 +227,13 @@ def run_smoke_adb(
             with contextlib.suppress(Exception):
                 dev.clear_debug_props()
             with contextlib.suppress(Exception):
-                if use_global_inplace:
-                    dev.write_text_inplace(global_cfg, base_cfg)
-                elif had_cfg:
-                    dev.shell(f"mv '{cfg_bak}' '{cfg_remote}'", check=False)
-                else:
-                    dev.shell(f"rm -f '{cfg_remote}'", check=False)
+                dev.write_text_inplace(global_cfg, base_cfg)
+            if base_title_cfg is not None:
+                with contextlib.suppress(Exception):
+                    dev.write_text_inplace(cfg_remote, base_title_cfg)
 
     with restore_guard():
-        if use_global_inplace:
-            dev.shell(f"rm -f '{log_remote}'", check=False)
-        else:
-            dev.shell(f"mkdir -p '{root}/config' '{root}/pad' && rm -f '{log_remote}'", check=False)
+        dev.shell(f"rm -f '{log_remote}'", check=False)
         updates: dict[str, dict[str, Any]] = {
             "GPU": {
                 "log_gpu_frame_time_breakdown": True,
@@ -250,23 +253,25 @@ def run_smoke_adb(
             updates["Vulkan"] = {"vulkan_allow_present_mode_immediate": True}
 
         cfg_text = merge_toml_sections(base_cfg, updates)
-        if use_global_inplace:
-            dev.write_text_inplace(global_cfg, cfg_text)
-        else:
-            dev.push_text(cfg_remote, cfg_text, filename=f"{title_id}.config.toml")
+        dev.write_text_inplace(global_cfg, cfg_text)
+        if base_title_cfg is not None:
+            dev.write_text_inplace(cfg_remote, merge_toml_sections(base_title_cfg, updates))
 
         if pad_script_path is not None and pad_script_path.is_file():
             rel_pad = f"pad/{pad_script_path.name}"
             remote_pad = f"{root}/{rel_pad}"
             pad_text = pad_script_path.read_text(encoding="utf-8")
             if dev.file_uid(remote_pad) is not None:
-                raw_remote_pad = dev.run(["exec-out", "cat", remote_pad], binary=False, check=False)
+                raw_remote_pad = dev.run(["exec-out", "cat", remote_pad], binary=False, check=True)
                 remote_text = raw_remote_pad if isinstance(raw_remote_pad, str) else ""
                 if remote_text.replace("\r\n", "\n") != pad_text.replace("\r\n", "\n"):
                     dev.write_text_inplace(remote_pad, pad_text)
             else:
-                dev.shell(f"mkdir -p '{root}/pad'", check=False)
-                dev.run(["push", str(pad_script_path), remote_pad])
+                if dev.file_uid(f"{root}/pad") is None:
+                    raise RuntimeError(
+                        f"{root}/pad does not exist under app UID; launch {package} once or stage pad script via record-pad before smoke."
+                    )
+                dev.write_text_inplace(remote_pad, pad_text)
             dev.set_prop("debug.xendroid.pad_script", rel_pad)
 
         dev.shell("input keyevent KEYCODE_WAKEUP", check=False)

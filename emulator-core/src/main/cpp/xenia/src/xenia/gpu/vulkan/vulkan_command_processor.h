@@ -172,6 +172,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
       const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
       std::function<void()> completion_callback = nullptr) override;
 
+  void RestoreRegisters(uint32_t first_register,
+                        const uint32_t* register_values,
+                        uint32_t register_count,
+                        bool execute_callbacks) override;
   void RestoreEdramSnapshot(const void* snapshot) override;
 
   void PrepareForWait() override;
@@ -1658,6 +1662,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint64_t current_texture_set_usage_gen_pixel_ = UINT64_MAX;
   uint64_t current_texture_set_sampler_gen_vertex_ = UINT64_MAX;
   uint64_t current_texture_set_sampler_gen_pixel_ = UINT64_MAX;
+  bool current_texture_set_3d_to_2d_vertex_ = true;
+  bool current_texture_set_3d_to_2d_pixel_ = true;
   // Scratch buffer for compute_texture_set_hash, reused across draws (cleared
   // each call, capacity persists) to gather the reuse-input words for a single
   // XXH3 call without a per-draw allocation. GPU-command-thread-only.

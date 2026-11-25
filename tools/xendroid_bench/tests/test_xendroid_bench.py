@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import pathlib
+import sqlite3
 import struct
 import sys
 import tempfile
 import tomllib
+import types
 import unittest
 from unittest import mock
 
@@ -575,6 +577,146 @@ class XendroidBenchTests(unittest.TestCase):
         chosen = perfetto_pipeline._select_dominant_layer(candidates)
         self.assertIsNotNone(chosen)
         self.assertIn("SurfaceView", chosen.layer_name)
+
+    def test_smoke_and_trace_bench_abort_on_config_read_failure_without_truncating(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tdir = pathlib.Path(tmp)
+            with mock.patch("xendroid_bench.smoke.AdbDevice") as smoke_dev_cls:
+                inst = smoke_dev_cls.return_value
+                inst.storage_root.return_value = "/sdcard/x"
+                inst.file_uid.return_value = 10554
+                inst.run.side_effect = RuntimeError("adb exec-out cat failed")
+                with self.assertRaises(RuntimeError):
+                    smoke.run_smoke_adb(
+                        serial="dev1",
+                        adb_bin="adb",
+                        package="xendroid.compose.fork",
+                        game_uri="/sdcard/x/game.iso",
+                        title_id="5454082B",
+                        duration_s=5,
+                        out_dir=tdir / "smoke_out",
+                    )
+                inst.write_text_inplace.assert_not_called()
+
+            with mock.patch("xendroid_bench.trace_bench_host.AdbDevice") as tb_dev_cls:
+                inst = tb_dev_cls.return_value
+                inst.storage_root.return_value = "/sdcard/x"
+                inst.file_uid.return_value = 10554
+                inst.run.side_effect = RuntimeError("adb exec-out cat failed")
+                with self.assertRaises(RuntimeError):
+                    trace_bench_host.run_trace_bench_adb(
+                        serial="dev1",
+                        adb_bin="adb",
+                        package="xendroid.compose.fork",
+                        trace_path_on_device="/sdcard/x/traces/t.xtr",
+                        out_dir=tdir / "tb_out",
+                    )
+                inst.write_text_inplace.assert_not_called()
+
+    def test_perfetto_multi_layer_does_not_double_fps_and_prefers_xendroid_over_foreign_surfaceview(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE process (upid INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute(
+            "CREATE TABLE actual_frame_timeline_slice (upid INTEGER, layer_name TEXT, ts INTEGER, dur INTEGER, jank_type TEXT)"
+        )
+        conn.execute("INSERT INTO process VALUES (1, 'xendroid.compose.fork'), (2, 'com.other.app')")
+        step_ns = 20_000_000  # 50 Hz over 1.0 s (50 frames each layer)
+        for i in range(50):
+            ts = i * step_ns
+            conn.execute(
+                "INSERT INTO actual_frame_timeline_slice VALUES (?, ?, ?, ?, ?)",
+                (1, "SurfaceView[xendroid.compose.fork/MainActivity]#0", ts, step_ns, "None"),
+            )
+            conn.execute(
+                "INSERT INTO actual_frame_timeline_slice VALUES (?, ?, ?, ?, ?)",
+                (1, "xendroid.compose.fork/MainActivity#0", ts, step_ns, "None"),
+            )
+            conn.execute(
+                "INSERT INTO actual_frame_timeline_slice VALUES (?, ?, ?, ?, ?)",
+                (2, "SurfaceView[maps]#0", ts, step_ns, "None"),
+            )
+        conn.commit()
+
+        class _FakeTp:
+            def __init__(self, **_kw: object) -> None:
+                pass
+
+            def query(self, sql: str) -> list[types.SimpleNamespace]:
+                cur = conn.execute(sql)
+                cols = [d[0] for d in cur.description]
+                return [types.SimpleNamespace(**dict(zip(cols, row))) for row in cur.fetchall()]
+
+            def close(self) -> None:
+                pass
+
+        fake_pkg = types.ModuleType("perfetto")
+        fake_tp_mod = types.ModuleType("perfetto.trace_processor")
+        fake_tp_mod.TraceProcessor = _FakeTp
+        fake_tp_mod.TraceProcessorConfig = lambda **kw: kw
+        fake_pkg.trace_processor = fake_tp_mod
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                trace_p = pathlib.Path(tmp) / "fake.pftrace"
+                trace_p.write_bytes(b"pf")
+                with mock.patch.dict(sys.modules, {"perfetto": fake_pkg, "perfetto.trace_processor": fake_tp_mod}):
+                    res = perfetto_pipeline.analyze_pftrace(trace_p, package="xendroid.compose.fork")
+                self.assertEqual(res["total_frames"], 50)
+                self.assertAlmostEqual(res["fps"], 50.0, places=1)
+                self.assertIn("SurfaceView", res["layer_name"])
+        finally:
+            conn.close()
+
+        # Fallback tier check: foreign SurfaceView (500 frames) must NOT defeat Xendroid layer (280 frames)
+        candidates = [
+            types.SimpleNamespace(
+                total_frames=500,
+                first_ts=0.0,
+                last_ts=10e9,
+                proc_name="com.other.app",
+                layer_name="SurfaceView[maps]#0",
+            ),
+            types.SimpleNamespace(
+                total_frames=280,
+                first_ts=0.0,
+                last_ts=10e9,
+                proc_name="xendroid.compose.fork",
+                layer_name="xendroid.compose.fork/MainActivity#0",
+            ),
+        ]
+        chosen = perfetto_pipeline._select_dominant_layer(candidates, package="xendroid.compose.fork")
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.proc_name, "xendroid.compose.fork")
+
+    def test_lazy_xex_pe_image_rejects_excessive_total_size_and_bounds_unencrypted_read(self) -> None:
+        # 5 blocks with dsize=0, zsize=60 MiB each -> 300 MiB (> 256 MiB aggregate cap)
+        comp_info = b"".join(struct.pack(">II", 0, 60 * 1024 * 1024) for _ in range(5))
+        fake_xex = bytearray(0x400 + 0x100)
+        self.assertIsNone(
+            xex_preflight._try_extract_uncompressed_or_basic_pe(
+                bytes(fake_xex), 0x400, 0x82000000, bytes(16), 0, 1, comp_info
+            )
+        )
+
+        # Ensure unencrypted PE > 256 KiB triggers bounded read rather than full pe_len read
+        raw_uncomp = bytearray(_build_clean_synthetic_xex2())
+        hdr = bytearray(raw_uncomp[:0x400])
+        pe = raw_uncomp[0x400:]
+        # Basic compression (enc=0, comp=1): 0x220 bytes data + 0x80000 bytes zero gap
+        struct.pack_into(">IHH", hdr, 0x60, 16, 0, 1)
+        struct.pack_into(">II", hdr, 0x68, 0x220, 0x80000)
+        xex_large = bytes(hdr) + pe[:0x220]
+        read_sizes: list[int] = []
+        orig_read = xex_preflight._LazyXexPeImage.read
+
+        def _spy_read(self_obj, offset: int, length: int) -> bytes:
+            read_sizes.append(length)
+            return orig_read(self_obj, offset, length)
+
+        with mock.patch.object(xex_preflight._LazyXexPeImage, "read", _spy_read):
+            parsed = xex_preflight.parse_xex(xex_large, REPO_ROOT)
+        self.assertEqual(parsed["compression"], "basic")
+        self.assertTrue(all(sz <= 64 * 1024 for sz in read_sizes), f"Unexpected unbounded read sizes: {read_sizes}")
 
 
 if __name__ == "__main__":

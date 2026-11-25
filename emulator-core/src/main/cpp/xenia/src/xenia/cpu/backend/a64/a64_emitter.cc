@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/backend/a64/a64_emitter.h"
 
+#include <atomic>
 #include <bit>
 #include <cstring>
 #include <unordered_set>
@@ -1233,13 +1234,21 @@ bool A64Emitter::TryEmitInlineHleSync(const GuestFunction* extern_function,
   ExportResolver* resolver = processor_ ? processor_->export_resolver() : nullptr;
   const InlineHleSyncKind kind = ClassifyInlineHleSync(exp->name);
   const bool census_active = resolver && resolver->hle_census_active();
+  const bool log_hf =
+      resolver && resolver->log_high_frequency_kernel_calls();
+  const bool logging_active = IsInlineHleSyncLoggingActive(
+      exp->tags, ExportTag::kLog, ExportTag::kLogResult,
+      ExportTag::kHighFrequency, log_hf);
   const ExportTrampoline wake_fn =
       resolver ? resolver->rtl_leave_cs_wake_trampoline() : nullptr;
   if (!ShouldEmitInlineHleSync(cvars::a64_inline_hle_sync, census_active,
-                               exp->tags,
-                               ExportTag::kLog | ExportTag::kLogResult,
-                               wake_fn != nullptr, kind)) {
+                               logging_active, wake_fn != nullptr, kind)) {
     return false;
+  }
+  static std::atomic<bool> logged_first_inline_hle_sync{false};
+  if (!logged_first_inline_hle_sync.exchange(true, std::memory_order_relaxed)) {
+    XELOGI("A64Emitter: inline HLE sync fast-path active (first export={})",
+           exp->name);
   }
 
   constexpr int32_t r3_off = static_cast<int32_t>(offsetof(ppc::PPCContext, r[3]));

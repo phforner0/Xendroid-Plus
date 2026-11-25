@@ -55,6 +55,43 @@ inline void InvalidatePixelSpecCacheFetches(PixelSpecCacheState& state,
   state.fetch_up_to_date &= slot_clear_mask;
 }
 
+inline bool ShouldEnableLocalReadAttachments(
+    bool cvar_in_pass_resolve, bool cvar_dynamic_rendering,
+    bool has_dynamic_rendering, bool has_dynamic_rendering_local_read,
+    bool has_fragment_stores_and_atomics) {
+  return cvar_in_pass_resolve && cvar_dynamic_rendering &&
+         has_dynamic_rendering && has_dynamic_rendering_local_read &&
+         has_fragment_stores_and_atomics;
+}
+
+inline uint32_t ComputeRestoredFetchInvalidationMask(uint32_t first_register,
+                                                     uint32_t register_count,
+                                                     uint32_t fetch_first_reg,
+                                                     uint32_t fetch_last_reg) {
+  if (register_count == 0 || fetch_last_reg < fetch_first_reg) {
+    return 0;
+  }
+  const uint64_t end_register_excl =
+      uint64_t(first_register) + uint64_t(register_count);
+  const uint64_t fetch_end_excl = uint64_t(fetch_last_reg) + 1;
+  if (uint64_t(first_register) >= fetch_end_excl ||
+      end_register_excl <= fetch_first_reg) {
+    return 0;
+  }
+  const uint32_t clamped_first =
+      std::max(first_register, fetch_first_reg);
+  const uint32_t clamped_last = static_cast<uint32_t>(
+      std::min<uint64_t>(end_register_excl - 1, fetch_last_reg));
+  const uint32_t first_slot = (clamped_first - fetch_first_reg) / 6;
+  const uint32_t last_slot =
+      std::min<uint32_t>(31, (clamped_last - fetch_first_reg) / 6);
+  uint32_t mask = 0;
+  for (uint32_t slot = first_slot; slot <= last_slot; ++slot) {
+    mask |= UINT32_C(1) << slot;
+  }
+  return mask;
+}
+
 struct AudioAdaptiveState {
   size_t extra = 0;
   size_t submitted_blocks = 0;
@@ -79,28 +116,28 @@ inline AudioAdaptiveStepResult StepAudioAdaptiveQueue(
     bool submitted, size_t depth, size_t topup_base, size_t deepest,
     uint64_t stall_us, uint64_t pump_interval_us, uint64_t now_ms) {
   AudioAdaptiveStepResult out;
+  const size_t base = std::min(topup_base, deepest);
   if (!has_valid_deadline) {
     state = AudioAdaptiveState{};
-    out.target_blocks = std::min(topup_base, deepest);
+    out.target_blocks = base;
     return out;
   }
   if (!enabled) {
     state = AudioAdaptiveState{};
-    out.target_blocks = std::min(topup_base, deepest);
+    out.target_blocks = base;
     return out;
   }
   if (submitted) {
     ++state.submitted_blocks;
   }
-  if (depth >= std::min<size_t>(topup_base, 2) || state.submitted_blocks >= 4) {
+  if (depth >= std::min<size_t>(base, 2) || state.submitted_blocks >= 4) {
     state.filled = true;
   }
-  const size_t max_extra = deepest > topup_base ? (deepest - topup_base) : 0;
+  const size_t max_extra = deepest - base;
   if (state.extra > max_extra) {
     state.extra = max_extra;
   }
-  const size_t current_target =
-      std::min(deepest, topup_base + state.extra);
+  const size_t current_target = std::min(deepest, base + state.extra);
   const bool stressed =
       submitted && state.filled &&
       (depth <= 1 || stall_us * 2 >= current_target * pump_interval_us);
@@ -119,8 +156,7 @@ inline AudioAdaptiveStepResult StepAudioAdaptiveQueue(
     out.shrunk = true;
   }
 
-  out.target_blocks =
-      std::max(topup_base, std::min(deepest, topup_base + state.extra));
+  out.target_blocks = std::min(deepest, base + state.extra);
   return out;
 }
 
@@ -131,11 +167,13 @@ inline uint32_t ComputeAAudioHighDrainDepth(uint32_t base_high_drain_depth,
   return std::max(base_high_drain_depth, target_headroom);
 }
 
-inline bool ShouldRunEmergencySecondAudioTopup(size_t depth_after_first,
+inline bool ShouldRunEmergencySecondAudioTopup(bool reports_queued_frame_count,
+                                              size_t depth_after_first,
                                               size_t target_blocks,
                                               uint64_t total_exec_us,
                                               uint64_t pump_interval_us) {
-  return depth_after_first <= 1 && depth_after_first < target_blocks &&
+  return reports_queued_frame_count && depth_after_first <= 1 &&
+         depth_after_first < target_blocks &&
          total_exec_us < pump_interval_us * 2;
 }
 

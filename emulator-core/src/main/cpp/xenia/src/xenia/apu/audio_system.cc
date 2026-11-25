@@ -495,6 +495,7 @@ void AudioSystem::WorkerThreadMain() {
         std::lock_guard<std::mutex> clients_lock(clients_mutex_);
         for (size_t i = 0; i < kMaximumClientCount; ++i) {
           clients_[i].next_pump_us = 0;
+          adaptive_queues[i] = xendroid::AudioAdaptiveState{};
         }
       }
       continue;
@@ -686,6 +687,7 @@ void AudioSystem::WorkerThreadMain() {
         const uint64_t topup_us = run_callback();
         ++pump_stats.topups;
         if (xendroid::ShouldRunEmergencySecondAudioTopup(
+                driver->ReportsQueuedFrameCount(),
                 driver->GetQueuedFrameCount(), topup_below, exec_us + topup_us,
                 kAudioPumpInterval) &&
             !paused_ && worker_running_ &&

@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/vulkan/vulkan_render_target_cache.h"
 
+#include "../../../../../xe_wave5_perf_logic.h"
+
 #include <algorithm>
 #include <set>
 #include <chrono>
@@ -98,7 +100,7 @@ DEFINE_bool(
     "kGuestDrawReadWrite does not.",
     "Vulkan");
 DEFINE_bool(
-    vulkan_in_pass_resolve_7e3, true,
+    vulkan_in_pass_resolve_7e3, false,
     "With vulkan_in_pass_resolve: in-pass resolves also of 7e3 in the EDRAM "
     "(k_2_10_10_10_FLOAT) to k_2_10_10_10 from single-sampled sources, with "
     "the conversion of the direct path (the sample packed to the EDRAM format "
@@ -106,7 +108,6 @@ DEFINE_bool(
     "chains of tiny resolves. Read per resolve "
     "(debug.xendroid.in_pass_resolve_7e3 on Android).",
     "Vulkan");
-UPDATE_from_bool(vulkan_in_pass_resolve_7e3, 2026, 11, 25, 12, false);
 DEFINE_int32(
     vulkan_in_pass_resolve_debug_reject, 0,
     "DEBUG probe bitmask: 1 = reject multisampled sources, 2 = reject "
@@ -1086,10 +1087,11 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     }
   }
 #endif
-  local_read_attachments_ =
-      cvars::vulkan_in_pass_resolve && cvars::vulkan_dynamic_rendering &&
-      device_properties.dynamicRendering &&
-      device_properties.dynamicRenderingLocalRead;
+  local_read_attachments_ = xendroid::ShouldEnableLocalReadAttachments(
+      cvars::vulkan_in_pass_resolve, cvars::vulkan_dynamic_rendering,
+      device_properties.dynamicRendering,
+      device_properties.dynamicRenderingLocalRead,
+      device_properties.fragmentStoresAndAtomics);
   if (local_read_attachments_) {
     color_draw_stage_mask_ |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     color_draw_access_mask_ |= VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;

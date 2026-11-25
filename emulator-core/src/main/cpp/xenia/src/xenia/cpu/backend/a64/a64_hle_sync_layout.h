@@ -71,12 +71,26 @@ inline InlineHleSyncKind ClassifyInlineHleSync(std::string_view export_name) {
   return InlineHleSyncKind::kNone;
 }
 
+inline bool IsInlineHleSyncLoggingActive(uint32_t export_tags,
+                                         uint32_t log_tag,
+                                         uint32_t log_result_tag,
+                                         uint32_t high_freq_tag,
+                                         bool log_high_freq_calls) {
+  if ((export_tags & log_result_tag) != 0) {
+    return true;
+  }
+  if ((export_tags & log_tag) != 0 &&
+      ((export_tags & high_freq_tag) == 0 || log_high_freq_calls)) {
+    return true;
+  }
+  return false;
+}
+
 inline bool ShouldEmitInlineHleSync(bool cvar_enabled, bool hle_census_active,
-                                    uint32_t export_tags,
-                                    uint32_t log_tag_mask,
+                                    bool logging_active,
                                     bool has_wake_trampoline,
                                     InlineHleSyncKind kind) {
-  if (!cvar_enabled || hle_census_active || (export_tags & log_tag_mask) != 0 ||
+  if (!cvar_enabled || hle_census_active || logging_active ||
       kind == InlineHleSyncKind::kNone) {
     return false;
   }

@@ -609,6 +609,7 @@ def _try_extract_uncompressed_or_basic_pe(
         segments.append((0, n, 0, n & ~15, bytes(16)))
         total_size = n
     else:
+        max_total_virtual_pe_size = 256 * 1024 * 1024
         p = 0
         virt = 0
         iv = bytes(16)
@@ -616,7 +617,11 @@ def _try_extract_uncompressed_or_basic_pe(
             dsize, zsize = struct.unpack_from(">II", comp_info_bytes, off)
             if dsize == 0 and zsize == 0:
                 continue
-            if p + dsize > len(payload) or zsize > 64 * 1024 * 1024:
+            if (
+                p + dsize > len(payload)
+                or zsize > 64 * 1024 * 1024
+                or virt + dsize + zsize > max_total_virtual_pe_size
+            ):
                 return None
             aligned = dsize & ~15
             segments.append((virt, virt + dsize, p, aligned, iv))
@@ -1043,7 +1048,7 @@ def parse_xex(
     if pe_image:
         if hasattr(pe_image, "read"):
             pe_len = len(pe_image)
-            if pe_image._round_keys is None or pe_len <= 256 * 1024:
+            if pe_len <= 256 * 1024:
                 code_sample = pe_image.read(0, pe_len)
             else:
                 ep_off = entry_point - load_address if entry_point >= load_address else 0
