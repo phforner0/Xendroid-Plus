@@ -15,6 +15,7 @@
 #include "xenia/base/atomic.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/pe_image.h"
+#include "xenia/cpu/backend/a64/a64_hle_sync_layout.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -561,6 +562,12 @@ struct X_RTL_CRITICAL_SECTION {
 };
 #pragma pack(pop)
 static_assert_size(X_RTL_CRITICAL_SECTION, 28);
+static_assert(offsetof(X_RTL_CRITICAL_SECTION, lock_count) ==
+              cpu::backend::a64::kRtlCsLockCountOffset);
+static_assert(offsetof(X_RTL_CRITICAL_SECTION, recursion_count) ==
+              cpu::backend::a64::kRtlCsRecursionCountOffset);
+static_assert(offsetof(X_RTL_CRITICAL_SECTION, owning_thread) ==
+              cpu::backend::a64::kRtlCsOwningThreadOffset);
 
 void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs,
                                     uint32_t cs_ptr) {
@@ -717,6 +724,15 @@ void RtlLeaveCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 DECLARE_XBOXKRNL_EXPORT2(RtlLeaveCriticalSection, kNone, kImplemented,
                          kHighFrequency);
+
+void xeRtlLeaveCriticalSectionWakeTrampoline(cpu::ppc::PPCContext* ctx) {
+  const uint32_t cs_guest = static_cast<uint32_t>(ctx->r[3]);
+  if (!cs_guest) {
+    return;
+  }
+  auto* cs = ctx->TranslateVirtual<X_RTL_CRITICAL_SECTION*>(cs_guest);
+  xeKeSetEvent(reinterpret_cast<X_KEVENT*>(cs), 1, 0);
+}
 
 struct X_TIME_FIELDS {
   xe::be<uint16_t> year;

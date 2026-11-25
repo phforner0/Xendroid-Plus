@@ -15,6 +15,7 @@
 #include "xenia/kernel/xboxkrnl/cert_monitor.h"
 #include "xenia/kernel/xboxkrnl/debug_monitor.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_rtl.h"
 
 DEFINE_string(cl, "", "Specify additional command-line provided to guest.",
               "Kernel");
@@ -76,6 +77,8 @@ XboxkrnlModule::XboxkrnlModule(Emulator* emulator, KernelState* kernel_state)
   Register##n##Exports(export_resolver_, kernel_state_);
 #include "xboxkrnl_module_export_groups.inc"
 #undef XE_MODULE_EXPORT_GROUP
+  export_resolver_->set_rtl_leave_cs_wake_trampoline(
+      &xeRtlLeaveCriticalSectionWakeTrampoline);
 
   // A call to an address with no code or a faulting load/store goes to the
   // title's frame-based exception handlers.

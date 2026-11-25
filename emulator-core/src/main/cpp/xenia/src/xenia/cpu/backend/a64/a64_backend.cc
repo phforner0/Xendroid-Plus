@@ -32,6 +32,9 @@
 #if XE_PLATFORM_MAC
 #include <pthread.h>
 #endif
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 #include "xenia/cpu/backend/a64/a64_assembler.h"
 #include "xenia/cpu/backend/a64/a64_code_cache.h"
 #include "xenia/cpu/backend/a64/a64_emitter.h"
@@ -57,6 +60,8 @@ DEFINE_bool(a64_enable_host_guest_stack_synchronization, true,
             "and checks for reentry at return sites. Has slight performance "
             "impact, but fixes crashes in games that use setjmp/longjmp.",
             "a64");
+
+DECLARE_bool(a64_inline_hle_sync);
 
 DECLARE_bool(record_mmio_access_exceptions);
 
@@ -2067,6 +2072,24 @@ bool A64Backend::Initialize(Processor* processor) {
   if (!Backend::Initialize(processor)) {
     return false;
   }
+
+#if defined(__ANDROID__)
+  {
+    char inline_sync_prop[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.inline_hle_sync",
+                              inline_sync_prop) > 0) {
+      if (std::strcmp(inline_sync_prop, "0") == 0 ||
+          std::strcmp(inline_sync_prop, "false") == 0) {
+        cvars::a64_inline_hle_sync = false;
+        XELOGI("debug.xendroid.inline_hle_sync: a64_inline_hle_sync = false");
+      } else if (std::strcmp(inline_sync_prop, "1") == 0 ||
+                 std::strcmp(inline_sync_prop, "true") == 0) {
+        cvars::a64_inline_hle_sync = true;
+        XELOGI("debug.xendroid.inline_hle_sync: a64_inline_hle_sync = true");
+      }
+    }
+  }
+#endif
 
   // Fast indirection is only viable if trampolines made it under 4GB.
   code_cache_->set_allow_fast_indirection(guest_trampolines_sub4gb_);

@@ -125,6 +125,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   void Call(const hir::Instr* instr, GuestFunction* function);
   void CallIndirect(const hir::Instr* instr, int reg_index);
   void CallExtern(const hir::Instr* instr, const Function* function);
+  bool TryEmitInlineHleSync(const GuestFunction* extern_function,
+                            uint32_t thunk_offset);
   void CallNative(void* fn);
   void CallNativeSafe(void* fn);
   // Loads the host address for the guest address in w16 into x9. A direct bl,

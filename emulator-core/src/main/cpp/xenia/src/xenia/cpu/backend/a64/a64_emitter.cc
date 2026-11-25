@@ -16,15 +16,18 @@
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_code_cache.h"
 #include "xenia/cpu/backend/a64/a64_function.h"
+#include "xenia/cpu/backend/a64/a64_hle_sync_layout.h"
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/backend/a64/a64_stack_skew_analysis.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 #include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/export_resolver.h"
 #include "xenia/cpu/hir/hir_builder.h"
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/ppc/ppc_context.h"
@@ -53,6 +56,13 @@ DEFINE_bool(
     "ARM reorders all of those, which a guest race the console's or an x86 "
     "host's ordering hides can need. Slow; diagnostic only. Takes effect for "
     "code translated afterwards.",
+    "CPU");
+
+DEFINE_bool(
+    a64_inline_hle_sync, true,
+    "Emit inline AArch64 fast-paths for uncontended high-frequency HLE sync "
+    "exports (IRQL, CriticalSection, SpinLock), falling back to C++ handlers "
+    "on contention/validation edge cases or when hle_census is enabled.",
     "CPU");
 
 namespace xe {
@@ -1196,6 +1206,9 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
     auto extern_function = static_cast<const GuestFunction*>(function);
     if (extern_function->extern_handler()) {
       undefined = false;
+      if (TryEmitInlineHleSync(extern_function, thunk_offset)) {
+        return;
+      }
       // GuestToHostThunk: x0=target, x1=arg0
       mov(x0, reinterpret_cast<uint64_t>(extern_function->extern_handler()));
       ldr(x1, ptr(GetContextReg(), static_cast<int32_t>(offsetof(
@@ -1209,6 +1222,274 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
     mov(x1, reinterpret_cast<uint64_t>(function));
     CallNativeSafe(reinterpret_cast<void*>(&UndefinedCallExtern));
   }
+}
+
+bool A64Emitter::TryEmitInlineHleSync(const GuestFunction* extern_function,
+                                      uint32_t thunk_offset) {
+  const Export* exp = extern_function->export_data();
+  if (!exp || !exp->name) {
+    return false;
+  }
+  ExportResolver* resolver = processor_ ? processor_->export_resolver() : nullptr;
+  const InlineHleSyncKind kind = ClassifyInlineHleSync(exp->name);
+  const bool census_active = resolver && resolver->hle_census_active();
+  const ExportTrampoline wake_fn =
+      resolver ? resolver->rtl_leave_cs_wake_trampoline() : nullptr;
+  if (!ShouldEmitInlineHleSync(cvars::a64_inline_hle_sync, census_active,
+                               exp->tags,
+                               ExportTag::kLog | ExportTag::kLogResult,
+                               wake_fn != nullptr, kind)) {
+    return false;
+  }
+
+  constexpr int32_t r3_off = static_cast<int32_t>(offsetof(ppc::PPCContext, r[3]));
+  constexpr int32_t r4_off = static_cast<int32_t>(offsetof(ppc::PPCContext, r[4]));
+  constexpr int32_t r13_off = static_cast<int32_t>(offsetof(ppc::PPCContext, r[13]));
+  const bool gran_shift_guard = xe::memory::allocation_granularity() > 0x1000;
+
+  Label slow;
+  Label done;
+
+  auto emit_guest_ptr_guard = [&](const WReg& w_addr, bool require_align4,
+                                  Label& target_slow) {
+    cbz_near(w_addr, target_slow);
+    if (require_align4) {
+      tst(w_addr, 3);
+      b_near(NE, target_slow);
+    }
+    if (gran_shift_guard) {
+      mov(w17, kGuestPhysicalShiftBoundary);
+      cmp(w_addr, w17);
+      b_near(HS, target_slow);
+    }
+  };
+
+  auto emit_fallback_call = [&](void* target_fn) {
+    mov(x0, reinterpret_cast<uint64_t>(target_fn));
+    ldr(x1, ptr(GetContextReg(), static_cast<int32_t>(offsetof(
+                                     ppc::PPCContext, kernel_state))));
+    ldr(x9, ptr(x19, thunk_offset));
+    blr(x9);
+  };
+
+  switch (kind) {
+    case InlineHleSyncKind::kKeRaiseIrqlToDpcLevel: {
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, false, slow);
+      add(x3, x21, w1, UXTW);
+      ldrb(w0, ptr(x3, kKpcrCurrentIrqlOffset));
+      cmp(w0, 2);
+      b_near(HI, slow);
+      mov(w2, 2);
+      strb(w2, ptr(x3, kKpcrCurrentIrqlOffset));
+      str(x0, ptr(x20, r3_off));
+      b(done);
+      break;
+    }
+    case InlineHleSyncKind::kKfLowerIrql: {
+      ldrb(w0, ptr(x20, r3_off));
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, false, slow);
+      add(x3, x21, w1, UXTW);
+      ldrb(w2, ptr(x3, kKpcrCurrentIrqlOffset));
+      cmp(w0, w2);
+      b_near(HI, slow);
+      strb(w0, ptr(x3, kKpcrCurrentIrqlOffset));
+      b(done);
+      break;
+    }
+    case InlineHleSyncKind::kRtlEnterCriticalSection:
+    case InlineHleSyncKind::kRtlTryEnterCriticalSection: {
+      const bool is_try =
+          kind == InlineHleSyncKind::kRtlTryEnterCriticalSection;
+      Label cas_retry;
+      Label check_recursive;
+      Label rec_retry;
+      Label contended;
+
+      ldr(w0, ptr(x20, r3_off));
+      emit_guest_ptr_guard(w0, true, slow);
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, true, slow);
+      add(x2, x21, w0, UXTW);
+      add(x3, x21, w1, UXTW);
+      ldr(w4, ptr(x3, kKpcrCurrentThreadOffset));
+      cbz_near(w4, slow);
+
+      add(x14, x2, kRtlCsLockCountOffset);
+      mov(w15, static_cast<uint32_t>(-1));
+      L(cas_retry);
+      ldaxr(w16, ptr(x14));
+      cmp(w16, w15);
+      b_near(NE, check_recursive);
+      stlxr(w17, wzr, ptr(x14));
+      cbnz_near(w17, cas_retry);
+
+      mov(w16, 0x01000000u);
+      str(w16, ptr(x2, kRtlCsRecursionCountOffset));
+      str(w4, ptr(x2, kRtlCsOwningThreadOffset));
+      if (is_try) {
+        mov(x16, 1);
+        str(x16, ptr(x20, r3_off));
+      }
+      b(done);
+
+      L(check_recursive);
+      clrex(15);
+      ldr(w16, ptr(x2, kRtlCsOwningThreadOffset));
+      cmp(w16, w4);
+      b_near(NE, is_try ? contended : slow);
+
+      L(rec_retry);
+      ldaxr(w16, ptr(x14));
+      add(w16, w16, 1);
+      stlxr(w17, w16, ptr(x14));
+      cbnz_near(w17, rec_retry);
+      ldr(w16, ptr(x2, kRtlCsRecursionCountOffset));
+      rev(w16, w16);
+      add(w16, w16, 1);
+      rev(w16, w16);
+      str(w16, ptr(x2, kRtlCsRecursionCountOffset));
+      if (is_try) {
+        mov(x16, 1);
+        str(x16, ptr(x20, r3_off));
+      }
+      b(done);
+
+      if (is_try) {
+        L(contended);
+        str(xzr, ptr(x20, r3_off));
+        b(done);
+      }
+      break;
+    }
+    case InlineHleSyncKind::kRtlLeaveCriticalSection: {
+      Label recursive_leave;
+      Label dec_retry;
+      Label rec_dec_retry;
+
+      ldr(w0, ptr(x20, r3_off));
+      emit_guest_ptr_guard(w0, true, slow);
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, true, slow);
+      add(x2, x21, w0, UXTW);
+      add(x3, x21, w1, UXTW);
+      ldr(w4, ptr(x3, kKpcrCurrentThreadOffset));
+      cbz_near(w4, slow);
+
+      ldr(w15, ptr(x2, kRtlCsOwningThreadOffset));
+      cmp(w15, w4);
+      b_near(NE, slow);
+
+      ldr(w15, ptr(x2, kRtlCsRecursionCountOffset));
+      add(x14, x2, kRtlCsLockCountOffset);
+      mov(w16, 0x01000000u);
+      cmp(w15, w16);
+      b_near(NE, recursive_leave);
+
+      str(wzr, ptr(x2, kRtlCsRecursionCountOffset));
+      str(wzr, ptr(x2, kRtlCsOwningThreadOffset));
+      L(dec_retry);
+      ldaxr(w15, ptr(x14));
+      sub(w15, w15, 1);
+      stlxr(w17, w15, ptr(x14));
+      cbnz_near(w17, dec_retry);
+      cmn(w15, 1);
+      b_near(EQ, done);
+
+      emit_fallback_call(reinterpret_cast<void*>(wake_fn));
+      b(done);
+
+      L(recursive_leave);
+      rev(w15, w15);
+      cmp(w15, 1);
+      b_near(LE, slow);
+      sub(w15, w15, 1);
+      rev(w15, w15);
+      str(w15, ptr(x2, kRtlCsRecursionCountOffset));
+      L(rec_dec_retry);
+      ldaxr(w15, ptr(x14));
+      sub(w15, w15, 1);
+      stlxr(w17, w15, ptr(x14));
+      cbnz_near(w17, rec_dec_retry);
+      b(done);
+      break;
+    }
+    case InlineHleSyncKind::kKeAcquireSpinLockAtRaisedIrql:
+    case InlineHleSyncKind::kKfAcquireSpinLock: {
+      const bool change_irql = kind == InlineHleSyncKind::kKfAcquireSpinLock;
+      Label spin_retry;
+      Label spin_contended;
+
+      ldr(w0, ptr(x20, r3_off));
+      emit_guest_ptr_guard(w0, true, slow);
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, false, slow);
+      add(x2, x21, w0, UXTW);
+      if (change_irql) {
+        add(x3, x21, w1, UXTW);
+        ldrb(w4, ptr(x3, kKpcrCurrentIrqlOffset));
+        cmp(w4, 2);
+        b_near(HI, slow);
+      }
+      rev(w14, w1);
+      L(spin_retry);
+      ldaxr(w15, ptr(x2));
+      cbnz_near(w15, spin_contended);
+      stlxr(w17, w14, ptr(x2));
+      cbnz_near(w17, spin_retry);
+
+      if (change_irql) {
+        mov(w16, 2);
+        strb(w16, ptr(x3, kKpcrCurrentIrqlOffset));
+        str(x4, ptr(x20, r3_off));
+      }
+      b(done);
+
+      L(spin_contended);
+      clrex(15);
+      break;
+    }
+    case InlineHleSyncKind::kKeReleaseSpinLockFromRaisedIrql:
+    case InlineHleSyncKind::kKfReleaseSpinLock: {
+      const bool change_irql = kind == InlineHleSyncKind::kKfReleaseSpinLock;
+      Label skip_irql;
+
+      ldr(w0, ptr(x20, r3_off));
+      emit_guest_ptr_guard(w0, true, slow);
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, false, slow);
+      add(x2, x21, w0, UXTW);
+      ldr(w15, ptr(x2));
+      rev(w16, w1);
+      cmp(w15, w16);
+      b_near(NE, slow);
+
+      if (change_irql) {
+        ldr(w4, ptr(x20, r4_off));
+        cmp(w4, 2);
+        b_near(HS, skip_irql);
+        add(x3, x21, w1, UXTW);
+        ldrb(w14, ptr(x3, kKpcrCurrentIrqlOffset));
+        cmp(w4, w14);
+        b_near(HI, slow);
+        stlr(wzr, ptr(x2));
+        strb(w4, ptr(x3, kKpcrCurrentIrqlOffset));
+        b(done);
+        L(skip_irql);
+      }
+      stlr(wzr, ptr(x2));
+      b(done);
+      break;
+    }
+    case InlineHleSyncKind::kNone:
+      return false;
+  }
+
+  L(slow);
+  emit_fallback_call(reinterpret_cast<void*>(extern_function->extern_handler()));
+  L(done);
+  return true;
 }
 
 void A64Emitter::EmitDynamicCallLookup(bool tail, bool direct) {

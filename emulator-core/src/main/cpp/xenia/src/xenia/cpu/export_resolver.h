@@ -153,9 +153,21 @@ class ExportResolver {
   void SetFunctionMapping(const std::string_view module_name, uint16_t ordinal,
                           ExportTrampoline trampoline);
 
+  bool hle_census_active() const { return hle_census_active_; }
+  void set_hle_census_active(bool active) { hle_census_active_ = active; }
+
+  ExportTrampoline rtl_leave_cs_wake_trampoline() const {
+    return rtl_leave_cs_wake_trampoline_;
+  }
+  void set_rtl_leave_cs_wake_trampoline(ExportTrampoline fn) {
+    rtl_leave_cs_wake_trampoline_ = fn;
+  }
+
  private:
   std::vector<Table> tables_;
   std::vector<Export*> all_exports_by_name_;
+  bool hle_census_active_ = false;
+  ExportTrampoline rtl_leave_cs_wake_trampoline_ = nullptr;
 };
 
 }  // namespace cpu

@@ -36,6 +36,7 @@ std::array<std::atomic<uint64_t>, kSlots> g_count{};
 std::array<xe::cpu::ExportTrampoline, kSlots> g_orig{};
 std::array<const char*, kSlots> g_name{};
 size_t g_used = 0;
+xe::cpu::ExportResolver* g_census_resolver = nullptr;
 
 std::mutex g_census_mutex;
 std::condition_variable g_census_cv;
@@ -150,12 +151,18 @@ void InstallHleCensus(xe::cpu::ExportResolver* resolver) {
 
   XELOGI("XDROID-HLE: census enabled, {} exports wrapped ({} skipped)", g_used,
          skipped);
+  g_census_resolver = resolver;
+  resolver->set_hle_census_active(true);
   std::lock_guard<std::mutex> lock(g_census_mutex);
   g_census_stop = false;
   g_census_thread = std::thread(CensusThreadMain, g_used);
 }
 
 void ShutdownHleCensus() {
+  if (g_census_resolver) {
+    g_census_resolver->set_hle_census_active(false);
+    g_census_resolver = nullptr;
+  }
   {
     std::lock_guard<std::mutex> lock(g_census_mutex);
     g_census_stop = true;
