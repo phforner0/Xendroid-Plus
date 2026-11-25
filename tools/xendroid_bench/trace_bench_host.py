@@ -152,7 +152,7 @@ def run_trace_bench_adb(
     out_dir.mkdir(parents=True, exist_ok=True)
     dev = AdbDevice(serial=serial, adb_bin=adb_bin)
     root = dev.storage_root(package)
-    cfg_remote = f"{root}/xenia-edge.config.toml"
+    cfg_remote = f"{root}/xenia-canary.config.toml"
     cfg_bak = f"{cfg_remote}.benchbak"
     log_remote = f"{root}/xe.log"
     run_id = f"xb-{uuid.uuid4().hex[:8]}"
