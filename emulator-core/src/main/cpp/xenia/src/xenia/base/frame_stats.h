@@ -403,6 +403,10 @@ inline std::atomic<PadLiveCallback>& pad_script_live_callback() {
   static std::atomic<PadLiveCallback> v{nullptr};
   return v;
 }
+inline std::atomic<PadLiveCallback>& pad_record_live_callback() {
+  static std::atomic<PadLiveCallback> v{nullptr};
+  return v;
+}
 }  // namespace internal
 
 // Per-frame guest frame times for run summaries: 1 ms buckets, the last one holds

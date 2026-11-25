@@ -312,6 +312,9 @@ X_RESULT AndroidInputDriver::GetState(uint32_t user_index,
       if (script_axes[5] > 0.02f) {
         right_trigger = uint8_t(std::clamp(script_axes[5], 0.0f, 1.0f) * 255.0f);
       }
+    } else {
+      xendroid::PadRecordObserve(buttons, thumb_lx, thumb_ly, thumb_rx,
+                                 thumb_ry, left_trigger, right_trigger);
     }
   }
 

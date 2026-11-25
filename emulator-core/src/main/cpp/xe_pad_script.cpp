@@ -22,6 +22,10 @@ DEFINE_string(pad_script, "",
               "Relative path under storage_root to a .pad script replayed over "
               "XInput slot 0 (empty = disabled).",
               "HID");
+DEFINE_string(pad_record, "",
+              "Relative path under storage_root to record XInput slot 0 "
+              "inputs as a swap-clocked .pad script (empty = disabled).",
+              "HID");
 
 namespace xendroid {
 namespace {
@@ -51,6 +55,22 @@ std::atomic<uint64_t> g_live_generation{1};
 std::string g_last_spec;
 std::string g_last_live_pulse;
 std::filesystem::path g_storage_root;
+
+// Layer 3: Asynchronous input recorder (observed on XInputGetState(0)).
+struct PadRecordEvent {
+  uint64_t tick = 0;
+  PadRecordSample sample;
+};
+
+std::atomic<bool> g_record_active{false};
+std::atomic<bool> g_record_stop{false};
+std::mutex g_rec_buf_mutex;
+std::vector<PadRecordEvent> g_rec_queue;
+bool g_rec_has_last = false;
+PadRecordSample g_rec_last_sample;
+std::thread g_rec_thread;
+std::string g_last_rec_spec;
+std::string g_last_rec_prop;
 
 void PublishScriptState(bool active, uint16_t buttons, const float axes[6]) {
   for (int i = 0; i < 6; ++i) {
@@ -276,6 +296,109 @@ void LivePropCallback(const char* value) {
   PadScriptApplyLive(value);
 }
 
+void RunRecordThread(std::filesystem::path out_file) {
+  std::error_code ec;
+  if (out_file.has_parent_path()) {
+    std::filesystem::create_directories(out_file.parent_path(), ec);
+  }
+  std::ofstream out(out_file, std::ios::out | std::ios::trunc);
+  if (!out.is_open()) {
+    XELOGW("XDROID-PAD record abort reason=open_failed file={}",
+           out_file.string());
+    g_record_active.store(false, std::memory_order_release);
+    return;
+  }
+  out << "# Recorded by XenDroid pad_record\n";
+
+  uint32_t title_id =
+      xe::internal::active_title_id_atomic().load(std::memory_order_relaxed);
+  bool wrote_wait_title = false;
+  if (title_id != 0) {
+    char tbuf[32] = {};
+    std::snprintf(tbuf, sizeof(tbuf), "wait title %08X 60\n", title_id);
+    out << tbuf;
+    wrote_wait_title = true;
+  }
+
+  uint64_t last_tick = CurrentTick();
+  uint64_t event_count = 0;
+  auto last_flush = SteadyClock::now();
+  std::vector<PadRecordEvent> batch;
+  batch.reserve(64);
+
+  auto flush_batch = [&]() {
+    batch.clear();
+    {
+      std::lock_guard<std::mutex> lk(g_rec_buf_mutex);
+      batch.swap(g_rec_queue);
+    }
+    if (!wrote_wait_title) {
+      const uint32_t tid = xe::internal::active_title_id_atomic().load(
+          std::memory_order_relaxed);
+      if (tid != 0) {
+        char tbuf[32] = {};
+        std::snprintf(tbuf, sizeof(tbuf), "wait title %08X 60\n", tid);
+        out << tbuf;
+        wrote_wait_title = true;
+      }
+    }
+    for (const auto& ev : batch) {
+      const uint64_t delta = ev.tick >= last_tick ? ev.tick - last_tick : 0;
+      if (ev.tick > last_tick) last_tick = ev.tick;
+      out << FormatPadSetLine(delta, ev.sample) << '\n';
+      ++event_count;
+    }
+  };
+
+  while (!g_record_stop.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    flush_batch();
+    const auto now = SteadyClock::now();
+    if (now - last_flush >= std::chrono::milliseconds(200)) {
+      out.flush();
+      last_flush = now;
+    }
+  }
+  flush_batch();
+  out << "release all\nend\n";
+  out.flush();
+  XELOGI("XDROID-PAD record stop file={} events={} ticks={}",
+         out_file.string(), event_count, last_tick);
+}
+
+void StopRecordLocked() {
+  g_record_active.store(false, std::memory_order_release);
+  if (g_rec_thread.joinable()) {
+    g_record_stop.store(true, std::memory_order_release);
+    g_rec_thread.join();
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_rec_buf_mutex);
+    g_rec_queue.clear();
+    g_rec_has_last = false;
+  }
+  g_last_rec_spec.clear();
+}
+
+void StartRecordLocked(const std::filesystem::path& storage_root,
+                       std::string_view spec) {
+  g_storage_root = storage_root;
+  if (spec.empty() || spec == g_last_rec_spec) {
+    return;
+  }
+  std::filesystem::path full;
+  if (!pad_detail::ResolvePadScriptPathUnderRoot(storage_root, spec, full)) {
+    XELOGW("XDROID-PAD record abort reason=unsafe_path spec={}", spec);
+    return;
+  }
+  StopRecordLocked();
+  g_last_rec_spec = std::string(spec);
+  g_record_stop.store(false, std::memory_order_release);
+  g_record_active.store(true, std::memory_order_release);
+  XELOGI("XDROID-PAD record start file={}", spec);
+  g_rec_thread = std::thread(RunRecordThread, std::move(full));
+}
+
 void ScriptPropCallback(const char* value) {
   if (!value || !value[0]) return;
   std::filesystem::path root;
@@ -288,12 +411,36 @@ void ScriptPropCallback(const char* value) {
   }
 }
 
+void RecordPropCallback(const char* raw) {
+  const std::string_view spec(raw ? raw : "");
+  std::lock_guard<std::mutex> lock(g_control_mutex);
+  if (spec == "__stop__") {
+    g_last_rec_prop = "__stop__";
+    StopRecordLocked();
+    return;
+  }
+  if (spec.empty()) {
+    if (!g_last_rec_prop.empty() && g_last_rec_prop != "__stop__") {
+      StopRecordLocked();
+    }
+    g_last_rec_prop.clear();
+    return;
+  }
+  if (spec == g_last_rec_prop || g_storage_root.empty()) {
+    return;
+  }
+  g_last_rec_prop = std::string(spec);
+  StartRecordLocked(g_storage_root, spec);
+}
+
 }  // namespace
 
 void PadScriptInstallCallbacks() {
   xe::internal::pad_live_callback().store(&LivePropCallback,
                                           std::memory_order_release);
   xe::internal::pad_script_live_callback().store(&ScriptPropCallback,
+                                                 std::memory_order_release);
+  xe::internal::pad_record_live_callback().store(&RecordPropCallback,
                                                  std::memory_order_release);
 }
 
@@ -408,8 +555,12 @@ void PadScriptShutdown() {
   xe::internal::pad_live_callback().store(nullptr, std::memory_order_release);
   xe::internal::pad_script_live_callback().store(nullptr,
                                                  std::memory_order_release);
+  xe::internal::pad_record_live_callback().store(nullptr,
+                                                 std::memory_order_release);
   g_live_generation.fetch_add(1, std::memory_order_acq_rel);
   std::lock_guard<std::mutex> lock(g_control_mutex);
+  StopRecordLocked();
+  g_last_rec_prop.clear();
   if (g_player_thread.joinable()) {
     g_player_stop.store(true, std::memory_order_relaxed);
     g_player_thread.join();
@@ -419,6 +570,39 @@ void PadScriptShutdown() {
   g_live_pulse_latched.store(false, std::memory_order_release);
   ClearScriptState();
   ClearLiveState();
+}
+
+void PadRecordStart(const std::filesystem::path& storage_root,
+                    std::string_view spec) {
+  std::lock_guard<std::mutex> lock(g_control_mutex);
+  StartRecordLocked(storage_root, spec);
+}
+
+void PadRecordStop() {
+  std::lock_guard<std::mutex> lock(g_control_mutex);
+  StopRecordLocked();
+}
+
+void PadRecordObserve(uint16_t buttons, int16_t thumb_lx, int16_t thumb_ly,
+                      int16_t thumb_rx, int16_t thumb_ry,
+                      uint8_t left_trigger, uint8_t right_trigger) {
+  if (!g_record_active.load(std::memory_order_acquire)) {
+    return;
+  }
+  const PadRecordSample sample = QuantizePadSample(
+      buttons, thumb_lx, thumb_ly, thumb_rx, thumb_ry, left_trigger,
+      right_trigger);
+  const uint64_t tick = CurrentTick();
+  std::lock_guard<std::mutex> lk(g_rec_buf_mutex);
+  if (!g_record_active.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (g_rec_has_last && sample == g_rec_last_sample) {
+    return;
+  }
+  g_rec_has_last = true;
+  g_rec_last_sample = sample;
+  g_rec_queue.push_back({tick, sample});
 }
 
 void PadScriptSnapshot(bool& active_out, uint16_t& buttons_out,

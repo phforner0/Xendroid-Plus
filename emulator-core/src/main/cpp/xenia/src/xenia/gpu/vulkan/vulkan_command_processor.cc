@@ -964,6 +964,13 @@ void PollDebugPropertyOverrides(CommandProcessor& command_processor) {
       cb(pad_script_value);
     }
   }
+  char pad_record_value[PROP_VALUE_MAX] = {};
+  const int pad_record_len =
+      __system_property_get("debug.xendroid.pad_record", pad_record_value);
+  if (auto cb = xe::internal::pad_record_live_callback().load(
+          std::memory_order_acquire)) {
+    cb(pad_record_len > 0 ? pad_record_value : "");
+  }
 #endif
 }
 

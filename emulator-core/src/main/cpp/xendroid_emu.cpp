@@ -377,6 +377,7 @@ bool EmulatorApp::OnInitialize() {
 
     xendroid::PadScriptInstallCallbacks();
     xendroid::PadScriptStart(storage_root, cvars::pad_script);
+    xendroid::PadRecordStart(storage_root, cvars::pad_record);
 
     // Must precede any title boot: without a provider XamShowKeyboardUI answers
     // itself with the title's own default text.

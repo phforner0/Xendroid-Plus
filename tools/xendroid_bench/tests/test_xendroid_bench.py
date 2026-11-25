@@ -22,6 +22,7 @@ from xendroid_bench import (
     perfetto_pipeline,
     power,
     ppc_coverage,
+    record_pad,
     reporting,
     shader_offline,
     smoke,
@@ -444,6 +445,29 @@ class XendroidBenchTests(unittest.TestCase):
             run_id="r1",
         )
         self.assertIsNone(tb_other["abort_reason"])
+
+    def test_validate_recorded_pad_accepts_set_events_and_rejects_bad(self) -> None:
+        good = "\n".join(
+            [
+                "# Recorded by XenDroid pad_record",
+                "wait title 4D5309C9 60",
+                "S 0 0000 0.000 0.000 0.000 0.000 0.000 0.000",
+                "S 42 1001 1.000 -1.000 0.500 -0.500 1.000 0.500",
+                "release all",
+                "end",
+            ]
+        )
+        res = record_pad.validate_recorded_pad(good)
+        self.assertTrue(res["valid"])
+        self.assertEqual(res["title_id"], "4D5309C9")
+        self.assertEqual(res["event_count"], 2)
+        self.assertEqual(res["total_delta_ticks"], 42)
+        self.assertTrue(res["has_end"])
+
+        bad = "wait title 4D5309C9 60\nS -1 0000 0 0 0 0 0 0\n"
+        bad_res = record_pad.validate_recorded_pad(bad)
+        self.assertFalse(bad_res["valid"])
+        self.assertGreaterEqual(len(bad_res["invalid_lines"]), 1)
 
 
 if __name__ == "__main__":

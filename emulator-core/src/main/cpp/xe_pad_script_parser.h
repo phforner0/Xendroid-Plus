@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -364,6 +366,68 @@ inline bool ParsePadScriptText(std::string_view script_text,
     return false;
   }
   return true;
+}
+
+struct PadRecordSample {
+  uint16_t buttons = 0;
+  int16_t axes_milli[6] = {};
+
+  bool operator==(const PadRecordSample& o) const {
+    if (buttons != o.buttons) return false;
+    for (int i = 0; i < 6; ++i) {
+      if (axes_milli[i] != o.axes_milli[i]) return false;
+    }
+    return true;
+  }
+  bool operator!=(const PadRecordSample& o) const { return !(*this == o); }
+};
+
+inline int16_t QuantizePadStickMilli(int16_t raw) {
+  const int32_t scaled =
+      raw >= 0 ? int32_t((int64_t(raw) * 1000 + 16383) / 32767)
+               : int32_t((int64_t(raw) * 1000 - 16384) / 32768);
+  const int32_t clamped = std::clamp<int32_t>(scaled, -1000, 1000);
+  if (clamped >= -40 && clamped <= 40) return 0;
+  if (clamped >= 975) return 1000;
+  if (clamped <= -975) return -1000;
+  const int32_t mag = (std::abs(clamped) + 12) / 25 * 25;
+  return int16_t(clamped < 0 ? -std::min<int32_t>(mag, 1000)
+                             : std::min<int32_t>(mag, 1000));
+}
+
+inline int16_t QuantizePadTriggerMilli(uint8_t raw) {
+  const int32_t scaled = int32_t((uint32_t(raw) * 1000u + 127u) / 255u);
+  const int32_t clamped = std::clamp<int32_t>(scaled, 0, 1000);
+  if (clamped <= 25) return 0;
+  if (clamped >= 975) return 1000;
+  return int16_t(std::min<int32_t>(((clamped + 12) / 25) * 25, 1000));
+}
+
+inline PadRecordSample QuantizePadSample(uint16_t buttons, int16_t lx,
+                                         int16_t ly, int16_t rx, int16_t ry,
+                                         uint8_t lt, uint8_t rt) {
+  PadRecordSample s;
+  s.buttons = buttons;
+  s.axes_milli[0] = QuantizePadStickMilli(lx);
+  s.axes_milli[1] = QuantizePadStickMilli(ly);
+  s.axes_milli[2] = QuantizePadStickMilli(rx);
+  s.axes_milli[3] = QuantizePadStickMilli(ry);
+  s.axes_milli[4] = QuantizePadTriggerMilli(lt);
+  s.axes_milli[5] = QuantizePadTriggerMilli(rt);
+  return s;
+}
+
+inline std::string FormatPadSetLine(uint64_t delta_ticks,
+                                    const PadRecordSample& s) {
+  char buf[160] = {};
+  const int n = std::snprintf(
+      buf, sizeof(buf),
+      "S %" PRIu64 " %04X %.3f %.3f %.3f %.3f %.3f %.3f", delta_ticks,
+      unsigned(s.buttons), double(s.axes_milli[0]) / 1000.0,
+      double(s.axes_milli[1]) / 1000.0, double(s.axes_milli[2]) / 1000.0,
+      double(s.axes_milli[3]) / 1000.0, double(s.axes_milli[4]) / 1000.0,
+      double(s.axes_milli[5]) / 1000.0);
+  return n > 0 ? std::string(buf, size_t(n)) : std::string();
 }
 
 }  // namespace xendroid

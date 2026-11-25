@@ -16,6 +16,7 @@ from .gfxr import parse_gfxr_measurements, run_gfxr_replay
 from .perfetto_pipeline import analyze_pftrace, parse_xe_perf_log, run_perf_capture
 from .power import compute_power_efficiency, run_power_capture_adb
 from .ppc_coverage import analyze_ppc_coverage
+from .record_pad import run_record_pad_adb
 from .renderdoc_headless import inspect_rdc_file
 from .reporting import make_report, write_report
 from .shader_offline import run_shader_offline
@@ -199,6 +200,17 @@ def build_parser() -> argparse.ArgumentParser:
     ht.add_argument("--skip-cpp", action="store_true")
     ht.add_argument("--skip-py", action="store_true")
     ht.add_argument("--out", type=pathlib.Path, default=None)
+
+    # 2b. record-pad
+    rp = sub.add_parser("record-pad", help="Layer 2: record real player touch/gamepad inputs into a .pad script.")
+    rp.add_argument("--serial", default=None)
+    rp.add_argument("--adb", default=None)
+    rp.add_argument("--package", default=DEFAULT_PACKAGE)
+    rp.add_argument("--game-uri", default=None, help="Optional game ISO/XEX URI to boot from launch; omit to attach live to running game.")
+    rp.add_argument("--title-id", default="00000000")
+    rp.add_argument("--name", default="recorded_session.pad")
+    rp.add_argument("--duration", type=int, default=30, help="Recording duration in seconds (0 waits for Enter).")
+    rp.add_argument("--out", type=pathlib.Path, default=pathlib.Path("performance-tests/record_pad"))
 
     return p
 
@@ -665,6 +677,28 @@ def main(argv: list[str] | None = None) -> int:
             verdict="PASS" if ok else "FAIL",
             summary="Host Python + C++20 native logic tests passed" if ok else "One or more host test suites failed",
             details=results,
+        )
+        return _emit(report, args.out)
+
+    if args.cmd == "record-pad":
+        res = run_record_pad_adb(
+            serial=args.serial,
+            adb_bin=args.adb,
+            package=args.package,
+            pad_name=args.name,
+            out_dir=args.out,
+            game_uri=args.game_uri,
+            title_id=args.title_id,
+            duration_s=args.duration,
+        )
+        report = make_report(
+            command="record-pad",
+            target=args.game_uri or args.package,
+            verdict=res["verdict"],
+            summary=res["summary"],
+            metrics=res["metrics"],
+            artifacts=res["artifacts"],
+            details=res["details"],
         )
         return _emit(report, args.out)
 

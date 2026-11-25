@@ -181,12 +181,58 @@ void TestGpuBenchLogic() {
          xendroid::BenchWatchdogVerdict::kSlowAbort);
 }
 
+void TestPadRecordLogic() {
+  // Deadzone, rounding step (25 milli), and full-range snap.
+  const auto rest =
+      xendroid::QuantizePadSample(0, 1200, -1200, 500, -500, 5, 6);
+  assert(rest.buttons == 0);
+  for (int i = 0; i < 6; ++i) {
+    assert(rest.axes_milli[i] == 0);
+  }
+  const auto active = xendroid::QuantizePadSample(0x1001, 32700, -32700, 16384,
+                                                  -16384, 254, 128);
+  assert(active.buttons == 0x1001);
+  assert(active.axes_milli[0] == 1000);
+  assert(active.axes_milli[1] == -1000);
+  assert(active.axes_milli[2] == 500);
+  assert(active.axes_milli[3] == -500);
+  assert(active.axes_milli[4] == 1000);
+  assert(active.axes_milli[5] == 500);
+  assert(active != rest);
+
+  // Round-trip emitted lines through ParsePadScriptText.
+  std::string script = "# Recorded by XenDroid pad_record\n";
+  script += "wait title 4D5309C9 60\n";
+  script += xendroid::FormatPadSetLine(0, rest) + "\n";
+  script += xendroid::FormatPadSetLine(42, active) + "\n";
+  script += xendroid::FormatPadSetLine(18, rest) + "\n";
+  script += "release all\n";
+  script += "end\n";
+
+  std::vector<xendroid::PadScriptCommand> cmds;
+  xendroid::PadScriptCommand err;
+  assert(xendroid::ParsePadScriptText(script, cmds, err));
+  assert(cmds.size() == 6);
+  assert(cmds[0].op == xendroid::PadScriptOp::kWaitTitle);
+  assert(cmds[0].n == 0x4D5309C9);
+  assert(cmds[2].op == xendroid::PadScriptOp::kSet);
+  assert(cmds[2].n == 42);
+  assert(cmds[2].input.buttons == 0x1001);
+  assert(std::fabs(cmds[2].values[0] - 1.0f) < 0.01f);
+  assert(std::fabs(cmds[2].values[1] + 1.0f) < 0.01f);
+  assert(std::fabs(cmds[2].values[4] - 1.0f) < 0.01f);
+  assert(std::fabs(cmds[2].values[5] - 0.5f) < 0.01f);
+  assert(cmds[4].op == xendroid::PadScriptOp::kReleaseAll);
+  assert(cmds[5].op == xendroid::PadScriptOp::kEnd);
+}
+
 }  // namespace
 
 int main() {
   TestHleCensusLogic();
   TestAudioSanityTracker();
   TestPadScriptParser();
+  TestPadRecordLogic();
   TestGpuBenchLogic();
   std::printf("bench_tools_logic_test: ok\n");
   return 0;
