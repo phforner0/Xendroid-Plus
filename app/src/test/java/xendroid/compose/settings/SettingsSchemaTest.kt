@@ -56,9 +56,10 @@ class SettingsSchemaTest {
             "Kernel|precise_guest_delays", "APU|apu_performance_hint", "HID|vibration", "HID|guide_button",
             "GPU|readback_resolve_sync", "GPU|precise_interpolation", "Vulkan|vulkan_allow_reverse_z",
             "Vulkan|vulkan_dynamic_rendering", "Vulkan|vulkan_avoid_geometry_shaders", "Vulkan|vulkan_depth_unorm24",
-            "Vulkan|vulkan_in_pass_resolve", "General|guest_crash_is_fatal").forEach { b(it, true) }
+            "General|guest_crash_is_fatal").forEach { b(it, true) }
         listOf("GPU|depth_bias_shader_offset", "GPU|memexport_enable", "UI|achievement_notification_position_by_game",
-            "Storage|mount_memory_unit", "Vulkan|vulkan_allow_present_mode_immediate",
+            "Storage|mount_memory_unit", "Vulkan|vulkan_in_pass_resolve",
+            "Vulkan|vulkan_allow_present_mode_immediate",
             "Vulkan|vulkan_allow_present_mode_mailbox").forEach { b(it, false) }
         assertEquals("0", (SettingsSchema.byKey["GPU|draw_resolution_scale_threshold"] as Setting.ListChoice).default)
         assertEquals("-1", (SettingsSchema.byKey["Kernel|console_type"] as Setting.ListChoice).default)

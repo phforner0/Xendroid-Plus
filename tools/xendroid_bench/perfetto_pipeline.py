@@ -140,6 +140,20 @@ def parse_xe_perf_log(log_text: str) -> dict[str, Any]:
     }
 
 
+def _row_rate(row: Any) -> tuple[int, float, float]:
+    total = int(getattr(row, "total_frames", 0) or 0)
+    first_ts = float(getattr(row, "first_ts", 0.0) or 0.0)
+    last_ts = float(getattr(row, "last_ts", 0.0) or 0.0)
+    wall_s = (last_ts - first_ts) / 1e9 if last_ts > first_ts else 0.0
+    fps = (total / wall_s) if wall_s > 0.5 else 0.0
+    return total, wall_s, fps
+
+
+def _is_sustained_rate(row: Any) -> bool:
+    total, wall_s, fps = _row_rate(row)
+    return total >= 50 and wall_s >= 5.0 and fps >= 10.0
+
+
 def _select_dominant_layer(candidates: list[Any], package: str = "") -> Any | None:
     best = None
     best_rank = None
@@ -218,7 +232,8 @@ def analyze_pftrace(
         picked_pkg = _select_dominant_layer(pkg_candidates, package=package)
         rows = [picked_pkg] if picked_pkg is not None else []
         matched_by = "package"
-        if not rows or not rows[0].total_frames:
+        picked_pkg_layer = str(getattr(picked_pkg, "layer_name", "") or "").lower()
+        if picked_pkg is None or "surfaceview" not in picked_pkg_layer:
             fallback_sql = """
             SELECT
               COUNT(*) AS total_frames,
@@ -238,9 +253,44 @@ def analyze_pftrace(
             ORDER BY total_frames DESC
             LIMIT 25;
             """
-            picked = _select_dominant_layer(list(tp.query(fallback_sql)), package=package)
-            rows = [picked] if picked is not None else []
-            matched_by = "dominant_layer_fallback"
+            fb_raw = list(tp.query(fallback_sql))
+            if picked_pkg is None:
+                picked_fb = _select_dominant_layer(fb_raw, package=package)
+                rows = [picked_fb] if picked_fb is not None else []
+                matched_by = "dominant_layer_fallback"
+            else:
+                pkg_key = (
+                    str(getattr(picked_pkg, "proc_name", "") or ""),
+                    str(getattr(picked_pkg, "layer_name", "") or ""),
+                )
+                fb_sustained = [
+                    c
+                    for c in fb_raw
+                    if (
+                        str(getattr(c, "proc_name", "") or ""),
+                        str(getattr(c, "layer_name", "") or ""),
+                    )
+                    != pkg_key
+                    and _is_sustained_rate(c)
+                    and not str(getattr(c, "layer_name", "") or "").lower().startswith("tx -")
+                ]
+                sf_candidates = [
+                    c
+                    for c in fb_sustained
+                    if "surfaceflinger" in str(getattr(c, "proc_name", "") or "").lower()
+                ]
+                picked_fb = _select_dominant_layer(sf_candidates, package=package)
+                if picked_fb is None:
+                    picked_fb = _select_dominant_layer(fb_sustained, package=package)
+                if picked_fb is not None and _is_sustained_rate(picked_fb):
+                    fb_total = int(getattr(picked_fb, "total_frames", 0) or 0)
+                    pkg_total = int(getattr(picked_pkg, "total_frames", 0) or 0)
+                    fb_proc = str(getattr(picked_fb, "proc_name", "") or "").lower()
+                    if fb_total >= 2 * pkg_total and (
+                        "surfaceflinger" in fb_proc or not _is_sustained_rate(picked_pkg)
+                    ):
+                        rows = [picked_fb]
+                        matched_by = "dominant_layer_fallback"
         if not rows or not rows[0].total_frames:
             return {
                 "available": True,

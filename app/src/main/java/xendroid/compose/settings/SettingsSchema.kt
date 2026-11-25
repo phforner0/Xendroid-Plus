@@ -47,7 +47,7 @@ object SettingsSchema {
                 "" to "None (no TU_DEBUG flags, GMEM)", "sysmem" to "sysmem (untiled, slower)",
                 "sysmem,nolrz" to "sysmem + nolrz (LRZ off, perf diagnostic)",
                 "sysmem,noubwc" to "sysmem + noubwc (UBWC off, perf diagnostic)"),
-            b("Vulkan", "vulkan_in_pass_resolve", "In-pass EDRAM resolve", true),
+            b("Vulkan", "vulkan_in_pass_resolve", "In-pass EDRAM resolve", false),
             b("Vulkan", "vulkan_resolve_to_texture_promote", "Resolve-to-texture: promote", true),
             b("Vulkan", "vulkan_resolve_to_texture", "Resolve-to-texture: store", true),
             b("Vulkan", "vulkan_resolve_to_texture_serve", "Resolve-to-texture: skip upload", true),

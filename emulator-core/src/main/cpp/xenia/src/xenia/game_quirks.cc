@@ -66,6 +66,11 @@ static const Quirk kQuirks[] = {
      "ir3 cannot compile fmadz"},
     {0x494707D4, "vulkan_in_pass_resolve", true, "in-pass resolves tuned here"},
     {0x49470804, "vulkan_in_pass_resolve", true, "in-pass resolves tuned here"},
+    // Red Dead Redemption: in-pass color resolves eliminate blocking stalls
+    // (0.5 -> 0.0) and reduce GPU frame time (28.5-29.7 -> 26.5 ms) with clean
+    // rendering on Adreno 825 / Turnip (Wave 5 factorial A/B, 2026-11-25).
+    {0x5454082B, "vulkan_in_pass_resolve", true,
+     "in-pass resolves reduce GPU time and blocking stalls"},
     {0x494707D4, "network_enabled", false, "hangs on a blocking recvfrom"},
     {0x49470804, "network_enabled", false, "hangs on a blocking recvfrom"},
     {0x4E4D083A, "spirv_multiply_zero_test_on_bits", true,

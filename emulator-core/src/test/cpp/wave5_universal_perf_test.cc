@@ -322,11 +322,19 @@ void TestSourceContracts(const fs::path& cpp_root) {
 
   const std::string vrtc = ReadSourceText(
       cpp_root / "xenia/src/xenia/gpu/vulkan/vulkan_render_target_cache.cc");
-  WAVE5_CHECK(vrtc.find("vulkan_in_pass_resolve, true,") != std::string::npos);
+  WAVE5_CHECK(vrtc.find("vulkan_in_pass_resolve, false,") != std::string::npos);
+  WAVE5_CHECK(vrtc.find("UPDATE_from_bool(vulkan_in_pass_resolve,") ==
+              std::string::npos);
   WAVE5_CHECK(vrtc.find("vulkan_in_pass_resolve_7e3, false,") !=
               std::string::npos);
   WAVE5_CHECK(vrtc.find("device_properties.fragmentStoresAndAtomics") !=
               std::string::npos);
+
+  const std::string quirks =
+      ReadSourceText(cpp_root / "xenia/src/xenia/game_quirks.cc");
+  WAVE5_CHECK(
+      quirks.find("{0x5454082B, \"vulkan_in_pass_resolve\", true,") !=
+      std::string::npos);
 
   const std::string apu =
       ReadSourceText(cpp_root / "xenia/src/xenia/apu/audio_system.cc");

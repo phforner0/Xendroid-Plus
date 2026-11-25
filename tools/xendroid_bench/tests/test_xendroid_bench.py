@@ -688,6 +688,81 @@ class XendroidBenchTests(unittest.TestCase):
         self.assertIsNotNone(chosen)
         self.assertEqual(chosen.proc_name, "xendroid.compose.fork")
 
+    def test_perfetto_hud_tx_layer_falls_back_to_surfaceflinger(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE process (upid INTEGER, name TEXT)")
+        conn.execute(
+            "CREATE TABLE actual_frame_timeline_slice (upid INTEGER, layer_name TEXT, ts INTEGER, dur INTEGER, jank_type TEXT)"
+        )
+        conn.execute("INSERT INTO process VALUES (1, 'xendroid.compose.fork:emu'), (2, '/system/bin/surfaceflinger')")
+        # Case 1: HUD TX layer at ~5.16 FPS (153 frames over 29.65s) vs SurfaceFlinger ~31.92 FPS (956 frames)
+        tx_step = int(29.65e9 / 153)
+        for i in range(153):
+            conn.execute(
+                "INSERT INTO actual_frame_timeline_slice VALUES (?, ?, ?, ?, ?)",
+                (1, "TX - xendroid.compose.fork/xendroid.compose.EmulatorHostActivity#12866", i * tx_step, 11_400_000, "None"),
+            )
+        sf_step = int(29.95e9 / 956)
+        for i in range(956):
+            conn.execute(
+                "INSERT INTO actual_frame_timeline_slice VALUES (?, ?, ?, ?, ?)",
+                (2, None, i * sf_step, 31_660_000, "None"),
+            )
+        conn.commit()
+
+        class _FakeTp:
+            def __init__(self, **_kw: object) -> None:
+                pass
+
+            def query(self, sql: str) -> list[types.SimpleNamespace]:
+                cur = conn.execute(sql)
+                cols = [d[0] for d in cur.description]
+                return [types.SimpleNamespace(**dict(zip(cols, row))) for row in cur.fetchall()]
+
+            def close(self) -> None:
+                pass
+
+        fake_pkg = types.ModuleType("perfetto")
+        fake_tp_mod = types.ModuleType("perfetto.trace_processor")
+        fake_tp_mod.TraceProcessor = _FakeTp
+        fake_tp_mod.TraceProcessorConfig = lambda **kw: kw
+        fake_pkg.trace_processor = fake_tp_mod
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                trace_p = pathlib.Path(tmp) / "hud_tx.pftrace"
+                trace_p.write_bytes(b"pf")
+                with mock.patch.dict(sys.modules, {"perfetto": fake_pkg, "perfetto.trace_processor": fake_tp_mod}):
+                    res1 = perfetto_pipeline.analyze_pftrace(trace_p, package="xendroid.compose.fork")
+                self.assertEqual(res1["matched_by"], "dominant_layer_fallback")
+                self.assertEqual(res1["proc_name"], "/system/bin/surfaceflinger")
+                self.assertEqual(res1["total_frames"], 956)
+                self.assertAlmostEqual(res1["fps"], 31.9, delta=0.3)
+
+                # Case 2: short TX burst (27 frames in 0.5s) vs SurfaceFlinger 1002 frames @ ~33.45 FPS
+                conn.execute("DELETE FROM actual_frame_timeline_slice")
+                burst_step = int(0.5e9 / 27)
+                for i in range(27):
+                    conn.execute(
+                        "INSERT INTO actual_frame_timeline_slice VALUES (?, ?, ?, ?, ?)",
+                        (1, "TX - xendroid.compose.fork/xendroid.compose.EmulatorHostActivity#12471", i * burst_step, 11_100_000, "None"),
+                    )
+                sf2_step = int(29.95e9 / 1002)
+                for i in range(1002):
+                    conn.execute(
+                        "INSERT INTO actual_frame_timeline_slice VALUES (?, ?, ?, ?, ?)",
+                        (2, None, i * sf2_step, 22_570_000, "None"),
+                    )
+                conn.commit()
+                with mock.patch.dict(sys.modules, {"perfetto": fake_pkg, "perfetto.trace_processor": fake_tp_mod}):
+                    res2 = perfetto_pipeline.analyze_pftrace(trace_p, package="xendroid.compose.fork")
+                self.assertEqual(res2["matched_by"], "dominant_layer_fallback")
+                self.assertEqual(res2["proc_name"], "/system/bin/surfaceflinger")
+                self.assertEqual(res2["total_frames"], 1002)
+                self.assertAlmostEqual(res2["fps"], 33.45, delta=0.3)
+        finally:
+            conn.close()
+
     def test_lazy_xex_pe_image_rejects_excessive_total_size_and_bounds_unencrypted_read(self) -> None:
         # 5 blocks with dsize=0, zsize=60 MiB each -> 300 MiB (> 256 MiB aggregate cap)
         comp_info = b"".join(struct.pack(">II", 0, 60 * 1024 * 1024) for _ in range(5))
