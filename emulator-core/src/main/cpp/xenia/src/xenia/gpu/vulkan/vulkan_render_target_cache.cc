@@ -15,6 +15,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
@@ -95,7 +98,7 @@ DEFINE_bool(
     "kGuestDrawReadWrite does not.",
     "Vulkan");
 DEFINE_bool(
-    vulkan_in_pass_resolve_7e3, false,
+    vulkan_in_pass_resolve_7e3, true,
     "With vulkan_in_pass_resolve: in-pass resolves also of 7e3 in the EDRAM "
     "(k_2_10_10_10_FLOAT) to k_2_10_10_10 from single-sampled sources, with "
     "the conversion of the direct path (the sample packed to the EDRAM format "
@@ -103,6 +106,7 @@ DEFINE_bool(
     "chains of tiny resolves. Read per resolve "
     "(debug.xendroid.in_pass_resolve_7e3 on Android).",
     "Vulkan");
+UPDATE_from_bool(vulkan_in_pass_resolve_7e3, 2026, 11, 25, 12, false);
 DEFINE_int32(
     vulkan_in_pass_resolve_debug_reject, 0,
     "DEBUG probe bitmask: 1 = reject multisampled sources, 2 = reject "
@@ -186,12 +190,13 @@ DEFINE_bool(
     "break. Disable for A/B measurement of the break count.",
     "Vulkan");
 DEFINE_bool(
-    vulkan_in_pass_resolve, false,
+    vulkan_in_pass_resolve, true,
     "Prepare color attachments for in-pass EDRAM resolves with "
     "VK_KHR_dynamic_rendering_local_read: RENDERING_LOCAL_READ image layout "
     "and input-attachment usage on color render targets. Requires dynamic "
     "rendering and driver support; no effect otherwise.",
     "Vulkan");
+UPDATE_from_bool(vulkan_in_pass_resolve, 2026, 11, 25, 12, false);
 
 DEFINE_bool(
     vulkan_direct_host_resolve, true,
@@ -1064,6 +1069,23 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
                                 &rt_pipeline_cache_);
     }
   }
+#if defined(__ANDROID__)
+  {
+    char in_pass_prop[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.in_pass_resolve", in_pass_prop) >
+        0) {
+      if (std::strcmp(in_pass_prop, "0") == 0 ||
+          std::strcmp(in_pass_prop, "false") == 0) {
+        cvars::vulkan_in_pass_resolve = false;
+        XELOGI("debug.xendroid.in_pass_resolve: vulkan_in_pass_resolve = false");
+      } else if (std::strcmp(in_pass_prop, "1") == 0 ||
+                 std::strcmp(in_pass_prop, "true") == 0) {
+        cvars::vulkan_in_pass_resolve = true;
+        XELOGI("debug.xendroid.in_pass_resolve: vulkan_in_pass_resolve = true");
+      }
+    }
+  }
+#endif
   local_read_attachments_ =
       cvars::vulkan_in_pass_resolve && cvars::vulkan_dynamic_rendering &&
       device_properties.dynamicRendering &&

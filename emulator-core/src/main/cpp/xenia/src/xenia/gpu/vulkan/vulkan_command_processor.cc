@@ -2812,6 +2812,8 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t fetch_slot_bit_clear = ~(uint32_t(1) << fetch_slot);
       current_samplers_fetch_up_to_date_vertex_ &= fetch_slot_bit_clear;
       current_samplers_fetch_up_to_date_pixel_ &= fetch_slot_bit_clear;
+      xendroid::InvalidatePixelSpecCacheFetches(pixel_spec_cache_,
+                                                fetch_slot_bit_clear);
       fetch_constants_decode_needed_ |= ~fetch_slot_bit_clear;
       if (texture_cache_) {
         texture_cache_->TextureFetchConstantWritten(fetch_slot);
@@ -2897,6 +2899,8 @@ void VulkanCommandProcessor::WriteFetchFromMem(uint32_t start_index,
       uint32_t slot_bit_clear = ~(UINT32_C(1) << slot);
       current_samplers_fetch_up_to_date_vertex_ &= slot_bit_clear;
       current_samplers_fetch_up_to_date_pixel_ &= slot_bit_clear;
+      xendroid::InvalidatePixelSpecCacheFetches(pixel_spec_cache_,
+                                                slot_bit_clear);
       fetch_constants_decode_needed_ |= ~slot_bit_clear;
     }
     if (texture_cache_) {
@@ -2929,6 +2933,8 @@ void VulkanCommandProcessor::WriteFetchFromMem(uint32_t start_index,
       uint32_t slot_bit_clear = ~(UINT32_C(1) << slot);
       current_samplers_fetch_up_to_date_vertex_ &= slot_bit_clear;
       current_samplers_fetch_up_to_date_pixel_ &= slot_bit_clear;
+      xendroid::InvalidatePixelSpecCacheFetches(pixel_spec_cache_,
+                                                slot_bit_clear);
       fetch_constants_decode_needed_ |= ~slot_bit_clear;
       if (texture_cache_) {
         texture_cache_->TextureFetchConstantWritten(slot);
@@ -7399,80 +7405,102 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // texture (taking the signs as unsigned), the classes made known (unsigned
   // or gamma) give the same zeros.
   uint32_t texture_sign_classes = 0;
-  if (pixel_shader && cvars::spirv_texture_sign_specialization &&
-      cvars::vulkan_texture_sign_classes) {
-    // The slots the translator gave the fetch constants.
-    std::array<uint8_t, 32> texture_sign_class_slots;
-    SpirvShaderTranslator::GetTextureSignClassSlots(
-        *pixel_shader, cvars::spirv_texture_sign_specialization_used,
-        texture_sign_class_slots);
-    for (const Shader::TextureBinding& texture_binding :
-         pixel_shader->texture_bindings()) {
-      const uint32_t fetch_constant = texture_binding.fetch_constant;
-      const uint32_t slot = texture_sign_class_slots[fetch_constant];
-      if (slot >= SpirvShaderTranslator::kTextureSignClassFetchConstantCount) {
-        continue;
-      }
-      texture_sign_classes |=
-          SpirvShaderTranslator::GetTextureSignClass(texture_util::SwizzleSigns(
-              regs.GetTextureFetch(fetch_constant)))
-          << (2 * slot);
-    }
-  }
-  pipeline_cache_->SetTextureSignClasses(texture_sign_classes);
-  // Whether every texture of the pixel shader has a zero exponent adjustment
-  // (spirv_texture_exp_adjust_specialization; word 3 bits 13:18).
   bool texture_exp_adjust_zero = false;
-  if (pixel_shader && cvars::spirv_texture_exp_adjust_specialization) {
-    texture_exp_adjust_zero = true;
-    for (const Shader::TextureBinding& texture_binding :
-         pixel_shader->texture_bindings()) {
-      if (regs.GetTextureFetch(texture_binding.fetch_constant).exp_adjust) {
-        texture_exp_adjust_zero = false;
-        break;
-      }
-    }
-  }
-  pipeline_cache_->SetTextureExpAdjustZero(texture_exp_adjust_zero);
-
-  // spirv_texture_iscale_specialization: 32-bit mask of fetch constants whose
-  // texture_integer_scale_bits may be non-zero for this draw. Specializing to 0
-  // folds away the UBO load and conversion/snap branches in the 99% common
-  // case.
   uint32_t texture_integer_scale_used = UINT32_MAX;
-  if (pixel_shader && cvars::spirv_texture_iscale_specialization) {
-    texture_integer_scale_used = 0;
+  if (pixel_shader) {
+    const bool do_sign = cvars::spirv_texture_sign_specialization &&
+                         cvars::vulkan_texture_sign_classes;
+    const bool do_sign_used = cvars::spirv_texture_sign_specialization_used;
+    const bool do_exp = cvars::spirv_texture_exp_adjust_specialization;
+    const bool do_iscale = cvars::spirv_texture_iscale_specialization;
     const bool check_num_format = cvars::texture_integer_num_format;
     const bool check_point_snap =
         cvars::texture_point_snap && texture_cache_->IsDrawResolutionScaled();
-    if (check_num_format || check_point_snap) {
-      for (const Shader::TextureBinding& texture_binding :
-           pixel_shader->texture_bindings()) {
-        const uint32_t fetch_constant = texture_binding.fetch_constant;
-        const xenos::xe_gpu_texture_fetch_t fetch =
-            regs.GetTextureFetch(fetch_constant);
-        bool slot_used = false;
-        if (check_num_format) {
-          const FormatInfo* fmt_info = FormatInfo::Get(fetch.format);
-          if (fmt_info && fmt_info->type == FormatType::kUncompressed) {
-            slot_used = true;
+    const uint32_t spec_flags =
+        (uint32_t(do_sign) << 0) | (uint32_t(do_sign_used) << 1) |
+        (uint32_t(do_exp) << 2) | (uint32_t(do_iscale) << 3) |
+        (uint32_t(check_num_format) << 4) | (uint32_t(check_point_snap) << 5);
+    const bool bindings_ready = pixel_shader->bindings_ready();
+    const uint32_t used_mask =
+        bindings_ready ? pixel_shader->GetUsedTextureMaskAfterTranslation()
+                       : UINT32_MAX;
+    if (bindings_ready &&
+        xendroid::EvaluatePixelSpecCacheHit(pixel_spec_cache_, pixel_shader,
+                                            spec_flags, used_mask)) {
+      texture_sign_classes = current_pixel_spec_sign_classes_;
+      texture_exp_adjust_zero = current_pixel_spec_exp_adjust_zero_;
+      texture_integer_scale_used = current_pixel_spec_iscale_used_;
+    } else {
+      if (do_sign &&
+          (pixel_spec_cache_.shader != pixel_shader ||
+           ((pixel_spec_cache_.flags_key ^ spec_flags) & 0x3u) != 0)) {
+        SpirvShaderTranslator::GetTextureSignClassSlots(
+            *pixel_shader, do_sign_used, current_pixel_spec_sign_slots_);
+      }
+      texture_exp_adjust_zero = do_exp;
+      if (do_iscale) {
+        texture_integer_scale_used = 0;
+      }
+      const bool need_iscale_loop =
+          do_iscale && (check_num_format || check_point_snap);
+      if (do_sign || do_exp || need_iscale_loop) {
+        for (const Shader::TextureBinding& texture_binding :
+             pixel_shader->texture_bindings()) {
+          const uint32_t fetch_constant = texture_binding.fetch_constant;
+          const xenos::xe_gpu_texture_fetch_t fetch =
+              regs.GetTextureFetch(fetch_constant);
+          if (do_sign) {
+            const uint32_t slot =
+                current_pixel_spec_sign_slots_[fetch_constant];
+            if (slot <
+                SpirvShaderTranslator::kTextureSignClassFetchConstantCount) {
+              texture_sign_classes |=
+                  SpirvShaderTranslator::GetTextureSignClass(
+                      texture_util::SwizzleSigns(fetch))
+                  << (2 * slot);
+            }
+          }
+          if (do_exp && fetch.exp_adjust) {
+            texture_exp_adjust_zero = false;
+          }
+          if (need_iscale_loop) {
+            bool slot_used = false;
+            if (check_num_format) {
+              const FormatInfo* fmt_info = FormatInfo::Get(fetch.format);
+              if (fmt_info && fmt_info->type == FormatType::kUncompressed) {
+                slot_used = true;
+              }
+            }
+            if (!slot_used && check_point_snap) {
+              if (fetch.mag_filter == xenos::TextureFilter::kPoint &&
+                  fetch.min_filter == xenos::TextureFilter::kPoint &&
+                  (fetch.mip_filter == xenos::TextureFilter::kPoint ||
+                   fetch.mip_filter == xenos::TextureFilter::kBaseMap) &&
+                  fetch.aniso_filter == xenos::AnisoFilter::kDisabled) {
+                slot_used = true;
+              }
+            }
+            if (slot_used) {
+              texture_integer_scale_used |= UINT32_C(1) << fetch_constant;
+            }
           }
         }
-        if (!slot_used && check_point_snap) {
-          if (fetch.mag_filter == xenos::TextureFilter::kPoint &&
-              fetch.min_filter == xenos::TextureFilter::kPoint &&
-              (fetch.mip_filter == xenos::TextureFilter::kPoint ||
-               fetch.mip_filter == xenos::TextureFilter::kBaseMap) &&
-              fetch.aniso_filter == xenos::AnisoFilter::kDisabled) {
-            slot_used = true;
-          }
-        }
-        if (slot_used) {
-          texture_integer_scale_used |= UINT32_C(1) << fetch_constant;
-        }
+      }
+      if (bindings_ready) {
+        pixel_spec_cache_.shader = pixel_shader;
+        pixel_spec_cache_.flags_key = spec_flags;
+        pixel_spec_cache_.fetch_up_to_date = ~uint32_t(0);
+        current_pixel_spec_sign_classes_ = texture_sign_classes;
+        current_pixel_spec_exp_adjust_zero_ = texture_exp_adjust_zero;
+        current_pixel_spec_iscale_used_ = texture_integer_scale_used;
+      } else {
+        pixel_spec_cache_.shader = nullptr;
+        pixel_spec_cache_.fetch_up_to_date = 0;
       }
     }
   }
+  pipeline_cache_->SetTextureSignClasses(texture_sign_classes);
+  pipeline_cache_->SetTextureExpAdjustZero(texture_exp_adjust_zero);
   pipeline_cache_->SetTextureIntegerScaleUsed(texture_integer_scale_used);
 
   const bool memexport_only_compute =
@@ -10921,6 +10949,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // through their per-submission UseSampler revalidation independently).
     current_samplers_fetch_up_to_date_vertex_ = 0;
     current_samplers_fetch_up_to_date_pixel_ = 0;
+    pixel_spec_cache_.fetch_up_to_date = 0;
 
     // Log guest ZPD report stats every 100 frames.
     if (GetZPDMode() != ZPDMode::kFake && cvars::occlusion_query_log &&
@@ -12594,20 +12623,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X],
                     sizeof(float) * 4 * 256);
       } else {
-        for (uint32_t i = 0; i < 4; ++i) {
-          uint64_t float_constant_map_entry =
-              current_float_constant_map_vertex_[i];
-          uint32_t float_constant_index;
-          while (xe::bit_scan_forward(float_constant_map_entry,
-                                      &float_constant_index)) {
-            float_constant_map_entry &= ~(1ull << float_constant_index);
-            std::memcpy(mapping,
-                        &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) +
-                              (float_constant_index << 2)],
-                        sizeof(float) * 4);
-            mapping += sizeof(float) * 4;
-          }
-        }
+        xendroid::PackFloatConstantsByRuns(
+            mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X],
+            current_float_constant_map_vertex_);
       }
       current_constant_buffers_up_to_date_ |=
           UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex;
@@ -12629,20 +12647,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         return false;
       }
       buffer_info.range = VkDeviceSize(float_constants_range);
-      for (uint32_t i = 0; i < 4; ++i) {
-        uint64_t float_constant_map_entry =
-            current_float_constant_map_pixel_[i];
-        uint32_t float_constant_index;
-        while (xe::bit_scan_forward(float_constant_map_entry,
-                                    &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          std::memcpy(mapping,
-                      &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) +
-                            (float_constant_index << 2)],
-                      sizeof(float) * 4);
-          mapping += sizeof(float) * 4;
-        }
-      }
+      xendroid::PackFloatConstantsByRuns(
+          mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X],
+          current_float_constant_map_pixel_);
       current_constant_buffers_up_to_date_ |=
           UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel;
     }
@@ -12870,30 +12877,87 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       texture_cache_->ResetTextureBindingsChanged(used_texture_mask_vertex |
                                                   used_texture_mask_pixel);
     } else {
-      // XenDroid's content-hash gate (default).
+      // XenDroid's content-hash gate with an O(1) consecutive-draw fast path
+      // when shader, bound texture views, image usage/layouts, and samplers are
+      // unchanged since the previous draw's snapshot.
+      const uint32_t textures_changed_v =
+          texture_cache_->texture_bindings_changed_vertex();
+      const uint32_t textures_changed_p =
+          texture_cache_->texture_bindings_changed_pixel();
+      const uint64_t tex_usage_gen =
+          texture_cache_->texture_usage_generation();
+      const uint64_t sampler_gen =
+          texture_cache_->sampler_destroy_generation();
+      const uint32_t used_mask_v =
+          vertex_bindings_ready
+              ? vertex_shader->GetUsedTextureMaskAfterTranslation()
+              : 0;
+      const uint32_t used_mask_p =
+          (pixel_shader && pixel_bindings_ready)
+              ? pixel_shader->GetUsedTextureMaskAfterTranslation()
+              : 0;
       // Vertex stage.
       if (texture_count_vertex || sampler_count_vertex) {
-        texture_set_hash_vertex = compute_texture_set_hash(
-            texture_count_vertex, sampler_count_vertex, true, &textures_vertex,
-            texture_cache_.get(), current_samplers_vertex_);
-        if (!current_texture_descriptor_set_hash_valid_vertex_ ||
-            texture_set_hash_vertex !=
-                current_texture_descriptor_set_hash_vertex_) {
-          current_graphics_descriptor_set_values_up_to_date_ &= ~(
-              UINT32_C(1)
-              << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
+        const bool vs_fast_hit =
+            (current_graphics_descriptor_set_values_up_to_date_ &
+             (UINT32_C(1)
+              << SpirvShaderTranslator::kDescriptorSetTexturesVertex)) &&
+            current_texture_descriptor_set_hash_valid_vertex_ &&
+            vertex_bindings_ready && !interpreter_placeholder &&
+            current_textures_vertex_shader_ == vertex_shader &&
+            !(textures_changed_v & used_mask_v) &&
+            current_texture_set_usage_gen_vertex_ == tex_usage_gen &&
+            current_texture_set_sampler_gen_vertex_ == sampler_gen &&
+            current_written_samplers_vertex_ == current_samplers_vertex_;
+        if (!vs_fast_hit) {
+          texture_set_hash_vertex = compute_texture_set_hash(
+              texture_count_vertex, sampler_count_vertex, true, &textures_vertex,
+              texture_cache_.get(), current_samplers_vertex_);
+          if (!current_texture_descriptor_set_hash_valid_vertex_ ||
+              texture_set_hash_vertex !=
+                  current_texture_descriptor_set_hash_vertex_) {
+            current_graphics_descriptor_set_values_up_to_date_ &= ~(
+                UINT32_C(1)
+                << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
+          } else {
+            current_textures_vertex_shader_ = vertex_shader;
+            current_written_samplers_vertex_ = current_samplers_vertex_;
+            current_texture_set_usage_gen_vertex_ = tex_usage_gen;
+            current_texture_set_sampler_gen_vertex_ = sampler_gen;
+            texture_cache_->ResetTextureBindingsChangedVertex(used_mask_v);
+          }
         }
       }
       // Pixel stage.
       if (texture_count_pixel || sampler_count_pixel) {
-        texture_set_hash_pixel = compute_texture_set_hash(
-            texture_count_pixel, sampler_count_pixel, false, textures_pixel,
-            texture_cache_.get(), current_samplers_pixel_);
-        if (!current_texture_descriptor_set_hash_valid_pixel_ ||
-            texture_set_hash_pixel !=
-                current_texture_descriptor_set_hash_pixel_) {
-          current_graphics_descriptor_set_values_up_to_date_ &= ~(
-              UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+        const bool ps_fast_hit =
+            (current_graphics_descriptor_set_values_up_to_date_ &
+             (UINT32_C(1)
+              << SpirvShaderTranslator::kDescriptorSetTexturesPixel)) &&
+            current_texture_descriptor_set_hash_valid_pixel_ &&
+            pixel_bindings_ready && !placeholder_pixel_shader &&
+            current_textures_pixel_shader_ == pixel_shader &&
+            !(textures_changed_p & used_mask_p) &&
+            current_texture_set_usage_gen_pixel_ == tex_usage_gen &&
+            current_texture_set_sampler_gen_pixel_ == sampler_gen &&
+            current_written_samplers_pixel_ == current_samplers_pixel_;
+        if (!ps_fast_hit) {
+          texture_set_hash_pixel = compute_texture_set_hash(
+              texture_count_pixel, sampler_count_pixel, false, textures_pixel,
+              texture_cache_.get(), current_samplers_pixel_);
+          if (!current_texture_descriptor_set_hash_valid_pixel_ ||
+              texture_set_hash_pixel !=
+                  current_texture_descriptor_set_hash_pixel_) {
+            current_graphics_descriptor_set_values_up_to_date_ &= ~(
+                UINT32_C(1)
+                << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+          } else {
+            current_textures_pixel_shader_ = pixel_shader;
+            current_written_samplers_pixel_ = current_samplers_pixel_;
+            current_texture_set_usage_gen_pixel_ = tex_usage_gen;
+            current_texture_set_sampler_gen_pixel_ = sampler_gen;
+            texture_cache_->ResetTextureBindingsChangedPixel(used_mask_p);
+          }
         }
       }
     }
@@ -12971,6 +13035,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         current_written_samplers_vertex_ = current_samplers_vertex_;
         current_texture_descriptor_set_hash_vertex_ = texture_set_hash_vertex;
         current_texture_descriptor_set_hash_valid_vertex_ = true;
+        current_texture_set_usage_gen_vertex_ =
+            texture_cache_->texture_usage_generation();
+        current_texture_set_sampler_gen_vertex_ =
+            texture_cache_->sampler_destroy_generation();
+        if (vertex_bindings_ready && !interpreter_placeholder) {
+          texture_cache_->ResetTextureBindingsChangedVertex(
+              vertex_shader->GetUsedTextureMaskAfterTranslation());
+        }
         ++vk_frame_sync_stats_.texture_set_reuses;
       }
     }
@@ -12986,6 +13058,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         current_written_samplers_pixel_ = current_samplers_pixel_;
         current_texture_descriptor_set_hash_pixel_ = texture_set_hash_pixel;
         current_texture_descriptor_set_hash_valid_pixel_ = true;
+        current_texture_set_usage_gen_pixel_ =
+            texture_cache_->texture_usage_generation();
+        current_texture_set_sampler_gen_pixel_ =
+            texture_cache_->sampler_destroy_generation();
+        if (pixel_shader && pixel_bindings_ready && !placeholder_pixel_shader) {
+          texture_cache_->ResetTextureBindingsChangedPixel(
+              pixel_shader->GetUsedTextureMaskAfterTranslation());
+        }
         ++vk_frame_sync_stats_.texture_set_reuses;
       }
     }
@@ -13257,6 +13337,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       // change).
       current_texture_descriptor_set_hash_vertex_ = texture_set_hash_vertex;
       current_texture_descriptor_set_hash_valid_vertex_ = true;
+      current_texture_set_usage_gen_vertex_ =
+          texture_cache_->texture_usage_generation();
+      current_texture_set_sampler_gen_vertex_ =
+          texture_cache_->sampler_destroy_generation();
+      if (vertex_bindings_ready && !interpreter_placeholder) {
+        texture_cache_->ResetTextureBindingsChangedVertex(
+            vertex_shader->GetUsedTextureMaskAfterTranslation());
+      }
     }
   }
   // Pixel shader textures and samplers.
@@ -13298,6 +13386,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     } else {
       current_texture_descriptor_set_hash_pixel_ = texture_set_hash_pixel;
       current_texture_descriptor_set_hash_valid_pixel_ = true;
+      current_texture_set_usage_gen_pixel_ =
+          texture_cache_->texture_usage_generation();
+      current_texture_set_sampler_gen_pixel_ =
+          texture_cache_->sampler_destroy_generation();
+      if (pixel_shader && pixel_bindings_ready && !placeholder_pixel_shader) {
+        texture_cache_->ResetTextureBindingsChangedPixel(
+            pixel_shader->GetUsedTextureMaskAfterTranslation());
+      }
     }
   }
   // Write.

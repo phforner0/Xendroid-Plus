@@ -312,6 +312,22 @@ class VulkanTextureCache final : public TextureCache {
   void ResetTextureBindingsChanged(uint32_t mask) {
     texture_bindings_changed_ &= ~mask;
   }
+  uint32_t texture_bindings_changed_vertex() const {
+    return texture_bindings_changed_vertex_;
+  }
+  uint32_t texture_bindings_changed_pixel() const {
+    return texture_bindings_changed_pixel_;
+  }
+  void ResetTextureBindingsChangedVertex(uint32_t mask) {
+    texture_bindings_changed_vertex_ &= ~mask;
+  }
+  void ResetTextureBindingsChangedPixel(uint32_t mask) {
+    texture_bindings_changed_pixel_ &= ~mask;
+  }
+  uint64_t texture_usage_generation() const {
+    return texture_usage_generation_;
+  }
+  void IncrementTextureUsageGeneration() { ++texture_usage_generation_; }
 
   SamplerParameters GetSamplerParameters(
       const VulkanShader::SamplerBinding& binding) const;
@@ -603,11 +619,7 @@ class VulkanTextureCache final : public TextureCache {
     void SetPendingStorageWrite() { pending_storage_write_ = true; }
 
     // Doesn't transition (the caller must insert the barrier).
-    Usage SetUsage(Usage new_usage) {
-      Usage old_usage = usage_;
-      usage_ = new_usage;
-      return old_usage;
-    }
+    Usage SetUsage(Usage new_usage);
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle,
                         bool is_array = true);
@@ -805,6 +817,9 @@ class VulkanTextureCache final : public TextureCache {
   // Accumulated mask of fetch constants whose host image views were rewritten,
   // consumed by the command processor to decide texture descriptor set reuse.
   uint32_t texture_bindings_changed_ = 0;
+  uint32_t texture_bindings_changed_vertex_ = 0;
+  uint32_t texture_bindings_changed_pixel_ = 0;
+  uint64_t texture_usage_generation_ = 0;
 
   // If both images can be placed in the same allocation, it's one allocation,
   // otherwise it's two separate.

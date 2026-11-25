@@ -3461,6 +3461,8 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(
   // These image views are about to change - let the command processor know the
   // texture descriptor sets referencing them need to be rewritten.
   texture_bindings_changed_ |= fetch_constant_mask;
+  texture_bindings_changed_vertex_ |= fetch_constant_mask;
+  texture_bindings_changed_pixel_ |= fetch_constant_mask;
   uint32_t bindings_remaining = fetch_constant_mask;
   uint32_t binding_index;
   while (xe::bit_scan_forward(bindings_remaining, &binding_index)) {
@@ -3511,6 +3513,17 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(
   vmaGetAllocationInfo(texture_cache.vma_allocator_, allocation_,
                        &allocation_info);
   SetHostMemoryUsage(uint64_t(allocation_info.size));
+}
+
+VulkanTextureCache::VulkanTexture::Usage
+VulkanTextureCache::VulkanTexture::SetUsage(Usage new_usage) {
+  Usage old_usage = usage_;
+  if (old_usage != new_usage) {
+    usage_ = new_usage;
+    static_cast<VulkanTextureCache&>(texture_cache())
+        .IncrementTextureUsageGeneration();
+  }
+  return old_usage;
 }
 
 VkImageView VulkanTextureCache::VulkanTexture::GetLoadStorageLevelView(

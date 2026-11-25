@@ -29,6 +29,7 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/hash.h"
+#include "../../../../../xe_wave5_perf_logic.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -1523,6 +1524,12 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint64_t current_samplers_submission_pixel_ = 0;
   uint64_t current_samplers_destroy_generation_ = ~uint64_t(0);
 
+  xendroid::PixelSpecCacheState pixel_spec_cache_{};
+  std::array<uint8_t, 32> current_pixel_spec_sign_slots_{};
+  uint32_t current_pixel_spec_sign_classes_ = 0;
+  bool current_pixel_spec_exp_adjust_zero_ = false;
+  uint32_t current_pixel_spec_iscale_used_ = UINT32_MAX;
+
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
   // but in_render_pass_ is true.
@@ -1647,6 +1654,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint64_t current_texture_descriptor_set_hash_pixel_ = 0;
   bool current_texture_descriptor_set_hash_valid_vertex_ = false;
   bool current_texture_descriptor_set_hash_valid_pixel_ = false;
+  uint64_t current_texture_set_usage_gen_vertex_ = UINT64_MAX;
+  uint64_t current_texture_set_usage_gen_pixel_ = UINT64_MAX;
+  uint64_t current_texture_set_sampler_gen_vertex_ = UINT64_MAX;
+  uint64_t current_texture_set_sampler_gen_pixel_ = UINT64_MAX;
   // Scratch buffer for compute_texture_set_hash, reused across draws (cleared
   // each call, capacity persists) to gather the reuse-input words for a single
   // XXH3 call without a per-draw allocation. GPU-command-thread-only.
