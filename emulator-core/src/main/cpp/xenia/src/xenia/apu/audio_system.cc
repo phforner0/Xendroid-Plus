@@ -14,6 +14,7 @@
 #include "xenia/apu/apu_flags.h"
 #include "xenia/apu/audio_driver.h"
 #include "xenia/apu/xma_decoder.h"
+#include "../../../../xe_wave5_perf_logic.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
 #if XE_PLATFORM_xendroid
@@ -59,11 +60,12 @@
 
 DECLARE_bool(apu_aaudio_log_stats);
 
-DEFINE_uint32(apu_max_queued_frames, 8,
+DEFINE_uint32(apu_max_queued_frames, 12,
               "Allows changing max buffered audio frames to reduce audio "
               "delay. Lowering this value might cause performance issues. "
               "Value range: [4-64]",
               "APU");
+UPDATE_from_uint32(apu_max_queued_frames, 2026, 11, 25, 12, 8);
 DEFINE_bool(apu_pump_topup, true,
             "Let the audio buffer refill at up to twice real time while it is "
             "running low, instead of only one frame per 5.33ms interval.",
@@ -383,13 +385,7 @@ void AudioSystem::WorkerThreadMain() {
   // a pause: blocks refilled beyond the usual depth, when they were last
   // added, when the last stall was, and whether the queue has reached the
   // usual depth since that start.
-  struct AdaptiveQueue {
-    size_t extra = 0;
-    std::chrono::steady_clock::time_point grown;
-    std::chrono::steady_clock::time_point since;
-    bool filled = false;
-  };
-  AdaptiveQueue adaptive_queues[kMaximumClientCount];
+  xendroid::AudioAdaptiveState adaptive_queues[kMaximumClientCount];
 
   // The host mixer releases a client's semaphore on its own coarse cadence,
   // but Xenos audio subsystem operates at 5.333ms interval (see
@@ -648,73 +644,57 @@ void AudioSystem::WorkerThreadMain() {
           driver = clients_[client_index].driver;
         }
       }
-      // Refill to above the driver's rate-control depth, or playback slows at
-      // a depth this loop is happy to sit at.
+      // Keep calm-scene baseline latency low (4 blocks = 21.3 ms) and reserve
+      // the remaining queued_frames_ headroom for apu_adaptive_queue spikes.
+      const size_t deepest =
+          queued_frames_ > 1 ? size_t(queued_frames_ - 1) : 1;
       const size_t topup_base =
           cvars::apu_queue_target > 0
               ? std::max<size_t>(
-                    std::min<size_t>(size_t(cvars::apu_queue_target),
-                                     queued_frames_ - 1),
-                    4)
-              : std::max<size_t>(queued_frames_ / 2, 4);
+                    std::min<size_t>(size_t(cvars::apu_queue_target), deepest),
+                    std::min<size_t>(4, deepest))
+              : std::min<size_t>(4, deepest);
       // 0 from a driver that does not report it, which keeps topping up.
       const size_t depth = driver ? driver->GetQueuedFrameCount() : 0;
-      // apu_adaptive_queue: deeper after a stall - this pump this late, or
-      // the guest's callback this slow - that used up half of what the queue
-      // covers, or after finding it nearly dry. Stalls come in runs (a heavy
-      // scene), so the next one finds the deeper queue. Only pumps that
-      // brought a block count: the top-up follows those alone, and a guest
-      // with nothing to submit drains the queue without any stall.
-      AdaptiveQueue& adaptive = adaptive_queues[client_index];
-      if (!earliest_pump_us) {
-        // The client's first pump, or the first after a pause.
-        adaptive = AdaptiveQueue();
+      const uint64_t adapt_now_ms = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+      const uint64_t stall_us = std::max(pump_late_us, exec_us);
+      const bool adaptive_active = cvars::apu_adaptive_queue &&
+                                   cvars::apu_pump_topup && driver &&
+                                   driver->ReportsQueuedFrameCount();
+      const auto adaptive_step = xendroid::StepAudioAdaptiveQueue(
+          adaptive_queues[client_index], adaptive_active,
+          earliest_pump_us != 0, submitted, depth, topup_base, deepest,
+          stall_us, kAudioPumpInterval, adapt_now_ms);
+      if (adaptive_step.grew) {
+        XELOGI(
+            "AudioWorker: a {} us stall with {} blocks queued, refilling to "
+            "{} blocks",
+            stall_us, depth, adaptive_step.target_blocks);
       }
-      if (cvars::apu_adaptive_queue && cvars::apu_pump_topup && driver &&
-          driver->ReportsQueuedFrameCount()) {
-        const auto adapt_now = std::chrono::steady_clock::now();
-        const size_t deepest = queued_frames_ - 1;
-        const size_t target = topup_base + adaptive.extra;
-        const uint64_t stall_us = std::max(pump_late_us, exec_us);
-        // Until the queue first reaches the usual depth it is still filling:
-        // a queue that low, or a slow first callback, is the start, not a
-        // stall.
-        if (depth >= topup_base) {
-          adaptive.filled = true;
-        }
-        const bool stressed =
-            submitted && adaptive.filled &&
-            (depth <= 1 || stall_us * 2 >= target * kAudioPumpInterval);
-        if (stressed && target < deepest &&
-            adapt_now - adaptive.grown >= std::chrono::milliseconds(500)) {
-          adaptive.extra = std::min(adaptive.extra + 2, deepest - topup_base);
-          adaptive.grown = adapt_now;
-          adaptive.since = adapt_now;
-          XELOGI(
-              "AudioWorker: a {} us stall with {} blocks queued, refilling to "
-              "{} blocks",
-              stall_us, depth, topup_base + adaptive.extra);
-        } else if (stressed) {
-          adaptive.since = adapt_now;
-        } else if (adaptive.extra &&
-                   adapt_now - adaptive.since >= std::chrono::seconds(20)) {
-          --adaptive.extra;
-          adaptive.since = adapt_now;
-        }
-      } else {
-        adaptive = AdaptiveQueue();
+      const size_t topup_below = adaptive_step.target_blocks;
+      if (driver && driver->ReportsQueuedFrameCount()) {
+        driver->SetTargetQueueDepth(topup_below);
       }
-      // The extra stays within the credits when the base is raised at run time.
-      const size_t topup_below =
-          std::max(topup_base, std::min<size_t>(topup_base + adaptive.extra,
-                                                queued_frames_ - 1));
       if (submitted && cvars::apu_pump_topup && driver && !paused_ &&
           worker_running_ && depth < topup_below &&
           xe::threading::Wait(client_semaphores_[client_index].get(), false,
                               std::chrono::milliseconds(0)) ==
               xe::threading::WaitResult::kSuccess) {
-        run_callback();
+        const uint64_t topup_us = run_callback();
         ++pump_stats.topups;
+        if (xendroid::ShouldRunEmergencySecondAudioTopup(
+                driver->GetQueuedFrameCount(), topup_below, exec_us + topup_us,
+                kAudioPumpInterval) &&
+            !paused_ && worker_running_ &&
+            xe::threading::Wait(client_semaphores_[client_index].get(), false,
+                                std::chrono::milliseconds(0)) ==
+                xe::threading::WaitResult::kSuccess) {
+          run_callback();
+          ++pump_stats.topups;
+        }
       }
     }
   }

@@ -8,6 +8,7 @@
  */
 #include "xe_aaudio_audio_driver.h"
 #include "audio_runtime.h"
+#include "xe_wave5_perf_logic.h"
 
 #include <algorithm>
 #include <atomic>
@@ -323,14 +324,17 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
   // Dynamic rate control:
   // - Below kRateControlDepth (3 blocks): bend pitch down toward 0.90x instead
   //   of gapping/clicking.
-  // - Above kHighQueueDrainDepth (6 blocks): gently drain post-pause / catch-up
-  //   backlog at 1.005x (+8.6 cents, inaudible) back to steady-state latency.
+  // - Above high_drain_depth (at least kHighQueueDrainDepth and above the
+  //   adaptive target): gently drain backlog at 1.005x (+8.6 cents).
   float rate_target = 1.0f;
   if (cvars::apu_aaudio_dynamic_rate) {
+    const uint32_t high_drain_depth = xendroid::ComputeAAudioHighDrainDepth(
+        kHighQueueDrainDepth,
+        driver->target_queue_depth_.load(std::memory_order_relaxed));
     if (depth_now < kRateControlDepth) {
       rate_target =
           std::max(0.90f, 1.0f - 0.05f * float(kRateControlDepth - depth_now));
-    } else if (depth_now > kHighQueueDrainDepth) {
+    } else if (depth_now > high_drain_depth) {
       rate_target = 1.005f;
     }
   }

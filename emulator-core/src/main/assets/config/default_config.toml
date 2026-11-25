@@ -2,7 +2,7 @@
 apu = "aaudio"                                    	# Audio system. Use: [any, nop, opensles, aaudio]
 apu_aaudio_buffer_bursts = 4                      	# Depth of the Android audio buffer, in device bursts. Higher rides out emulator slowdowns without dropping audio, at the cost of latency.
 apu_aaudio_log_stats = false                      	# Log Android audio callback statistics (gaps, queue depth, underruns) once a second.
-apu_max_queued_frames = 8                         	# Allows changing max buffered audio frames to reduce audio delay. Lowering this value might cause performance issues. Value range: [4-64]
+apu_max_queued_frames = 12                        	# Allows changing max buffered audio frames to reduce audio delay. Lowering this value might cause performance issues. Value range: [4-64]
 enable_xmp = true                                 	# Enables Music Player playback.
 ffmpeg_verbose = false                            	# Verbose FFmpeg output (debug and above)
 mute = false                                      	# Mutes all audio output.

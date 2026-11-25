@@ -342,7 +342,7 @@ object SettingsSchema {
             b("APU", "apu_performance_hint", "Audio performance hint (ADPF)", true),
             i("Console", "xmp_default_volume", "XMP default volume", 70, 0, 100),
             b("APU", "ffmpeg_verbose", "FFmpeg verbose", false),
-            i("APU", "apu_max_queued_frames", "Max queued frames", 8, 4, 64),
+            i("APU", "apu_max_queued_frames", "Max queued frames", 12, 4, 64),
             i("APU", "apu_aaudio_buffer_bursts", "Audio buffer depth", 4, 2, 8),
             // 15j: grows after underruns, back to the depth above after quiet stretches.
             b("APU", "apu_aaudio_adaptive_buffer", "Adaptive audio buffer", false),

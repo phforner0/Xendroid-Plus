@@ -49,6 +49,10 @@ class AAudioAudioDriver : public AudioDriver {
   void SetVolume(float volume) override;
   size_t GetQueuedFrameCount() override;
   bool ReportsQueuedFrameCount() const override { return true; }
+  void SetTargetQueueDepth(size_t blocks) override {
+    target_queue_depth_.store(static_cast<uint32_t>(blocks),
+                              std::memory_order_relaxed);
+  }
   void SubmitFrame(float* frame) override;
   void Shutdown() override;
 
@@ -176,6 +180,7 @@ class AAudioAudioDriver : public AudioDriver {
 
   // Per-driver volume (XMP): written by other threads, read by the callback.
   std::atomic<float> driver_volume_{1.0f};
+  std::atomic<uint32_t> target_queue_depth_{4};
 
   // Callback-owned sanity tracker; published via relaxed atomics to recovery_thread_.
   xendroid::AudioSanityTracker audio_sanity_;
