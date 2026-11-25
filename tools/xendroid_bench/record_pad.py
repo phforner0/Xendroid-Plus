@@ -65,18 +65,21 @@ def validate_recorded_pad(text: str) -> dict[str, Any]:
     }
 
 
-def _wait_for_record_stop(
-    dev: AdbDevice, log_remote: str, package: str, timeout_s: float = 8.0
+def _wait_for_record_marker(
+    dev: AdbDevice, log_remote: str, pattern: re.Pattern[str], package: str, timeout_s: float = 15.0
 ) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        tail = dev.shell(f"tail -n 40 '{log_remote}' 2>/dev/null || true", check=False)
-        if RECORD_STOP_RE.search(tail):
+        tail = dev.shell(f"tail -n 60 '{log_remote}' 2>/dev/null || true", check=False)
+        if pattern.search(tail):
             return True
         if dev.pidof_emu(package) is None:
-            return True
+            return False
         time.sleep(0.25)
     return False
+
+
+RECORD_START_RE = re.compile(r"XDROID-PAD record start\b")
 
 
 def run_record_pad_adb(
@@ -90,6 +93,7 @@ def run_record_pad_adb(
     title_id: str = "00000000",
     duration_s: int = 30,
 ) -> dict[str, Any]:
+    del title_id  # Recorded automatically via active_title_id_atomic() when title runs.
     out_dir.mkdir(parents=True, exist_ok=True)
     dev = AdbDevice(serial=serial, adb_bin=adb_bin)
     root = dev.storage_root(package)
@@ -99,10 +103,7 @@ def run_record_pad_adb(
     rel_spec = f"pad/{safe_name}"
     remote_pad = f"{root}/{rel_spec}"
     log_remote = f"{root}/xe.log"
-    cfg_remote = f"{root}/config/{title_id}.config.toml"
-    cfg_bak = f"{cfg_remote}.recbak"
 
-    had_cfg = False
     boot_mode = bool(game_uri)
 
     @contextlib.contextmanager
@@ -115,35 +116,32 @@ def run_record_pad_adb(
             if boot_mode:
                 with contextlib.suppress(Exception):
                     dev.force_stop(package)
-                with contextlib.suppress(Exception):
-                    if had_cfg:
-                        dev.shell(f"mv '{cfg_bak}' '{cfg_remote}'", check=False)
-                    else:
-                        dev.shell(f"rm -f '{cfg_remote}'", check=False)
 
     dev.clear_debug_props()
-    dev.shell(f"mkdir -p '{root}/pad' '{root}/config' && rm -f '{remote_pad}'", check=False)
+    dev.shell(f"rm -f '{remote_pad}'", check=False)
 
     if boot_mode:
         assert game_uri is not None
         dev.force_stop(package)
-        had_cfg = "OK" in dev.shell(
-            f"[ -f '{cfg_remote}' ] && cp '{cfg_remote}' '{cfg_bak}' && echo OK",
-            check=False,
-        )
+        dev.shell(f"rm -f '{log_remote}'", check=False)
 
     with restore_guard():
         if boot_mode:
             assert game_uri is not None
-            dev.shell(f"rm -f '{log_remote}'", check=False)
-            base_cfg = dev.shell(f"cat '{cfg_bak}'", check=False) if had_cfg else ""
-            cfg_text = merge_toml_sections(base_cfg, {"HID": {"pad_record": rel_spec}})
-            dev.push_text(cfg_remote, cfg_text, filename=f"{title_id}.config.toml")
             dev.shell("input keyevent KEYCODE_WAKEUP", check=False)
             escaped_uri = game_uri.replace("'", "'\\''")
             dev.shell(
                 f"am start -n {package}/{DEFAULT_ACTIVITY} -a {DEFAULT_ACTION} --es game_uri '{escaped_uri}'"
             )
+            # Wait for :emu process & first frames before triggering live pad_record
+            # (so Android 16 Scoped Storage uid creates pad/ natively with app UID).
+            boot_deadline = time.monotonic() + 20.0
+            while time.monotonic() < boot_deadline:
+                if dev.pidof_emu(package) is not None and dev.shell(f"[ -s '{log_remote}' ] && echo OK", check=False).strip() == "OK":
+                    break
+                time.sleep(0.25)
+            dev.set_prop("debug.xendroid.pad_record", rel_spec)
+            _wait_for_record_marker(dev, log_remote, RECORD_START_RE, package, timeout_s=15.0)
         else:
             if dev.pidof_emu(package) is None:
                 return {
@@ -154,6 +152,7 @@ def run_record_pad_adb(
                     "details": {},
                 }
             dev.set_prop("debug.xendroid.pad_record", rel_spec)
+            _wait_for_record_marker(dev, log_remote, RECORD_START_RE, package, timeout_s=10.0)
 
         start = time.monotonic()
         if duration_s > 0:
@@ -167,7 +166,7 @@ def run_record_pad_adb(
                 input()
 
         dev.set_prop("debug.xendroid.pad_record", "__stop__")
-        _wait_for_record_stop(dev, log_remote, package, timeout_s=8.0)
+        _wait_for_record_marker(dev, log_remote, RECORD_STOP_RE, package, timeout_s=8.0)
         if boot_mode:
             dev.force_stop(package)
 

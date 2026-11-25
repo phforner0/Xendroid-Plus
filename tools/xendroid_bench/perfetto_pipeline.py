@@ -41,6 +41,14 @@ data_sources: {{
     name: "android.surfaceflinger.frametimeline"
   }}
 }}
+data_sources: {{
+  config {{
+    name: "linux.process_stats"
+    process_stats_config {{
+      scan_all_processes_on_start: true
+    }}
+  }}
+}}
 duration_ms: {duration_ms}
 """
 
@@ -132,6 +140,28 @@ def parse_xe_perf_log(log_text: str) -> dict[str, Any]:
     }
 
 
+def _select_dominant_layer(candidates: list[Any]) -> Any | None:
+    best = None
+    best_rank = None
+    for c in candidates:
+        total = int(getattr(c, "total_frames", 0) or 0)
+        if total <= 0:
+            continue
+        first_ts = float(getattr(c, "first_ts", 0.0) or 0.0)
+        last_ts = float(getattr(c, "last_ts", 0.0) or 0.0)
+        wall_s = (last_ts - first_ts) / 1e9 if last_ts > first_ts else 0.0
+        fps = (total / wall_s) if wall_s > 0.5 else 0.0
+        layer = str(getattr(c, "layer_name", "") or "").lower()
+        proc = str(getattr(c, "proc_name", "") or "").lower()
+        is_xendroid = ("xendroid" in layer or "xendroid" in proc or "surfaceview" in layer)
+        active_game_rate = fps >= 10.0
+        rank = (1 if is_xendroid else 0, 1 if active_game_rate else 0, total)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best = c
+    return best
+
+
 def analyze_pftrace(
     trace_path: pathlib.Path,
     *,
@@ -158,29 +188,56 @@ def analyze_pftrace(
 
     try:
         safe_pkg = re.sub(r"[^A-Za-z0-9_.:-]", "", package)
-        sql = f"""
-        INCLUDE PERFETTO MODULE android.frames.timeline;
+        pkg_sql = f"""
         SELECT
-          COUNT(frame_id) AS total_frames,
-          SUM(dur) AS total_dur_ns,
-          AVG(dur) / 1e6 AS avg_dur_ms,
-          MAX(dur) / 1e6 AS max_dur_ms,
-          SUM(CASE WHEN jank_type != 'JankType.None' AND jank_type IS NOT NULL THEN 1 ELSE 0 END) AS janky_frames
-        FROM android_frames
-        WHERE process_name LIKE '%{safe_pkg}%';
+          COUNT(*) AS total_frames,
+          MIN(s.ts) AS first_ts,
+          MAX(s.ts + s.dur) AS last_ts,
+          AVG(s.dur) / 1e6 AS avg_dur_ms,
+          MAX(s.dur) / 1e6 AS max_dur_ms,
+          SUM(CASE WHEN s.jank_type IS NOT NULL AND s.jank_type NOT IN ('None', 'JankType.None') THEN 1 ELSE 0 END) AS janky_frames
+        FROM actual_frame_timeline_slice s
+        LEFT JOIN process p USING(upid)
+        WHERE p.name LIKE '%{safe_pkg}%' OR s.layer_name LIKE '%{safe_pkg}%';
         """
-        rows = list(tp.query(sql))
+        rows = list(tp.query(pkg_sql))
+        matched_by = "package"
+        if not rows or not rows[0].total_frames:
+            fallback_sql = """
+            SELECT
+              COUNT(*) AS total_frames,
+              MIN(s.ts) AS first_ts,
+              MAX(s.ts + s.dur) AS last_ts,
+              AVG(s.dur) / 1e6 AS avg_dur_ms,
+              MAX(s.dur) / 1e6 AS max_dur_ms,
+              SUM(CASE WHEN s.jank_type IS NOT NULL AND s.jank_type NOT IN ('None', 'JankType.None') THEN 1 ELSE 0 END) AS janky_frames,
+              p.name AS proc_name,
+              s.layer_name AS layer_name
+            FROM actual_frame_timeline_slice s
+            LEFT JOIN process p USING(upid)
+            WHERE COALESCE(s.layer_name, '') NOT LIKE '%StatusBar%'
+              AND COALESCE(s.layer_name, '') NOT LIKE '%NavigationBar%'
+              AND COALESCE(s.layer_name, '') NOT LIKE '%NotificationShade%'
+            GROUP BY p.name, s.layer_name
+            ORDER BY total_frames DESC
+            LIMIT 25;
+            """
+            picked = _select_dominant_layer(list(tp.query(fallback_sql)))
+            rows = [picked] if picked is not None else []
+            matched_by = "dominant_layer_fallback"
         if not rows or not rows[0].total_frames:
             return {
                 "available": True,
                 "total_frames": 0,
-                "note": "No android_frames rows matched target package in trace.",
+                "note": "No actual_frame_timeline_slice rows matched target package in trace.",
             }
         r = rows[0]
         total_frames = int(r.total_frames)
-        total_dur_ns = float(r.total_dur_ns or 0.0)
+        first_ts = float(r.first_ts or 0.0)
+        last_ts = float(r.last_ts or 0.0)
+        wall_s = (last_ts - first_ts) / 1e9 if last_ts > first_ts else 0.0
         janky = int(r.janky_frames or 0)
-        fps = (total_frames * 1e9 / total_dur_ns) if total_dur_ns > 0 else 0.0
+        fps = (total_frames / wall_s) if wall_s > 0 else 0.0
         return {
             "available": True,
             "total_frames": total_frames,
@@ -189,6 +246,7 @@ def analyze_pftrace(
             "max_frame_ms": round(float(r.max_dur_ms or 0.0), 3),
             "janky_frames": janky,
             "jank_percent": round(100.0 * janky / total_frames, 2),
+            "matched_by": matched_by,
         }
     finally:
         tp.close()
@@ -209,14 +267,15 @@ def run_perf_capture(
     pbtx.write_text(build_pbtx_config(package=package, duration_s=duration_s), encoding="utf-8")
 
     remote_cfg = "/data/local/tmp/xendroid_bench.pbtx"
-    remote_trace = "/data/local/tmp/xendroid_bench.pftrace"
+    remote_trace = "/data/misc/perfetto-traces/xendroid_bench.pftrace"
     dev.run(["push", str(pbtx), remote_cfg])
 
     therm_start = dev.read_thermal_state()
     bat_start = dev.read_battery_state()
     try:
+        dev.shell(f"rm -f '{remote_trace}'", check=False)
         dev.shell(
-            f"perfetto --txt -c {remote_cfg} -o {remote_trace}",
+            f"cat '{remote_cfg}' | perfetto --txt -c - -o '{remote_trace}'",
             timeout=duration_s + 45,
             check=True,
         )

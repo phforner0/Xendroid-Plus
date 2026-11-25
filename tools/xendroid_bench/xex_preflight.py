@@ -504,6 +504,88 @@ def inspect_zar(path: pathlib.Path) -> tuple[bytes | None, list[str], str | None
 # ---------------------------------------------------------------------------
 # XEX2 / XEX1 Header + Optional Import Ordinal Parser
 # ---------------------------------------------------------------------------
+class _LazyXexPeImage:
+    """Random-access AES-128-CBC / basic-compressed PE reader (O(1) per thunk lookup)."""
+
+    def __init__(
+        self,
+        payload: bytes,
+        segments: list[tuple[int, int, int, int, bytes]],
+        total_size: int,
+        round_keys: list[list[int]] | None,
+    ) -> None:
+        # segments: (virt_start, virt_data_end, cipher_start, aligned_len, init_iv)
+        self._payload = payload
+        self._segments = segments
+        self._total_size = total_size
+        self._round_keys = round_keys
+        self._block_cache: dict[tuple[int, int], bytes] = {}
+
+    def __len__(self) -> int:
+        return self._total_size
+
+    def _decrypt_block(self, seg_idx: int, bidx: int) -> bytes:
+        key = (seg_idx, bidx)
+        cached = self._block_cache.get(key)
+        if cached is not None:
+            return cached
+        _, _, cstart, _, init_iv = self._segments[seg_idx]
+        coff = cstart + bidx * 16
+        blk = self._payload[coff : coff + 16]
+        assert self._round_keys is not None
+        dec = _aes128_decrypt_block(blk, self._round_keys)
+        iv = init_iv if bidx == 0 else self._payload[coff - 16 : coff]
+        plain = bytes(dec[j] ^ iv[j] for j in range(16))
+        self._block_cache[key] = plain
+        return plain
+
+    def read(self, offset: int, size: int) -> bytes:
+        if offset < 0 or size <= 0 or offset + size > self._total_size:
+            return b""
+        out = bytearray(size)
+        pos = 0
+        lo, hi = 0, len(self._segments)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._segments[mid][1] <= offset:
+                lo = mid + 1
+            else:
+                hi = mid
+        seg_idx = lo
+        while pos < size and seg_idx < len(self._segments):
+            vstart, vend, cstart, aligned_len, _ = self._segments[seg_idx]
+            cur = offset + pos
+            if cur < vstart:
+                step = min(size - pos, vstart - cur)
+                pos += step
+                continue
+            if cur >= vend:
+                seg_idx += 1
+                continue
+            local = cur - vstart
+            step = min(size - pos, vend - cur)
+            if self._round_keys is None:
+                out[pos : pos + step] = self._payload[cstart + local : cstart + local + step]
+                pos += step
+            else:
+                end_local = local + step
+                while local < end_local:
+                    if local >= aligned_len:
+                        rem = end_local - local
+                        out[pos : pos + rem] = self._payload[cstart + local : cstart + local + rem]
+                        pos += rem
+                        local += rem
+                    else:
+                        bidx = local // 16
+                        boff = local % 16
+                        blk_plain = self._decrypt_block(seg_idx, bidx)
+                        take = min(16 - boff, end_local - local, aligned_len - local)
+                        out[pos : pos + take] = blk_plain[boff : boff + take]
+                        pos += take
+                        local += take
+        return bytes(out)
+
+
 def _try_extract_uncompressed_or_basic_pe(
     xex_bytes: bytes,
     header_size: int,
@@ -512,60 +594,52 @@ def _try_extract_uncompressed_or_basic_pe(
     enc_type: int,
     comp_type: int,
     comp_info_bytes: bytes,
-) -> bytes | None:
+) -> _LazyXexPeImage | None:
+    del base_address
     if comp_type not in (0, 1):
         return None
     payload = xex_bytes[header_size:]
     candidates = [XEX2_RETAIL_KEY, XEX2_DEVKIT_KEY, XEX1_RETAIL_KEY] if enc_type == 1 else [None]
-    for root_key in candidates:
-        if comp_type == 0:
-            if enc_type == 1:
-                assert root_key is not None
-                session_key = aes128_cbc_decrypt(root_key, aes_key_enc)
-                image = aes128_cbc_decrypt(session_key, payload)
-            else:
-                image = payload
-        else:
-            # Basic compression: sequence of (uint32 data_size, uint32 zero_size) blocks.
-            # XexModule::ReadImageBasicCompressed decrypts each block using continuous CBC IV.
-            image_buf = bytearray()
-            p = 0
-            round_keys = None
-            iv = bytes(16)
-            if enc_type == 1:
-                assert root_key is not None
-                session_key = aes128_cbc_decrypt(root_key, aes_key_enc)
-                round_keys = _aes_key_expansion(session_key)
-            for off in range(0, len(comp_info_bytes) - (len(comp_info_bytes) % 8), 8):
-                dsize, zsize = struct.unpack_from(">II", comp_info_bytes, off)
-                if dsize == 0 and zsize == 0:
-                    continue
-                if p + dsize > len(payload) or zsize > 64 * 1024 * 1024:
-                    image_buf = bytearray()
-                    break
-                chunk = payload[p : p + dsize]
-                if round_keys is not None:
-                    aligned = dsize & ~15
-                    dec = bytearray(dsize)
-                    for boff in range(0, aligned, 16):
-                        blk = chunk[boff : boff + 16]
-                        dec_blk = _aes128_decrypt_block(blk, round_keys)
-                        for j in range(16):
-                            dec[boff + j] = dec_blk[j] ^ iv[j]
-                        iv = blk
-                    if aligned < dsize:
-                        dec[aligned:] = chunk[aligned:]
-                    image_buf.extend(dec)
-                else:
-                    image_buf.extend(chunk)
-                image_buf.extend(bytes(zsize))
-                p += dsize
-            image = bytes(image_buf)
 
-        if len(image) >= 0x100 and image[:2] == b"MZ":
-            (e_lfanew,) = struct.unpack_from("<I", image, 0x3C)
-            if e_lfanew + 4 <= len(image) and image[e_lfanew : e_lfanew + 4] == b"PE\x00\x00":
-                return image
+    segments: list[tuple[int, int, int, int, bytes]] = []
+    if comp_type == 0:
+        n = len(payload) & ~15 if enc_type == 1 else len(payload)
+        if n == 0:
+            return None
+        segments.append((0, n, 0, n & ~15, bytes(16)))
+        total_size = n
+    else:
+        p = 0
+        virt = 0
+        iv = bytes(16)
+        for off in range(0, len(comp_info_bytes) - (len(comp_info_bytes) % 8), 8):
+            dsize, zsize = struct.unpack_from(">II", comp_info_bytes, off)
+            if dsize == 0 and zsize == 0:
+                continue
+            if p + dsize > len(payload) or zsize > 64 * 1024 * 1024:
+                return None
+            aligned = dsize & ~15
+            segments.append((virt, virt + dsize, p, aligned, iv))
+            if aligned > 0:
+                iv = payload[p + aligned - 16 : p + aligned]
+            p += dsize
+            virt += dsize + zsize
+        total_size = virt
+        if total_size < 0x100:
+            return None
+
+    for root_key in candidates:
+        round_keys = None
+        if enc_type == 1:
+            assert root_key is not None
+            session_key = aes128_cbc_decrypt(root_key, aes_key_enc)
+            round_keys = _aes_key_expansion(session_key)
+        reader = _LazyXexPeImage(payload, segments, total_size, round_keys)
+        hdr = reader.read(0, 0x100)
+        if len(hdr) >= 0x100 and hdr[:2] == b"MZ":
+            (e_lfanew,) = struct.unpack_from("<I", hdr, 0x3C)
+            if e_lfanew + 4 <= total_size and reader.read(e_lfanew, 4) == b"PE\x00\x00":
+                return reader
     return None
 
 
@@ -585,6 +659,27 @@ def _try_extract_pe_with_xextool(xex_bytes: bytes) -> bytes | None:
         if res.returncode == 0 and pe_p.is_file():
             return pe_p.read_bytes()
     return None
+
+
+_OPTIONAL_EXPORT_PREFIXES = (
+    "XamShow",
+    "NetDll_",
+    "XNet",
+    "XOnline",
+    "XeKeys",
+    "Io",
+    "ObIsTitleObject",
+    "RtlNtStatusToDosError",
+    "XamUser",
+    "XamParty",
+    "XamSession",
+    "XamVoice",
+)
+
+
+def _is_optional_missing_export(entry: dict[str, Any]) -> bool:
+    name = str(entry.get("name", ""))
+    return name.startswith(_OPTIONAL_EXPORT_PREFIXES)
 
 
 def parse_xex(
@@ -780,7 +875,10 @@ def parse_xex(
                 off = raddr - load_address
                 if off < 0 or off + 4 > len(pe_image):
                     continue
-                (val,) = struct.unpack_from(">I", pe_image, off)
+                raw_u32 = pe_image.read(off, 4) if hasattr(pe_image, "read") else pe_image[off : off + 4]
+                if len(raw_u32) != 4:
+                    continue
+                (val,) = struct.unpack_from(">I", raw_u32, 0)
                 rec_type = (val >> 24) & 0xFF
                 ordinal = val & 0xFFFF
                 if rec_type not in (0, 1) or ordinal in seen_ordinals:
@@ -868,17 +966,41 @@ def parse_xex(
             }
         )
     if ordinal_analysis["missing_exports"]:
-        blockers += len(ordinal_analysis["missing_exports"])
-        names = ", ".join(
-            e.get("name", f"{e['library']}!{e['ordinal']}") for e in ordinal_analysis["missing_exports"][:8]
-        )
-        findings.append(
-            {
-                "severity": "WARN",
-                "category": "missing_exports",
-                "message": f"{len(ordinal_analysis['missing_exports'])} unresolved/unregistered kernel import(s): {names}",
-            }
-        )
+        critical_missing = [
+            e for e in ordinal_analysis["missing_exports"] if not _is_optional_missing_export(e)
+        ]
+        optional_missing = [
+            e for e in ordinal_analysis["missing_exports"] if _is_optional_missing_export(e)
+        ]
+        ordinal_analysis["critical_missing_exports"] = critical_missing
+        ordinal_analysis["optional_missing_exports"] = optional_missing
+        if critical_missing:
+            blockers += len(critical_missing)
+            names = ", ".join(
+                e.get("name", f"{e['library']}!{e['ordinal']}") for e in critical_missing[:8]
+            )
+            findings.append(
+                {
+                    "severity": "ERROR",
+                    "category": "missing_exports",
+                    "message": f"{len(critical_missing)} critical unresolved/unregistered kernel import(s): {names}",
+                }
+            )
+        if optional_missing:
+            warnings += len(optional_missing)
+            names = ", ".join(
+                e.get("name", f"{e['library']}!{e['ordinal']}") for e in optional_missing[:8]
+            )
+            findings.append(
+                {
+                    "severity": "WARN",
+                    "category": "optional_missing_exports",
+                    "message": f"{len(optional_missing)} optional Live/IO/service import(s) unresolved: {names}",
+                }
+            )
+    else:
+        ordinal_analysis["critical_missing_exports"] = []
+        ordinal_analysis["optional_missing_exports"] = []
     if ordinal_analysis["stub_exports"]:
         warnings += len(ordinal_analysis["stub_exports"])
         names = ", ".join(e["name"] for e in ordinal_analysis["stub_exports"][:10])
@@ -919,7 +1041,18 @@ def parse_xex(
 
     ppc_result = None
     if pe_image:
-        ppc_result = ppc_coverage.analyze_ppc_coverage(repo_root, code_bytes=pe_image)
+        if hasattr(pe_image, "read"):
+            pe_len = len(pe_image)
+            if pe_image._round_keys is None or pe_len <= 256 * 1024:
+                code_sample = pe_image.read(0, pe_len)
+            else:
+                ep_off = entry_point - load_address if entry_point >= load_address else 0
+                if ep_off < 0 or ep_off >= pe_len:
+                    ep_off = 0
+                code_sample = pe_image.read(ep_off, min(64 * 1024, pe_len - ep_off))
+        else:
+            code_sample = pe_image
+        ppc_result = ppc_coverage.analyze_ppc_coverage(repo_root, code_bytes=code_sample)
         if ppc_result.get("raw_pattern_scan", {}).get("lwarx", 0) > 0:
             findings.append(
                 {

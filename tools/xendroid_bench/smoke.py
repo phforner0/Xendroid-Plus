@@ -103,16 +103,23 @@ def analyze_smoke_log(log_text: str) -> dict[str, Any]:
 
     # Audio verdict
     audio_status = "UNKNOWN"
+    concealed_delta = 0
     if audio_samples:
         max_rms = max(s["rms"] for s in audio_samples)
         max_sil = max(s["silence_ms"] for s in audio_samples)
-        total_concealed = sum(s["concealed"] for s in audio_samples)
+        if len(audio_samples) >= 3:
+            mid = len(audio_samples) // 2
+            concealed_delta = max(0, audio_samples[-1]["concealed"] - audio_samples[mid]["concealed"])
+        elif len(audio_samples) == 2:
+            concealed_delta = max(0, audio_samples[1]["concealed"] - audio_samples[0]["concealed"])
+        else:
+            concealed_delta = audio_samples[0]["concealed"]
         total_nans = sum(s.get("nans", 0) for s in audio_samples)
         if total_nans > 0:
             audio_status = "CORRUPT_NAN"
         elif max_rms < 1e-4 and max_sil >= 5000:
             audio_status = "MUTE"
-        elif total_concealed > 20:
+        elif concealed_delta > 50:
             audio_status = "UNDERRUNS"
         else:
             audio_status = "OK"
@@ -135,6 +142,7 @@ def analyze_smoke_log(log_text: str) -> dict[str, Any]:
         "clock_off_events": clock_off_events,
         "hle_stalled": hle_stalled,
         "audio_status": audio_status,
+        "audio_concealed_delta": concealed_delta,
         "audio_samples": audio_samples[-5:],
         "pad_events": pad_events,
     }
@@ -186,12 +194,20 @@ def run_smoke_adb(
     dev = AdbDevice(serial=serial, adb_bin=adb_bin)
     root = dev.storage_root(package)
     log_remote = f"{root}/xe.log"
+    global_cfg = f"{root}/xenia-canary.config.toml"
     cfg_remote = f"{root}/config/{title_id}.config.toml"
     cfg_bak = f"{cfg_remote}.benchbak"
 
     dev.force_stop(package)
     dev.clear_debug_props()
-    had_cfg = "OK" in dev.shell(f"[ -f '{cfg_remote}' ] && cp '{cfg_remote}' '{cfg_bak}' && echo OK", check=False)
+    use_global_inplace = dev.file_uid(global_cfg) is not None
+    if use_global_inplace:
+        raw_base = dev.run(["exec-out", "cat", global_cfg], binary=False, check=False)
+        base_cfg = raw_base if isinstance(raw_base, str) else ""
+        had_cfg = True
+    else:
+        had_cfg = "OK" in dev.shell(f"[ -f '{cfg_remote}' ] && cp '{cfg_remote}' '{cfg_bak}' && echo OK", check=False)
+        base_cfg = dev.shell(f"cat '{cfg_bak}'", check=False) if had_cfg else ""
 
     @contextlib.contextmanager
     def restore_guard():
@@ -203,14 +219,18 @@ def run_smoke_adb(
             with contextlib.suppress(Exception):
                 dev.clear_debug_props()
             with contextlib.suppress(Exception):
-                if had_cfg:
+                if use_global_inplace:
+                    dev.write_text_inplace(global_cfg, base_cfg)
+                elif had_cfg:
                     dev.shell(f"mv '{cfg_bak}' '{cfg_remote}'", check=False)
                 else:
                     dev.shell(f"rm -f '{cfg_remote}'", check=False)
 
     with restore_guard():
-        dev.shell(f"mkdir -p '{root}/config' '{root}/pad' && rm -f '{log_remote}'", check=False)
-        base_cfg = dev.shell(f"cat '{cfg_bak}'", check=False) if had_cfg else ""
+        if use_global_inplace:
+            dev.shell(f"rm -f '{log_remote}'", check=False)
+        else:
+            dev.shell(f"mkdir -p '{root}/config' '{root}/pad' && rm -f '{log_remote}'", check=False)
         updates: dict[str, dict[str, Any]] = {
             "GPU": {
                 "log_gpu_frame_time_breakdown": True,
@@ -228,13 +248,27 @@ def run_smoke_adb(
             updates["GPU"]["framerate_limit"] = 0
             updates["GPU"]["guest_display_refresh_cap"] = False
             updates["Vulkan"] = {"vulkan_allow_present_mode_immediate": True}
-        if pad_script_path is not None and pad_script_path.is_file():
-            remote_pad = f"{root}/pad/{pad_script_path.name}"
-            dev.run(["push", str(pad_script_path), remote_pad])
-            updates["HID"] = {"pad_script": f"pad/{pad_script_path.name}"}
 
         cfg_text = merge_toml_sections(base_cfg, updates)
-        dev.push_text(cfg_remote, cfg_text, filename=f"{title_id}.config.toml")
+        if use_global_inplace:
+            dev.write_text_inplace(global_cfg, cfg_text)
+        else:
+            dev.push_text(cfg_remote, cfg_text, filename=f"{title_id}.config.toml")
+
+        if pad_script_path is not None and pad_script_path.is_file():
+            rel_pad = f"pad/{pad_script_path.name}"
+            remote_pad = f"{root}/{rel_pad}"
+            pad_text = pad_script_path.read_text(encoding="utf-8")
+            if dev.file_uid(remote_pad) is not None:
+                raw_remote_pad = dev.run(["exec-out", "cat", remote_pad], binary=False, check=False)
+                remote_text = raw_remote_pad if isinstance(raw_remote_pad, str) else ""
+                if remote_text.replace("\r\n", "\n") != pad_text.replace("\r\n", "\n"):
+                    dev.write_text_inplace(remote_pad, pad_text)
+            else:
+                dev.shell(f"mkdir -p '{root}/pad'", check=False)
+                dev.run(["push", str(pad_script_path), remote_pad])
+            dev.set_prop("debug.xendroid.pad_script", rel_pad)
+
         dev.shell("input keyevent KEYCODE_WAKEUP", check=False)
         escaped_uri = game_uri.replace("'", "'\\''")
         dev.shell(

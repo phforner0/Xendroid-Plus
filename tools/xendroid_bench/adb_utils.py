@@ -194,6 +194,26 @@ class AdbDevice:
             p.write_text(content, encoding="utf-8", newline="\n")
             self.run(["push", str(p), remote_path], timeout=30, check=True)
 
+    def write_text_inplace(self, remote_path: str, content: str, *, timeout: int = 30) -> None:
+        """Overwrite an existing device file via non-PTY `cat >` to preserve app UID."""
+        escaped = remote_path.replace("'", "'\\''")
+        payload = content.replace("\r\n", "\n").encode("utf-8")
+        res = subprocess.run(
+            [*self.prefix, "shell", "-T", f"cat > '{escaped}'"],
+            input=payload,
+            capture_output=True,
+            timeout=timeout,
+        )
+        if res.returncode != 0:
+            err = res.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"adb shell -T cat > '{remote_path}' failed ({res.returncode}): {err}")
+
+    def file_uid(self, remote_path: str) -> int | None:
+        """Return numeric UID of `remote_path` on device, or None if missing."""
+        escaped = remote_path.replace("'", "'\\''")
+        out = self.shell(f"stat -c '%u' '{escaped}' 2>/dev/null || true", check=False).strip()
+        return int(out) if out.isdigit() else None
+
     def screencap(self, dest: pathlib.Path) -> pathlib.Path:
         dest.parent.mkdir(parents=True, exist_ok=True)
         raw = self.run(["exec-out", "screencap", "-p"], binary=True, timeout=20)

@@ -170,8 +170,15 @@ def run_compat_matrix(
                 overall = smoke_v
             elif vis_pass is False:
                 overall = "FAIL_VISUAL_REGRESSION"
+            elif smoke_v in ("COMPAT_INGAME", "COMPAT_BOOTS_MENU"):
+                overall = smoke_v
 
-            counts[verdict] = counts.get(verdict, 0) + 1
+            if overall in ("COMPAT_INGAME", "COMPAT_BOOTS_MENU"):
+                counts["COMPAT_VERIFIED_RUNTIME"] = counts.get("COMPAT_VERIFIED_RUNTIME", 0) + 1
+            elif overall in counts:
+                counts[overall] = counts.get(overall, 0) + 1
+            elif overall.startswith("FAIL"):
+                counts["ERROR"] += 1
             rows.append(
                 {
                     "name": tgt.name,
@@ -205,8 +212,10 @@ def run_compat_matrix(
                 }
             )
 
+    verified_rt = counts.get("COMPAT_VERIFIED_RUNTIME", 0)
     summary = (
         f"Scanned {len(targets)} title(s): "
+        f"{verified_rt} verified runtime, "
         f"{counts.get('COMPAT_LIKELY', 0)} likely, "
         f"{counts.get('COMPAT_WARN', 0)} warn, "
         f"{counts.get('COMPAT_BLOCKED', 0)} blocked, "
@@ -219,13 +228,14 @@ def run_compat_matrix(
     if not targets:
         verdict_out = "WARN"
     elif counts.get("COMPAT_BLOCKED", 0) > 0 or counts.get("ERROR", 0) > 0:
-        verdict_out = "WARN" if counts.get("COMPAT_LIKELY", 0) > 0 else "FAIL"
+        verdict_out = "WARN" if (counts.get("COMPAT_LIKELY", 0) + verified_rt) > 0 else "FAIL"
 
     return {
         "verdict": verdict_out,
         "summary": summary,
         "metrics": {
             "total_titles": len(targets),
+            "compat_verified_runtime": verified_rt,
             "compat_likely": counts.get("COMPAT_LIKELY", 0),
             "compat_warn": counts.get("COMPAT_WARN", 0),
             "compat_blocked": counts.get("COMPAT_BLOCKED", 0),

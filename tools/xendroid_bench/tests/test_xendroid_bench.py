@@ -8,6 +8,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 TOOLS_DIR = pathlib.Path(__file__).resolve().parents[2]
 REPO_ROOT = TOOLS_DIR.parent
@@ -468,6 +469,112 @@ class XendroidBenchTests(unittest.TestCase):
         bad_res = record_pad.validate_recorded_pad(bad)
         self.assertFalse(bad_res["valid"])
         self.assertGreaterEqual(len(bad_res["invalid_lines"]), 1)
+
+    def test_write_text_inplace_uses_non_pty_stdin_and_lf(self) -> None:
+        dev = adb_utils.AdbDevice(serial="dev1", adb_bin="adb")
+        completed = mock.Mock(returncode=0, stderr=b"")
+        with mock.patch("xendroid_bench.adb_utils.subprocess.run", return_value=completed) as run_mock:
+            dev.write_text_inplace("/sdcard/a.toml", "a = 1\r\nb = 2\r\n")
+        run_mock.assert_called_once()
+        cmd = run_mock.call_args.args[0]
+        self.assertEqual(cmd, ["adb", "-s", "dev1", "shell", "-T", "cat > '/sdcard/a.toml'"])
+        self.assertEqual(run_mock.call_args.kwargs["input"], b"a = 1\nb = 2\n")
+
+    def test_perfetto_uses_selinux_misc_dir_and_stdin_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = pathlib.Path(tmp)
+            shell_cmds: list[str] = []
+            with mock.patch("xendroid_bench.perfetto_pipeline.AdbDevice") as dev_cls:
+                inst = dev_cls.return_value
+                inst.read_thermal_state.return_value = {"gpu_temp_c": 35.0}
+                inst.read_battery_state.return_value = {"external_powered": False}
+                inst.storage_root.return_value = "/sdcard/x"
+
+                def _shell(cmd: str, **_kw: object) -> str:
+                    shell_cmds.append(cmd)
+                    return ""
+
+                inst.shell.side_effect = _shell
+                inst.run.return_value = ""
+                perfetto_pipeline.run_perf_capture(
+                    serial="dev1",
+                    adb_bin="adb",
+                    package=adb_utils.DEFAULT_PACKAGE,
+                    duration_s=5,
+                    out_dir=out_dir,
+                    pull_xe_log=False,
+                )
+            self.assertTrue(
+                any(
+                    "cat '/data/local/tmp/xendroid_bench.pbtx' | perfetto --txt -c - -o '/data/misc/perfetto-traces/xendroid_bench.pftrace'"
+                    in c
+                    for c in shell_cmds
+                )
+            )
+
+    def test_preflight_optional_live_missing_exports_are_warnings_not_blockers(self) -> None:
+        self.assertTrue(xex_preflight._is_optional_missing_export({"name": "XamShowFriendRequestUI"}))
+        self.assertTrue(xex_preflight._is_optional_missing_export({"name": "NetDll_XNetServerToInAddr"}))
+        self.assertTrue(xex_preflight._is_optional_missing_export({"name": "IoCompleteRequest"}))
+        self.assertFalse(xex_preflight._is_optional_missing_export({"name": "KeSomeCoreFunction"}))
+
+    def test_smoke_audio_concealed_uses_delta_not_cumulative_sum(self) -> None:
+        ok_log = "\n".join(
+            f"i> AudioSanity: rms=0.050 peak=0.200 silence_ms=0 clipped=0 concealed={c} xruns=0 nans=0"
+            for c in (100, 100, 101, 101, 102)
+        )
+        ok_res = smoke.analyze_smoke_log(ok_log)
+        self.assertEqual(ok_res["audio_status"], "OK")
+        self.assertEqual(ok_res["audio_concealed_delta"], 1)
+
+        bad_log = "\n".join(
+            f"i> AudioSanity: rms=0.050 peak=0.200 silence_ms=0 clipped=0 concealed={c} xruns=0 nans=0"
+            for c in (100, 150, 220)
+        )
+        bad_res = smoke.analyze_smoke_log(bad_log)
+        self.assertEqual(bad_res["audio_status"], "UNDERRUNS")
+        self.assertEqual(bad_res["audio_concealed_delta"], 70)
+
+    def test_compat_matrix_runtime_ingame_overrides_static_warn_or_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tdir = pathlib.Path(tmp)
+            games = tdir / "games"
+            logs = tdir / "logs"
+            out = tdir / "out"
+            games.mkdir()
+            logs.mkdir()
+            (games / "Forza.xex").write_bytes(_build_clean_synthetic_xex2())
+            (logs / "4D5309C9.log").write_text(
+                "i> GpuFrame: 30 frames, interval avg=33.3ms max=34.0ms | per frame: exec=4.0ms draws=1200 draw=3.0ms swap=0.5ms stall=1.0ms\n",
+                encoding="utf-8",
+            )
+            cm = compat_matrix.run_compat_matrix(games, REPO_ROOT, out_dir=out, logs_dir=logs)
+            self.assertEqual(cm["verdict"], "PASS")
+            self.assertEqual(cm["details"]["rows"][0]["overall_verdict"], "COMPAT_INGAME")
+            self.assertEqual(cm["metrics"]["compat_verified_runtime"], 1)
+
+    def test_perfetto_dominant_layer_prefers_surfaceview_over_low_fps_layer(self) -> None:
+        from types import SimpleNamespace
+
+        candidates = [
+            SimpleNamespace(
+                total_frames=500,
+                first_ts=0.0,
+                last_ts=10e9,
+                proc_name="com.android.systemui",
+                layer_name="Wallpaper",
+            ),
+            SimpleNamespace(
+                total_frames=280,
+                first_ts=0.0,
+                last_ts=9e9,
+                proc_name="xendroid.compose.fork",
+                layer_name="SurfaceView[xendroid.compose.fork/MainActivity]#0",
+            ),
+        ]
+        chosen = perfetto_pipeline._select_dominant_layer(candidates)
+        self.assertIsNotNone(chosen)
+        self.assertIn("SurfaceView", chosen.layer_name)
 
 
 if __name__ == "__main__":
