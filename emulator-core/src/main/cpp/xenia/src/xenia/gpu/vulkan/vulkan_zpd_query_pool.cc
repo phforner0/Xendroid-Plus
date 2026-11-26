@@ -850,6 +850,179 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
                            &readback_barrier, 0, nullptr);
 }
 
+void VulkanZPDQueryPool::RecordResolveBatch(
+    DeferredCommandBuffer& deferred_command_buffer) {
+  if (resolve_batch_indices_.empty() &&
+      fsi_counter_resolve_batch_indices_.empty()) {
+    return;
+  }
+
+  auto build_ranges = [this](std::vector<uint32_t>& indices,
+                             std::vector<uint8_t>& pending) {
+    std::sort(indices.begin(), indices.end());
+    resolve_batch_ranges_.clear();
+    uint32_t range_start = 0;
+    uint32_t range_count = 0;
+    for (uint32_t index : indices) {
+      if (range_count == 0) {
+        range_start = index;
+        range_count = 1;
+        continue;
+      }
+      if (index == range_start + range_count) {
+        ++range_count;
+        continue;
+      }
+      resolve_batch_ranges_.push_back({range_start, range_count});
+      range_start = index;
+      range_count = 1;
+    }
+    if (range_count != 0) {
+      resolve_batch_ranges_.push_back({range_start, range_count});
+    }
+    for (uint32_t index : indices) {
+      pending[index] = 0;
+    }
+    indices.clear();
+  };
+
+  if (!resolve_batch_indices_.empty()) {
+    if (!is_initialized()) {
+      for (uint32_t index : resolve_batch_indices_) {
+        resolve_batch_pending_[index] = 0;
+      }
+      resolve_batch_indices_.clear();
+    } else {
+      build_ranges(resolve_batch_indices_, resolve_batch_pending_);
+
+      VkDeviceSize barrier_offset = VK_WHOLE_SIZE;
+      VkDeviceSize barrier_end = 0;
+      for (const ResolveRange& range : resolve_batch_ranges_) {
+        if (range.start >= capacity_) {
+          continue;
+        }
+
+        uint32_t count = std::min(range.count, capacity_ - range.start);
+        VkDeviceSize offset =
+            static_cast<VkDeviceSize>(range.start) * sizeof(uint64_t);
+        VkDeviceSize size = static_cast<VkDeviceSize>(count) * sizeof(uint64_t);
+
+        // WAIT_BIT blocks until available. No separate availability check
+        // needed. Recorded into DeferredCommandBuffer on the Recorder thread
+        // so the Submit Worker never touches VulkanZPDQueryPool state.
+        deferred_command_buffer.CmdVkCopyQueryPoolResults(
+            query_pool_, range.start, count, readback_buffer_, offset,
+            sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+        barrier_offset = std::min(barrier_offset, offset);
+        barrier_end = std::max(barrier_end, offset + size);
+      }
+
+      if (barrier_offset != VK_WHOLE_SIZE && barrier_end > barrier_offset) {
+        VkBufferMemoryBarrier readback_barrier;
+        readback_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        readback_barrier.pNext = nullptr;
+        readback_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        readback_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        readback_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        readback_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        readback_barrier.buffer = readback_buffer_;
+        readback_barrier.offset = barrier_offset;
+        readback_barrier.size = barrier_end - barrier_offset;
+        deferred_command_buffer.CmdVkPipelineBarrier(
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0,
+            nullptr, 1, &readback_barrier, 0, nullptr);
+      }
+    }
+  }
+
+  if (fsi_counter_resolve_batch_indices_.empty()) {
+    return;
+  }
+
+  if (!fsi_counter_initialized()) {
+    for (uint32_t index : fsi_counter_resolve_batch_indices_) {
+      fsi_counter_resolve_batch_pending_[index] = 0;
+    }
+    fsi_counter_resolve_batch_indices_.clear();
+    return;
+  }
+
+  build_ranges(fsi_counter_resolve_batch_indices_,
+               fsi_counter_resolve_batch_pending_);
+
+  VkDeviceSize readback_barrier_offset = VK_WHOLE_SIZE;
+  VkDeviceSize readback_barrier_end = 0;
+  fsi_resolve_barrier_scratch_.clear();
+  fsi_resolve_copy_scratch_.clear();
+  fsi_resolve_barrier_scratch_.reserve(resolve_batch_ranges_.size());
+  fsi_resolve_copy_scratch_.reserve(resolve_batch_ranges_.size());
+  for (const ResolveRange& range : resolve_batch_ranges_) {
+    if (range.start >= capacity_) {
+      continue;
+    }
+
+    uint32_t count = std::min(range.count, capacity_ - range.start);
+    VkDeviceSize offset =
+        static_cast<VkDeviceSize>(range.start) * sizeof(uint32_t);
+    VkDeviceSize size = static_cast<VkDeviceSize>(count) * sizeof(uint32_t);
+
+    VkBufferMemoryBarrier counter_barrier;
+    counter_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    counter_barrier.pNext = nullptr;
+    counter_barrier.srcAccessMask =
+        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    counter_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    counter_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    counter_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    counter_barrier.buffer = fsi_counter_buffer_;
+    counter_barrier.offset = offset;
+    counter_barrier.size = size;
+    fsi_resolve_barrier_scratch_.push_back(counter_barrier);
+
+    VkBufferCopy copy_region;
+    copy_region.srcOffset = offset;
+    copy_region.dstOffset = offset;
+    copy_region.size = size;
+    fsi_resolve_copy_scratch_.push_back(copy_region);
+
+    readback_barrier_offset = std::min(readback_barrier_offset, offset);
+    readback_barrier_end = std::max(readback_barrier_end, offset + size);
+  }
+
+  if (!fsi_resolve_barrier_scratch_.empty()) {
+    deferred_command_buffer.CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+        uint32_t(fsi_resolve_barrier_scratch_.size()),
+        fsi_resolve_barrier_scratch_.data(), 0, nullptr);
+    deferred_command_buffer.CmdVkCopyBuffer(
+        fsi_counter_buffer_, fsi_counter_readback_buffer_,
+        uint32_t(fsi_resolve_copy_scratch_.size()),
+        fsi_resolve_copy_scratch_.data());
+  }
+
+  if (readback_barrier_offset == VK_WHOLE_SIZE ||
+      readback_barrier_end <= readback_barrier_offset) {
+    return;
+  }
+
+  VkBufferMemoryBarrier readback_barrier;
+  readback_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  readback_barrier.pNext = nullptr;
+  readback_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  readback_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  readback_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  readback_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  readback_barrier.buffer = fsi_counter_readback_buffer_;
+  readback_barrier.offset = readback_barrier_offset;
+  readback_barrier.size = readback_barrier_end - readback_barrier_offset;
+  deferred_command_buffer.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr,
+      1, &readback_barrier, 0, nullptr);
+}
+
 void VulkanZPDQueryPool::InvalidateReadback() {
   if (vulkan_device_) {
     const ui::vulkan::VulkanDevice::Functions& dfn =

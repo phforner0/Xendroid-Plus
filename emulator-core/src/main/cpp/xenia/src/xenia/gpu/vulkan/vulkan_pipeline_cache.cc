@@ -677,6 +677,7 @@ void VulkanPipelineCache::Shutdown() {
       creation_threads_shutdown_ = true;
     }
     creation_request_cond_.notify_all();
+    creation_done_cond_.notify_all();
     for (size_t i = 0; i < creation_threads_.size(); ++i) {
       xe::threading::Wait(creation_threads_[i].get(), false);
     }
@@ -1315,6 +1316,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
       }
       {
         std::lock_guard<std::mutex> lock(creation_request_lock_);
+        creation_arguments.creation_ticket = ++next_creation_ticket_;
         creation_queue_.push(creation_arguments);
       }
       creation_request_cond_.notify_one();
@@ -1386,6 +1388,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
       }
       {
         std::lock_guard<std::mutex> lock(creation_request_lock_);
+        creation_arguments.creation_ticket = ++next_creation_ticket_;
         creation_queue_.push(creation_arguments);
       }
       creation_request_cond_.notify_one();
@@ -1504,6 +1507,98 @@ void VulkanPipelineCache::EndSubmission() {
   ProcessDeferredDestructions();
 }
 
+namespace {
+thread_local uint32_t g_async_replay_thread_depth = 0;
+}  // namespace
+
+VulkanPipelineCache::ScopedWorkerReplay::ScopedWorkerReplay() {
+  ++g_async_replay_thread_depth;
+}
+
+VulkanPipelineCache::ScopedWorkerReplay::~ScopedWorkerReplay() {
+  assert_not_zero(g_async_replay_thread_depth);
+  --g_async_replay_thread_depth;
+}
+
+bool VulkanPipelineCache::IsInAsyncReplayThread() {
+  return g_async_replay_thread_depth != 0;
+}
+
+bool VulkanPipelineCache::HasPendingCreationAtOrBeforeTicketLocked(
+    uint64_t required_ticket) const {
+  if (required_ticket == 0) {
+    return false;
+  }
+  for (uint64_t active_ticket : in_flight_primary_tickets_) {
+    if (active_ticket != 0 && active_ticket <= required_ticket) {
+      return true;
+    }
+  }
+  return creation_queue_.HasTicketAtOrBefore(required_ticket);
+}
+
+uint64_t VulkanPipelineCache::PrepareAsyncSubmissionOnRecorder() {
+  MaybeSaveVkPipelineCache();
+
+  if (shader_storage_file_flush_needed_ ||
+      pipeline_storage_file_flush_needed_) {
+    storage_writer_.RequestFlush(shader_storage_file_flush_needed_,
+                                 pipeline_storage_file_flush_needed_);
+    shader_storage_file_flush_needed_ = false;
+    pipeline_storage_file_flush_needed_ = false;
+  }
+
+  ProcessDeferredDestructions();
+
+  if (creation_threads_.empty()) {
+    return 0;
+  }
+
+  if (startup_loading_.load(std::memory_order_acquire) ||
+      cvars::vulkan_async_skip_draws) {
+    bool creation_queued;
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      creation_queued = !creation_queue_.empty();
+    }
+    if (creation_queued) {
+      creation_request_cond_.notify_one();
+    }
+    return 0;
+  }
+
+  uint64_t required_ticket = 0;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    const uint64_t latest_ticket = next_creation_ticket_;
+    if (latest_ticket != 0 &&
+        HasPendingCreationAtOrBeforeTicketLocked(latest_ticket)) {
+      required_ticket = latest_ticket;
+    }
+  }
+  if (required_ticket != 0) {
+    creation_request_cond_.notify_all();
+  }
+  return required_ticket;
+}
+
+void VulkanPipelineCache::AwaitPipelineTicket(uint64_t required_ticket) {
+  if (required_ticket == 0 || creation_threads_.empty()) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(creation_request_lock_);
+  if (!HasPendingCreationAtOrBeforeTicketLocked(required_ticket)) {
+    return;
+  }
+  creation_request_cond_.notify_all();
+  Clock::ScopedGuestTimeHold guest_time_hold(
+      cvars::vulkan_hold_guest_time_on_pipeline_wait);
+  creation_done_cond_.wait(lock, [this, required_ticket]() {
+    return creation_threads_shutdown_.load(std::memory_order_acquire) ||
+           !HasPendingCreationAtOrBeforeTicketLocked(required_ticket);
+  });
+}
+
 bool VulkanPipelineCache::IsCreatingPipelines() {
   if (creation_threads_.empty()) {
     return false;
@@ -1564,6 +1659,10 @@ void VulkanPipelineCache::CreationThread() {
       creation_arguments = creation_queue_.top();
       creation_queue_.pop();
       ++creation_threads_busy_;
+      if (creation_arguments.creation_ticket != 0) {
+        in_flight_primary_tickets_.push_back(
+            creation_arguments.creation_ticket);
+      }
       creation_arguments.pipeline->second.creation_in_flight.store(
           true, std::memory_order_relaxed);
     }
@@ -1574,6 +1673,15 @@ void VulkanPipelineCache::CreationThread() {
       std::unique_lock<std::mutex> lock(creation_request_lock_);
       creation_arguments.pipeline->second.creation_in_flight.store(
           false, std::memory_order_relaxed);
+      if (creation_arguments.creation_ticket != 0) {
+        auto ticket_it = std::find(in_flight_primary_tickets_.begin(),
+                                   in_flight_primary_tickets_.end(),
+                                   creation_arguments.creation_ticket);
+        if (ticket_it != in_flight_primary_tickets_.end()) {
+          *ticket_it = in_flight_primary_tickets_.back();
+          in_flight_primary_tickets_.pop_back();
+        }
+      }
       --creation_threads_busy_;
       // Before the idle signals, whose callback may take a while.
       creation_done_cond_.notify_all();
@@ -1641,6 +1749,10 @@ void VulkanPipelineCache::NotifyCreationIdleLocked(
 }
 
 bool VulkanPipelineCache::ExpeditePipeline(Pipeline* pipeline) {
+  // Worker replay thread must NEVER call ExpeditePipeline because
+  // CreateQueuedPipeline(..., nullptr) uses the Recorder's single-threaded
+  // guest_shader_cache_.translator() and ucode_disasm_buffer_.
+  assert_false(IsInAsyncReplayThread());
   // Compared by handle, as the draw does.
   auto real_pipeline_ready = [pipeline]() {
     const VkPipeline current =
@@ -1659,19 +1771,36 @@ bool VulkanPipelineCache::ExpeditePipeline(Pipeline* pipeline) {
     std::unique_lock<std::mutex> lock(creation_request_lock_);
     if (!creation_queue_.Take(pipeline, creation_arguments)) {
       // A creation thread has it, or it is done (maybe failed).
-      creation_done_cond_.wait(lock, [pipeline]() {
-        return !pipeline->creation_in_flight.load(std::memory_order_relaxed);
+      creation_done_cond_.wait(lock, [this, pipeline]() {
+        return !pipeline->creation_in_flight.load(std::memory_order_relaxed) ||
+               creation_threads_shutdown_.load(std::memory_order_acquire);
       });
       return real_pipeline_ready();
     }
-    // Counted as busy, so the completion signals don't fire before it exists.
+    // Counted as busy and in-flight so neither idle signals nor Submit Worker
+    // WaitForPipelineCompletionFromWorker can race ahead of this compilation.
     ++creation_threads_busy_;
+    pipeline->creation_in_flight.store(true, std::memory_order_release);
+    if (creation_arguments.creation_ticket != 0) {
+      in_flight_primary_tickets_.push_back(creation_arguments.creation_ticket);
+    }
   }
   CreateQueuedPipeline(creation_arguments, nullptr);
   bool notify_idle = false;
   {
     std::unique_lock<std::mutex> lock(creation_request_lock_);
+    pipeline->creation_in_flight.store(false, std::memory_order_release);
+    if (creation_arguments.creation_ticket != 0) {
+      auto ticket_it = std::find(in_flight_primary_tickets_.begin(),
+                                 in_flight_primary_tickets_.end(),
+                                 creation_arguments.creation_ticket);
+      if (ticket_it != in_flight_primary_tickets_.end()) {
+        *ticket_it = in_flight_primary_tickets_.back();
+        in_flight_primary_tickets_.pop_back();
+      }
+    }
     --creation_threads_busy_;
+    creation_done_cond_.notify_all();
     // The idle signals are left to a creation thread (see
     // creation_idle_notify_pending_).
     if (creation_threads_busy_ == 0 && creation_queue_.empty() &&
@@ -1684,6 +1813,38 @@ bool VulkanPipelineCache::ExpeditePipeline(Pipeline* pipeline) {
   if (notify_idle) {
     creation_request_cond_.notify_one();
   }
+  return real_pipeline_ready();
+}
+
+bool VulkanPipelineCache::WaitForPipelineCompletionFromWorker(
+    Pipeline* pipeline) {
+  auto real_pipeline_ready = [pipeline]() {
+    const VkPipeline current =
+        pipeline->pipeline.load(std::memory_order_acquire);
+    return current != VK_NULL_HANDLE &&
+           current !=
+               pipeline->placeholder_pipeline.load(std::memory_order_acquire);
+  };
+  if (real_pipeline_ready()) {
+    return true;
+  }
+  if (creation_threads_.empty() ||
+      pipeline->creation_failed.load(std::memory_order_acquire)) {
+    return real_pipeline_ready();
+  }
+  Clock::ScopedGuestTimeHold guest_time_hold(
+      cvars::vulkan_hold_guest_time_on_pipeline_wait);
+  std::unique_lock<std::mutex> lock(creation_request_lock_);
+  if (creation_queue_.PromoteToMaxPriority(pipeline)) {
+    creation_request_cond_.notify_one();
+  }
+  creation_done_cond_.wait(lock, [this, pipeline, &real_pipeline_ready]() {
+    return real_pipeline_ready() ||
+           pipeline->creation_failed.load(std::memory_order_acquire) ||
+           creation_threads_shutdown_.load(std::memory_order_acquire) ||
+           (!pipeline->creation_in_flight.load(std::memory_order_acquire) &&
+            !creation_queue_.Contains(pipeline));
+  });
   return real_pipeline_ready();
 }
 
@@ -1713,8 +1874,9 @@ bool VulkanPipelineCache::WaitForPipeline(Pipeline* pipeline,
       lock, std::chrono::milliseconds(timeout_ms), [&]() {
         return real_pipeline_ready() ||
                pipeline->creation_failed.load(std::memory_order_acquire) ||
-               (!pipeline->creation_in_flight.load(std::memory_order_relaxed) &&
-                creation_queue_.empty());
+               creation_threads_shutdown_.load(std::memory_order_acquire) ||
+               (!pipeline->creation_in_flight.load(std::memory_order_acquire) &&
+                !creation_queue_.Contains(pipeline));
       });
   return real_pipeline_ready();
 }
@@ -1741,7 +1903,13 @@ VkPipeline VulkanPipelineCache::ResolvePipelineForReplay(
     return VK_NULL_HANDLE;
   }
   if (expedite_on_replay) {
-    ExpeditePipeline(pipeline);
+    if (IsInAsyncReplayThread()) {
+      // Async Submit & Replay Worker NEVER calls ExpeditePipeline() /
+      // CreateQueuedPipeline(..., nullptr); wait on creation_threads_ instead.
+      WaitForPipelineCompletionFromWorker(pipeline);
+    } else {
+      ExpeditePipeline(pipeline);
+    }
   } else if (timeout_ms > 0) {
     WaitForPipeline(pipeline, timeout_ms);
   }

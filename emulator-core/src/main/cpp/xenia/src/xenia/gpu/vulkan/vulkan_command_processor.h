@@ -717,6 +717,7 @@ class SmallReadbackRingState {
 #include "xenia/gpu/vulkan/vulkan_render_target_cache.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
+#include "xenia/gpu/vulkan/vulkan_submit_worker.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
 #include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
 #include "xenia/gpu/xenos.h"
@@ -871,10 +872,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
                                      uint32_t dword_count);
 
   // Returns the deferred drawing command list for the currently open
-  // submission.
+  // submission (points into the active SubmitChunk slot on the Recorder).
   DeferredCommandBuffer& deferred_command_buffer() {
     assert_true(submission_open_);
-    return deferred_command_buffer_;
+    return submit_chunks_[active_chunk_index_]->main_dcb;
   }
 
   // Deferred commands replayed at the head of the submission's command
@@ -882,7 +883,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // hoisted out of render passes.
   DeferredCommandBuffer& deferred_setup_command_buffer() {
     assert_true(submission_open_);
-    return deferred_setup_command_buffer_;
+    return submit_chunks_[active_chunk_index_]->setup_dcb;
   }
 
   bool submission_open() const { return submission_open_; }
@@ -964,7 +965,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::map<std::tuple<uint64_t, uint64_t, uint32_t>, PipelineUse>
       pipeline_use_;
   uint64_t GetCurrentSubmission() const {
-    return completion_timeline_.GetUpcomingSubmission();
+    return completion_timeline_.GetRecordedSubmission();
   }
   uint64_t GetCompletedSubmission() const override {
     return completion_timeline_.GetCompletedSubmissionFromLastUpdate();
@@ -1372,11 +1373,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool CanEndSubmissionImmediately() const;
   // Always inlined: VkAwaitSites attributes its waits to the callers.
   XE_FORCEINLINE bool AwaitAllQueueOperationsCompletion() {
+    if (submission_open_) {
+      EndSubmission(false);
+    }
+    DrainSubmitWorker();
     CheckSubmissionCompletionAndDeviceLoss(GetCurrentSubmission());
     const bool drained = !submission_open_ &&
                          GetCompletedSubmission() + 1u >= GetCurrentSubmission();
     if (drained) {
       drained_submission_ = GetCurrentSubmission();
+      ReclaimCommandBuffersAndSemaphoresOnRecorder(GetCompletedSubmission());
     }
     return drained;
   }
@@ -1882,8 +1888,59 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
-  DeferredCommandBuffer deferred_command_buffer_;
-  DeferredCommandBuffer deferred_setup_command_buffer_;
+
+  // Bounded SPSC K = 4 SubmitChunk ring (Onda 3A). In sync mode, slot 0 is
+  // used directly on the Recorder thread. In async mode, the Recorder writes
+  // into submit_chunks_[active_chunk_index_] and pushes sealed chunks to the
+  // Submit & Replay Worker thread.
+  struct SubmitChunk {
+    explicit SubmitChunk(const VulkanCommandProcessor& command_processor)
+        : setup_dcb(command_processor, 64 * 1024),
+          main_dcb(command_processor) {}
+
+    DeferredCommandBuffer setup_dcb;
+    DeferredCommandBuffer main_dcb;
+    uint64_t submission_index = 0;
+    bool is_swap = false;
+    bool has_deferred_pipelines = false;
+    uint64_t required_pipeline_ticket = 0;
+    std::vector<SparseBufferBind> sparse_buffer_binds;
+    std::vector<VkSparseMemoryBind> sparse_memory_binds;
+    VkPipelineStageFlags sparse_bind_wait_stage_mask = 0;
+    std::vector<VkSemaphore> external_wait_semaphores;
+    std::vector<VkPipelineStageFlags> external_wait_stage_masks;
+    submit_worker::SubmitTimestampSnapshot timestamps;
+  };
+  std::array<std::unique_ptr<SubmitChunk>,
+             submit_worker::kSubmitChunkRingCapacity>
+      submit_chunks_;
+  submit_worker::SpscSlotRing<submit_worker::kSubmitChunkRingCapacity>
+      submit_ring_;
+  size_t active_chunk_index_ = 0;
+  std::thread submit_worker_thread_;
+  bool async_submit_worker_active_ = false;
+  bool current_submission_has_deferred_pipelines_ = false;
+  std::atomic<int32_t> desired_submit_worker_nice_{-10};
+  std::atomic<uint64_t> async_worker_replay_ns_{0};
+  std::vector<VkSemaphore> worker_wait_semaphores_;
+  std::vector<VkPipelineStageFlags> worker_wait_stage_masks_;
+
+  void PollAsyncSubmitWorkerProperties();
+  void SyncAsyncSubmitWorkerMode();
+  void StartSubmitWorker();
+  void DrainSubmitWorker();
+  void StopSubmitWorker();
+  void SubmitWorkerThreadMain();
+  void ExecuteAndSubmitChunkOnWorker(
+      SubmitChunk& chunk, const std::function<void()>& release_slot);
+  void ReclaimCommandBuffersAndSemaphoresOnWorker(
+      uint64_t completed_submission);
+  void ReclaimCommandBuffersAndSemaphoresOnRecorder(
+      uint64_t completed_submission);
+  bool EnsureSubmissionResourcesLockedOrOwned(bool needs_semaphore);
+  void CaptureTimestampSnapshotOnRecorder(
+      uint64_t submission_index, bool setup_has_commands,
+      submit_worker::SubmitTimestampSnapshot& snapshot_out);
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;

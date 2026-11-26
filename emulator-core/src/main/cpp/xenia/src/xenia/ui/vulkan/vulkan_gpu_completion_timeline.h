@@ -11,7 +11,9 @@
 #define XENIA_UI_VULKAN_VULKAN_GPU_COMPLETION_TIMELINE_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -32,13 +34,68 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
 
   const char* name() const { return name_; }
   size_t pending_submission_count() const {
+    std::lock_guard<std::mutex> lock(timeline_mutex_);
     return pending_submission_fences_.size();
   }
   uint64_t front_pending_submission() const {
+    std::lock_guard<std::mutex> lock(timeline_mutex_);
     return pending_submission_fences_.empty()
                ? 0
                : pending_submission_fences_.front().first;
   }
+
+  // Three-pointer monotonic submission timeline (Onda 3A):
+  //   completed_submission_ <= submitted_submission_ < recorded_submission_
+  // Safe to read from any thread (Recorder, Submit Worker, creation threads).
+  uint64_t GetRecordedSubmission() const {
+    return recorded_submission_.load(std::memory_order_acquire);
+  }
+  uint64_t GetSubmittedSubmission() const {
+    return submitted_submission_.load(std::memory_order_acquire);
+  }
+  uint64_t GetCompletedSubmissionCached() const {
+    return completed_submission_cached_.load(std::memory_order_acquire);
+  }
+  bool HasWorkerSubmitError() const {
+    return worker_failed_.load(std::memory_order_acquire);
+  }
+  VkResult GetWorkerSubmitError() const {
+    return worker_submit_error_.load(std::memory_order_acquire);
+  }
+  void ClearWorkerSubmitError() {
+    std::lock_guard<std::mutex> lock(timeline_mutex_);
+    worker_failed_.store(false, std::memory_order_release);
+    worker_submit_error_.store(VK_SUCCESS, std::memory_order_release);
+  }
+
+  // Recorder-only: reserves the current logical submission index S and
+  // advances upcoming/recorded submission to S + 1 before pushing the chunk
+  // to the asynchronous Submit & Replay Worker.
+  uint64_t ReserveNextSubmission() {
+    const uint64_t reserved = GetUpcomingSubmission();
+    IncrementUpcomingSubmission();
+    recorded_submission_.store(GetUpcomingSubmission(),
+                               std::memory_order_release);
+    return reserved;
+  }
+
+  // Worker-only: acquires a free VkFence (short lock), calls vkQueueSubmit
+  // OUTSIDE timeline_mutex_, then registers {submission_index, fence} and
+  // publishes submitted_submission_ (or propagates error / DEVICE_LOST).
+  VkResult SubmitReservedSubmission(
+      uint64_t submission_index, uint32_t queue_family_index,
+      uint32_t queue_index, uint32_t submit_count, const VkSubmitInfo* submits,
+      uint64_t* queue_lock_wait_ns_out = nullptr,
+      uint64_t* submit_host_ns_out = nullptr);
+
+  // Worker-only: propagates a pre-submit failure (e.g., vkQueueBindSparse or
+  // vkEndCommandBuffer failure) and wakes WaitUntilSubmitted without deadlock.
+  void ReportReservedSubmissionFailed(uint64_t submission_index,
+                                      VkResult error_result);
+
+  // Recorder-only: waits until submitted_submission_ >= target_submission or a
+  // worker submission error / VK_ERROR_DEVICE_LOST occurs. Never deadlocks.
+  bool WaitUntilSubmitted(uint64_t target_submission);
 
   VulkanGPUCompletionTimeline(const VulkanGPUCompletionTimeline&) = delete;
   VulkanGPUCompletionTimeline& operator=(const VulkanGPUCompletionTimeline&) =
@@ -73,20 +130,40 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
 
     ~FenceAcquisition() {
       if (completion_timeline_ && fence_) {
+        bool notify_submitted = false;
+        {
+          std::lock_guard<std::mutex> lock(
+              completion_timeline_->timeline_mutex_);
 #ifndef NDEBUG
-        assert_not_zero(completion_timeline_->fences_acquired_);
-        --completion_timeline_->fences_acquired_;
+          assert_not_zero(completion_timeline_->fences_acquired_);
+          --completion_timeline_->fences_acquired_;
 #endif
-        if (submission_successful_.value_or(false)) {
-          assert_true(
-              completion_timeline_->pending_submission_fences_.empty() ||
-              completion_timeline_->pending_submission_fences_.front().first <
-                  completion_timeline_->GetUpcomingSubmission());
-          completion_timeline_->pending_submission_fences_.emplace_back(
-              completion_timeline_->GetUpcomingSubmission(), fence_);
-          completion_timeline_->IncrementUpcomingSubmission();
-        } else {
-          completion_timeline_->free_fences_.push_back(fence_);
+          if (submission_successful_.value_or(false)) {
+            const uint64_t submission =
+                completion_timeline_->GetUpcomingSubmission();
+            assert_true(
+                completion_timeline_->pending_submission_fences_.empty() ||
+                completion_timeline_->pending_submission_fences_.front().first <
+                    submission);
+            completion_timeline_->pending_submission_fences_.emplace_back(
+                submission, fence_);
+            completion_timeline_->IncrementUpcomingSubmission();
+            completion_timeline_->recorded_submission_.store(
+                completion_timeline_->GetUpcomingSubmission(),
+                std::memory_order_release);
+            if (submission >
+                completion_timeline_->submitted_submission_.load(
+                    std::memory_order_relaxed)) {
+              completion_timeline_->submitted_submission_.store(
+                  submission, std::memory_order_release);
+            }
+            notify_submitted = true;
+          } else {
+            completion_timeline_->free_fences_.push_back(fence_);
+          }
+        }
+        if (notify_submitted) {
+          completion_timeline_->submit_cv_.notify_all();
         }
       }
     }
@@ -175,6 +252,18 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
 
   VulkanDevice* const vulkan_device_;
   const char* const name_;
+
+  // Protects ONLY free_fences_ and pending_submission_fences_ (short swaps).
+  // NEVER held across vkQueueSubmit, vkWaitForFences, vkGetFenceStatus,
+  // vkResetFences, or vkCreateFence.
+  mutable std::mutex timeline_mutex_;
+  std::condition_variable submit_cv_;
+
+  std::atomic<uint64_t> recorded_submission_{1};
+  std::atomic<uint64_t> submitted_submission_{0};
+  std::atomic<uint64_t> completed_submission_cached_{0};
+  std::atomic<bool> worker_failed_{false};
+  std::atomic<VkResult> worker_submit_error_{VK_SUCCESS};
 
   std::vector<VkFence> free_fences_;
 

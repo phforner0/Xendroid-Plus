@@ -254,6 +254,34 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // enabled or the startup storage preload is running, in which case it
   // doesn't block and unready pipelines have their draws dropped at replay.
   void EndSubmission();
+  // Async Submit Worker split of EndSubmission() (Onda 3A): runs Recorder-only
+  // bookkeeping (MaybeSaveVkPipelineCache, storage_writer_.RequestFlush,
+  // ProcessDeferredDestructions) on the GPU Commands thread and returns the
+  // required primary pipeline creation ticket for the chunk (0 if no wait is
+  // needed, e.g. under vulkan_async_skip_draws / startup_loading or when all
+  // previously enqueued pipelines have already finished).
+  uint64_t PrepareAsyncSubmissionOnRecorder();
+  // Worker-thread safe: waits on creation_threads_ until every primary
+  // pipeline creation with creation_ticket <= required_ticket has finished (or
+  // shutdown is requested), without blocking on newer tickets queued for
+  // subsequent chunks.
+  void AwaitPipelineTicket(uint64_t required_ticket);
+  // RAII scope marking the current thread as the asynchronous Submit & Replay
+  // Worker during DeferredCommandBuffer::Execute() so ResolvePipelineForReplay
+  // never calls ExpeditePipeline() / CreateQueuedPipeline(..., nullptr) with
+  // the Recorder's single-threaded translator.
+  class ScopedWorkerReplay {
+   public:
+    ScopedWorkerReplay();
+    ~ScopedWorkerReplay();
+    ScopedWorkerReplay(const ScopedWorkerReplay&) = delete;
+    ScopedWorkerReplay& operator=(const ScopedWorkerReplay&) = delete;
+  };
+  static bool IsInAsyncReplayThread();
+  // Worker-thread safe replacement for ExpeditePipeline during replay:
+  // promotes `pipeline` in creation_queue_ and waits for creation_threads_ to
+  // finish compiling it without touching guest_shader_cache_.translator().
+  bool WaitForPipelineCompletionFromWorker(Pipeline* pipeline);
   // Throttled persist of the VkPipelineCache blob. Cheap no-op unless new
   // pipelines were created and the save interval elapsed. Called from
   // EndSubmission().
@@ -556,6 +584,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // True when queued solely to upgrade a fast-linked GPL pipeline to a
     // link-time-optimized (LTO) pipeline in the background.
     bool lto_link_only = false;
+    // Monotonic ticket for primary pipelines queued from ConfigurePipeline
+    // (0 for background LTO re-links and startup storage preload).
+    uint64_t creation_ticket = 0;
   };
 
   // Comparator for priority queue - higher priority first.
@@ -597,6 +628,38 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
       heap_.pop_back();
       std::make_heap(heap_.begin(), heap_.end(),
                      PipelineCreationPriorityCompare());
+      return true;
+    }
+    bool Contains(const Pipeline* pipeline) const {
+      return std::any_of(heap_.begin(), heap_.end(),
+                         [pipeline](const PipelineCreationArguments& a) {
+                           return &a.pipeline->second == pipeline;
+                         });
+    }
+    bool HasTicketAtOrBefore(uint64_t required_ticket) const {
+      if (required_ticket == 0) {
+        return false;
+      }
+      return std::any_of(
+          heap_.begin(), heap_.end(),
+          [required_ticket](const PipelineCreationArguments& a) {
+            return a.creation_ticket != 0 &&
+                   a.creation_ticket <= required_ticket;
+          });
+    }
+    bool PromoteToMaxPriority(const Pipeline* pipeline) {
+      auto it = std::find_if(heap_.begin(), heap_.end(),
+                             [pipeline](const PipelineCreationArguments& a) {
+                               return &a.pipeline->second == pipeline;
+                             });
+      if (it == heap_.end()) {
+        return false;
+      }
+      if (it->priority < 255) {
+        it->priority = 255;
+        std::make_heap(heap_.begin(), heap_.end(),
+                       PipelineCreationPriorityCompare());
+      }
       return true;
     }
 
@@ -868,6 +931,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // performance. Higher priority pipelines (those writing to visible RTs)
   // are compiled first.
   CreationRequestHeap creation_queue_;
+  uint64_t next_creation_ticket_ = 0;
+  std::vector<uint64_t> in_flight_primary_tickets_;
+  bool HasPendingCreationAtOrBeforeTicketLocked(uint64_t required_ticket) const;
   std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;
   // Notified when a creation thread is done with a pipeline it took.
