@@ -11,7 +11,7 @@
   <img alt="Android 10+" src="https://img.shields.io/badge/Android-10%2B-3DBB2E?logo=android&logoColor=white">
   <img alt="arm64-v8a" src="https://img.shields.io/badge/ABI-arm64--v8a-2B2D31">
   <img alt="Vulkan" src="https://img.shields.io/badge/Vulkan-Adreno%20%7C%20Turnip-AC162C?logo=vulkan&logoColor=white">
-  <a href="https://discord.gg/AT8Bswv62"><img alt="Discord" src="https://img.shields.io/badge/Discord-community-5865F2?logo=discord&logoColor=white"></a>
+  <a href="https://discord.gg/uVxMcTxvQ8"><img alt="Discord" src="https://img.shields.io/badge/Discord-community-5865F2?logo=discord&logoColor=white"></a>
   <a href="https://buymeacoffee.com/phforner0"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-FFDD00?logo=buymeacoffee&logoColor=black"></a>
 </p>
 
@@ -185,7 +185,7 @@ hardware you own.
 
 ## Community
 
-Join the discussion on [Discord](https://discord.gg/AT8Bswv62).
+Join the discussion on [Discord](https://discord.gg/uVxMcTxvQ8).
 
 Xendroid+ is free. If you'd like to help pay for its build servers and test devices, you
 can support it on [Buy Me a Coffee](https://buymeacoffee.com/phforner0). It's voluntary
