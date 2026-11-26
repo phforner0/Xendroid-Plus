@@ -4266,6 +4266,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       PipelineCreationArguments lto_args = creation_arguments;
       lto_args.priority = 0;
       lto_args.lto_link_only = true;
+      lto_args.creation_ticket = 0;
       {
         std::lock_guard<std::mutex> lock(creation_request_lock_);
         if (!creation_threads_shutdown_) {

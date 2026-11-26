@@ -476,6 +476,8 @@ void TestSourceInvariants(const fs::path& cpp_root) {
                       std::string::npos);
   SUBMIT_WORKER_CHECK(pc_cc.find("IsInAsyncReplayThread()") !=
                       std::string::npos);
+  SUBMIT_WORKER_CHECK(pc_cc.find("lto_args.creation_ticket = 0;") !=
+                      std::string::npos);
 
   const std::string zpd_h =
       ReadSourceText(vk_gpu / "vulkan_zpd_query_pool.h");
