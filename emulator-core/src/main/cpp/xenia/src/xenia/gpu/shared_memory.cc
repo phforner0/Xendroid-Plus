@@ -393,17 +393,20 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
     auto sync_block_from_gpu_written = [this](uint32_t i) {
       if (subpage_tracker_.active()) {
         uint64_t new_valid_block = 0;
+        uint64_t invalidated_block = 0;
         const uint32_t base_hp = i << 6;
         const uint32_t hp_limit =
             std::min(base_hp + 64u, subpage_tracker_.host_page_count());
         for (uint32_t hp = base_hp; hp < hp_limit; ++hp) {
-          subpage_tracker_.SetHostPageValidFromGpuWritten(hp);
+          const uint64_t bit = uint64_t(1) << (hp & 63);
+          if (subpage_tracker_.SetHostPageValidFromGpuWritten(hp) != 0) {
+            invalidated_block |= bit;
+          }
           if (subpage_tracker_.IsHostPageFullyValid(hp)) {
-            new_valid_block |= uint64_t(1) << (hp & 63);
+            new_valid_block |= bit;
           }
         }
-        system_page_flags_invalidated_in_submission_[i] |=
-            system_page_flags_valid_[i] & ~new_valid_block;
+        system_page_flags_invalidated_in_submission_[i] |= invalidated_block;
         __atomic_store_n(&system_page_flags_valid_[i], new_valid_block,
                          __ATOMIC_RELEASE);
       } else {
@@ -1062,7 +1065,15 @@ void SharedMemory::RewatchPages(uint32_t block, uint64_t mask) {
   unwatched_pages_[block] &= ~mask;
   unwatched_page_count_ -= uint32_t(xe::bit_count(mask));
   // Arm protection before verifying so any racing CPU store faults cleanly.
-  uint64_t valid = mask & system_page_flags_valid_[block];
+  // When subpage tracking is active, a partially valid host page has its
+  // host-page valid bit cleared while 1..3 subpages remain valid; include
+  // every host page with any valid subpage so writewatch protection is always
+  // re-armed and those remaining subpages are verified against their 4 KB
+  // upload hashes.
+  uint64_t valid =
+      subpage_tracker_.active()
+          ? subpage_tracker_.FilterBlockMaskWithAnyValidSubpage(block, mask)
+          : (mask & system_page_flags_valid_[block]);
   uint64_t runs = valid;
   while (runs) {
     uint32_t first = 0;
@@ -1075,6 +1086,50 @@ void SharedMemory::RewatchPages(uint32_t block, uint64_t mask) {
         true, false);
     runs &= ~(count >= 64 ? UINT64_MAX
                           : (((uint64_t(1) << count) - 1) << first));
+  }
+  if (subpage_tracker_.active()) {
+    auto* phys_heap = memory().GetPhysicalHeap();
+    while (valid) {
+      uint32_t bit = 0;
+      xe::bit_scan_forward(valid, &bit);
+      valid &= valid - 1;
+      const uint32_t page = (block << 6) + bit;
+      const bool used_in_sub =
+          !system_page_flags_used_in_submission_.empty() &&
+          ((system_page_flags_used_in_submission_[block] >> bit) & 1u) != 0;
+      const uint8_t mismatched =
+          subpage_tracker_.VerifyAndInvalidateHostPageSubpages(
+              page, used_in_sub,
+              [&](uint32_t sp, uint64_t& out_hash) -> bool {
+                const uint32_t sp_addr = sp << SubpageTracker::kSubpageSizeLog2;
+                uint32_t protect = 0;
+                if (!phys_heap->QueryProtectUnlocked(sp_addr, &protect) ||
+                    !(protect & kMemoryProtectRead)) {
+                  return false;
+                }
+                out_hash = XXH3_64bits(
+                    memory().TranslatePhysical<const uint8_t*>(sp_addr),
+                    SubpageTracker::kSubpageSize);
+                return true;
+              });
+      if (mismatched != 0) {
+        const uint64_t page_bit = uint64_t(1) << bit;
+        __atomic_fetch_and(&system_page_flags_valid_[block], ~page_bit,
+                           __ATOMIC_RELEASE);
+        if (used_in_sub) {
+          system_page_flags_invalidated_in_submission_[block] |= page_bit;
+        }
+        if (!dirty_this_frame_.empty()) {
+          dirty_this_frame_[block] |= page_bit;
+        }
+        if (!page_upload_hash_valid_.empty()) {
+          __atomic_fetch_and(&page_upload_hash_valid_[block], ~page_bit,
+                             __ATOMIC_RELAXED);
+        }
+        FireWatches(page, page, false);
+      }
+    }
+    return;
   }
   while (valid) {
     uint32_t bit = 0;
@@ -1761,15 +1816,19 @@ void SharedMemory::PrepareForTraceDownload() {
     // SystemPageFlagsBlock& page_flags_block = system_page_flags_[i];
     uint64_t previously_valid_block = system_page_flags_valid_[i];
     uint64_t gpu_written_block = system_page_flags_valid_and_gpu_written_[i];
+    uint64_t fire_watches_block = 0;
     if (subpage_tracker_.active()) {
       uint64_t new_valid_block = 0;
       const uint32_t base_hp = i << 6;
       const uint32_t hp_limit =
           std::min(base_hp + 64u, subpage_tracker_.host_page_count());
       for (uint32_t hp = base_hp; hp < hp_limit; ++hp) {
-        subpage_tracker_.SetHostPageValidFromGpuWritten(hp);
+        const uint64_t bit = uint64_t(1) << (hp & 63);
+        if (subpage_tracker_.SetHostPageValidFromGpuWritten(hp) != 0) {
+          fire_watches_block |= bit;
+        }
         if (subpage_tracker_.IsHostPageFullyValid(hp)) {
-          new_valid_block |= uint64_t(1) << (hp & 63);
+          new_valid_block |= bit;
         }
       }
       __atomic_store_n(&system_page_flags_valid_[i], new_valid_block,
@@ -1777,10 +1836,10 @@ void SharedMemory::PrepareForTraceDownload() {
     } else {
       __atomic_store_n(&system_page_flags_valid_[i], gpu_written_block,
                        __ATOMIC_RELEASE);
+      fire_watches_block = previously_valid_block & ~gpu_written_block;
     }
 
     // Fire watches on the invalidated pages.
-    uint64_t fire_watches_block = previously_valid_block & ~gpu_written_block;
     system_page_flags_invalidated_in_submission_[i] |= fire_watches_block;
     uint64_t fire_watches_break_block = ~fire_watches_block;
     while (true) {

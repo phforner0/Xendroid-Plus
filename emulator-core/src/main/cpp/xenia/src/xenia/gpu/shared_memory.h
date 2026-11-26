@@ -80,20 +80,40 @@ class SubpageTracker {
   uint32_t subpage_count() const { return subpage_count_; }
 
   uint8_t valid_mask(uint32_t host_page) const {
-    return host_page < host_page_count_ ? valid_mask_[host_page] : 0;
+    return host_page < host_page_count_ ? LoadValidMask(host_page) : 0;
   }
   uint8_t gpu_written_mask(uint32_t host_page) const {
-    return host_page < host_page_count_ ? gpu_written_mask_[host_page] : 0;
+    return host_page < host_page_count_ ? LoadGpuWrittenMask(host_page) : 0;
   }
   uint8_t hash_valid_mask(uint32_t host_page) const {
     return host_page < host_page_count_ ? hash_valid_mask_[host_page] : 0;
   }
   bool IsHostPageFullyValid(uint32_t host_page) const {
     return host_page < host_page_count_ &&
-           valid_mask_[host_page] == full_host_page_mask_;
+           LoadValidMask(host_page) == full_host_page_mask_;
   }
   bool HasAnyGpuWrittenSubpage(uint32_t host_page) const {
-    return host_page < host_page_count_ && gpu_written_mask_[host_page] != 0;
+    return host_page < host_page_count_ && LoadGpuWrittenMask(host_page) != 0;
+  }
+
+  // Filters a 64-host-page block bitmask down to host pages that have at least
+  // one valid 4 KB subpage (used by RewatchPages when subpage tracking is on).
+  uint64_t FilterBlockMaskWithAnyValidSubpage(uint32_t block,
+                                              uint64_t mask) const {
+    if (!active_ || !mask) {
+      return 0;
+    }
+    uint64_t out = 0;
+    const uint32_t base_hp = block << 6;
+    while (mask) {
+      const uint32_t bit = uint32_t(__builtin_ctzll(mask));
+      mask &= mask - 1;
+      const uint32_t hp = base_hp + bit;
+      if (hp < host_page_count_ && LoadValidMask(hp) != 0) {
+        out |= uint64_t(1) << bit;
+      }
+    }
+    return out;
   }
 
   static uint8_t LocalSubpageRangeMask(uint32_t local_first,
@@ -118,8 +138,10 @@ class SubpageTracker {
     if (!active_) {
       return;
     }
-    std::fill(valid_mask_.begin(), valid_mask_.end(), uint8_t(0));
-    std::fill(gpu_written_mask_.begin(), gpu_written_mask_.end(), uint8_t(0));
+    for (uint32_t hp = 0; hp < host_page_count_; ++hp) {
+      StoreValidMask(hp, 0);
+      StoreGpuWrittenMask(hp, 0);
+    }
     std::fill(hash_valid_mask_.begin(), hash_valid_mask_.end(), uint8_t(0));
     std::fill(invalidated_in_submission_mask_.begin(),
               invalidated_in_submission_mask_.end(), full_host_page_mask_);
@@ -144,12 +166,17 @@ class SubpageTracker {
     const uint32_t hp_last = sp_last >> subpages_per_host_page_log2_;
     for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
       const uint8_t mask = SubpageMaskForHostPage(hp, sp_first, sp_last);
-      valid_mask_[hp] |= mask;
+      const uint8_t cur_valid = LoadValidMask(hp);
+      const uint8_t cur_gw = LoadGpuWrittenMask(hp);
       if (written_by_gpu) {
-        gpu_written_mask_[hp] |= mask;
         hash_valid_mask_[hp] &= uint8_t(~mask);
+        // Publish gpu_written before valid so lockless IsRangeGpuWritten
+        // readers observing valid also observe gpu_written.
+        StoreGpuWrittenMask(hp, uint8_t(cur_gw | mask));
+        StoreValidMask(hp, uint8_t(cur_valid | mask));
       } else {
-        gpu_written_mask_[hp] &= uint8_t(~mask);
+        StoreGpuWrittenMask(hp, uint8_t(cur_gw & uint8_t(~mask)));
+        StoreValidMask(hp, uint8_t(cur_valid | mask));
       }
     }
   }
@@ -171,8 +198,8 @@ class SubpageTracker {
     const uint32_t hp = subpage >> subpages_per_host_page_log2_;
     const uint32_t local = subpage & (subpages_per_host_page_ - 1);
     const uint8_t bit = uint8_t(uint32_t(1) << local);
-    valid_mask_[hp] &= uint8_t(~bit);
-    gpu_written_mask_[hp] &= uint8_t(~bit);
+    StoreValidMask(hp, uint8_t(LoadValidMask(hp) & uint8_t(~bit)));
+    StoreGpuWrittenMask(hp, uint8_t(LoadGpuWrittenMask(hp) & uint8_t(~bit)));
     hash_valid_mask_[hp] &= uint8_t(~bit);
     if (mark_submission_invalidated) {
       invalidated_in_submission_mask_[hp] |= bit;
@@ -186,9 +213,9 @@ class SubpageTracker {
     }
     hp_last = std::min(hp_last, host_page_count_ - 1);
     for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
-      const uint8_t gpu_bits = gpu_written_mask_[hp];
-      valid_mask_[hp] = 0;
-      gpu_written_mask_[hp] = 0;
+      const uint8_t gpu_bits = LoadGpuWrittenMask(hp);
+      StoreValidMask(hp, 0);
+      StoreGpuWrittenMask(hp, 0);
       hash_valid_mask_[hp] &= uint8_t(~gpu_bits);
       if (mark_submission_invalidated) {
         invalidated_in_submission_mask_[hp] = full_host_page_mask_;
@@ -208,14 +235,14 @@ class SubpageTracker {
     const uint32_t sp_last = (start + length - 1) >> kSubpageSizeLog2;
     hp_last = std::min(hp_last, host_page_count_ - 1);
     for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
-      const uint8_t gpu_bits = gpu_written_mask_[hp];
+      const uint8_t gpu_bits = LoadGpuWrittenMask(hp);
       const uint8_t exact_bits =
           (hp >= (sp_first >> subpages_per_host_page_log2_) &&
            hp <= (sp_last >> subpages_per_host_page_log2_))
               ? SubpageMaskForHostPage(hp, sp_first, sp_last)
               : uint8_t(0);
-      valid_mask_[hp] = 0;
-      gpu_written_mask_[hp] = 0;
+      StoreValidMask(hp, 0);
+      StoreGpuWrittenMask(hp, 0);
       hash_valid_mask_[hp] &= uint8_t(~(gpu_bits | exact_bits));
       if (mark_submission_invalidated) {
         invalidated_in_submission_mask_[hp] = full_host_page_mask_;
@@ -223,15 +250,56 @@ class SubpageTracker {
     }
   }
 
-  void SetHostPageValidFromGpuWritten(uint32_t hp) {
+  // Keeps only GPU-written subpages valid on host page `hp`. Returns the
+  // bitmask of previously CPU-valid subpages that lost validity so callers can
+  // fire watches even when `hp` was only partially valid.
+  uint8_t SetHostPageValidFromGpuWritten(uint32_t hp) {
     if (!active_ || hp >= host_page_count_) {
-      return;
+      return 0;
     }
-    const uint8_t prev_valid = valid_mask_[hp];
-    const uint8_t gpu_mask = gpu_written_mask_[hp];
-    invalidated_in_submission_mask_[hp] |= uint8_t(prev_valid & ~gpu_mask);
-    valid_mask_[hp] = gpu_mask;
+    const uint8_t prev_valid = LoadValidMask(hp);
+    const uint8_t gpu_mask = LoadGpuWrittenMask(hp);
+    const uint8_t invalidated = uint8_t(prev_valid & uint8_t(~gpu_mask));
+    invalidated_in_submission_mask_[hp] |= invalidated;
+    StoreValidMask(hp, gpu_mask);
     hash_valid_mask_[hp] &= uint8_t(~gpu_mask);
+    return invalidated;
+  }
+
+  // Verifies all currently valid 4 KB subpages of `hp` against their stored
+  // upload hashes (used when re-watching an unwatched host page after
+  // re-arming PROT_READ). Invalidates any mismatched subpage and returns the
+  // bitmask of subpages that mismatched.
+  template <typename HashFn>
+  uint8_t VerifyAndInvalidateHostPageSubpages(uint32_t hp,
+                                              bool mark_submission_invalidated,
+                                              HashFn&& try_hash_subpage) {
+    if (!active_ || hp >= host_page_count_) {
+      return 0;
+    }
+    const uint8_t valid_bits = LoadValidMask(hp);
+    if (!valid_bits) {
+      return 0;
+    }
+    const uint8_t hash_bits = hash_valid_mask_[hp];
+    const uint32_t page_sp_base = hp << subpages_per_host_page_log2_;
+    uint8_t mismatched = 0;
+    for (uint32_t local = 0; local < subpages_per_host_page_; ++local) {
+      const uint8_t bit = uint8_t(uint32_t(1) << local);
+      if (!(valid_bits & bit)) {
+        continue;
+      }
+      const uint32_t sp = page_sp_base + local;
+      uint64_t current_hash = 0;
+      const bool match = (hash_bits & bit) != 0 &&
+                         try_hash_subpage(sp, current_hash) &&
+                         current_hash == upload_hash_[sp];
+      if (!match) {
+        mismatched |= bit;
+        InvalidateSubpage(sp, mark_submission_invalidated);
+      }
+    }
+    return mismatched;
   }
 
   bool IsRangeValid(uint32_t start, uint32_t length) const {
@@ -247,7 +315,7 @@ class SubpageTracker {
     const uint32_t hp_last = sp_last >> subpages_per_host_page_log2_;
     for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
       const uint8_t req_mask = SubpageMaskForHostPage(hp, sp_first, sp_last);
-      if ((valid_mask_[hp] & req_mask) != req_mask) {
+      if ((LoadValidMask(hp) & req_mask) != req_mask) {
         return false;
       }
     }
@@ -265,7 +333,9 @@ class SubpageTracker {
     const uint32_t hp_last = sp_last >> subpages_per_host_page_log2_;
     for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
       const uint8_t req_mask = SubpageMaskForHostPage(hp, sp_first, sp_last);
-      if ((valid_mask_[hp] & gpu_written_mask_[hp] & req_mask) != req_mask) {
+      const uint8_t valid_bits = LoadValidMask(hp);
+      const uint8_t gw_bits = LoadGpuWrittenMask(hp);
+      if ((valid_bits & gw_bits & req_mask) != req_mask) {
         return false;
       }
     }
@@ -288,7 +358,7 @@ class SubpageTracker {
     uint32_t run_start = UINT32_MAX;
     for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
       const uint8_t req_mask = SubpageMaskForHostPage(hp, sp_first, sp_last);
-      const uint8_t dirty_mask = uint8_t(req_mask & ~valid_mask_[hp]);
+      const uint8_t dirty_mask = uint8_t(req_mask & ~LoadValidMask(hp));
       if (dirty_mask == 0) {
         if (run_start != UINT32_MAX) {
           const uint32_t run_end = hp << subpages_per_host_page_log2_;
@@ -349,7 +419,8 @@ class SubpageTracker {
         const uint32_t local = sp & (subpages_per_host_page_ - 1);
         const uint8_t bit = uint8_t(uint32_t(1) << local);
         bool unchanged = false;
-        if ((hash_valid_mask_[hp] & bit) && !(gpu_written_mask_[hp] & bit)) {
+        if ((hash_valid_mask_[hp] & bit) &&
+            !(LoadGpuWrittenMask(hp) & bit)) {
           uint64_t current_hash = 0;
           if (try_hash_subpage(sp, current_hash) &&
               current_hash == upload_hash_[sp]) {
@@ -358,9 +429,11 @@ class SubpageTracker {
         }
         if (unchanged) {
           flush_run();
-          const bool was_full = valid_mask_[hp] == full_host_page_mask_;
-          valid_mask_[hp] |= bit;
-          if (!was_full && valid_mask_[hp] == full_host_page_mask_) {
+          const uint8_t cur_valid = LoadValidMask(hp);
+          const bool was_full = cur_valid == full_host_page_mask_;
+          const uint8_t next_valid = uint8_t(cur_valid | bit);
+          StoreValidMask(hp, next_valid);
+          if (!was_full && next_valid == full_host_page_mask_) {
             out_newly_full_host_pages.push_back(hp);
           }
         } else {
@@ -410,6 +483,19 @@ class SubpageTracker {
   }
 
  private:
+  uint8_t LoadValidMask(uint32_t host_page) const {
+    return __atomic_load_n(&valid_mask_[host_page], __ATOMIC_ACQUIRE);
+  }
+  void StoreValidMask(uint32_t host_page, uint8_t value) {
+    __atomic_store_n(&valid_mask_[host_page], value, __ATOMIC_RELEASE);
+  }
+  uint8_t LoadGpuWrittenMask(uint32_t host_page) const {
+    return __atomic_load_n(&gpu_written_mask_[host_page], __ATOMIC_ACQUIRE);
+  }
+  void StoreGpuWrittenMask(uint32_t host_page, uint8_t value) {
+    __atomic_store_n(&gpu_written_mask_[host_page], value, __ATOMIC_RELEASE);
+  }
+
   bool active_ = false;
   uint32_t buffer_size_ = 0;
   uint32_t host_page_size_log2_ = 0;

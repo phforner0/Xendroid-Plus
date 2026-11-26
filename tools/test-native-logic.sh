@@ -80,7 +80,7 @@ done
 "$build/wave5_universal_perf_test" "$cpp"
 "${cxx[@]}" "${flags[@]}" -pthread "$test/gpu_pipeline_async_test.cc" -o "$build/gpu_pipeline_async_test"
 "$build/gpu_pipeline_async_test" "$cpp"
-"${cxx[@]}" "${flags[@]}" "$test/gpu_zerocopy_upload_test.cc" -o "$build/gpu_zerocopy_upload_test"
+"${cxx[@]}" "${flags[@]}" -pthread "$test/gpu_zerocopy_upload_test.cc" -o "$build/gpu_zerocopy_upload_test"
 "$build/gpu_zerocopy_upload_test" "$cpp"
 "${cxx[@]}" "${flags[@]}" "$test/wave6_cpu_kernel_edge_test.cc" -o "$build/wave6_cpu_kernel_edge_test"
 "$build/wave6_cpu_kernel_edge_test" "$cpp"

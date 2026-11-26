@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -7,6 +8,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -288,11 +290,15 @@ void TestSubpage4KBTracker() {
   ZC_CHECK((t.hash_valid_mask(0) & (1u << 1)) == 0u);
   ZC_CHECK((t.hash_valid_mask(0) & (1u << 0)) != 0u);
 
-  // SetPageValidFromGpuWritten keeps ONLY subpage 1 valid.
+  // SetHostPageValidFromGpuWritten keeps ONLY subpage 1 valid and returns the
+  // bitmask of previously CPU-valid subpages invalidated (0b1101 = subpages
+  // 0,2,3) even for partially valid host pages so PrepareForTraceDownload fires
+  // watches cleanly.
   t.OnGpuSubmissionOpened();
   ZC_CHECK(!t.AnySubpageRangeInvalidatedSinceSubmissionOpen(
       std::array<std::pair<uint32_t, uint32_t>, 1>{{{0, 4}}}.data(), 1));
-  t.SetHostPageValidFromGpuWritten(0);
+  const uint8_t inv_full = t.SetHostPageValidFromGpuWritten(0);
+  ZC_CHECK(inv_full == 0x0Du);
   ZC_CHECK(t.valid_mask(0) == 0x02u);
   ZC_CHECK(t.gpu_written_mask(0) == 0x02u);
   ZC_CHECK(!t.IsHostPageFullyValid(0));
@@ -301,6 +307,119 @@ void TestSubpage4KBTracker() {
       std::array<std::pair<uint32_t, uint32_t>, 1>{{{0, 1}}}.data(), 1));
   ZC_CHECK(!t.AnySubpageRangeInvalidatedSinceSubmissionOpen(
       std::array<std::pair<uint32_t, uint32_t>, 1>{{{1, 1}}}.data(), 1));
+
+  // Partially valid host page 1 (only subpage 0 CPU-valid, host valid bit = 0):
+  // SetHostPageValidFromGpuWritten MUST report non-zero invalidated mask (0x01)
+  // so PrepareForTraceDownload includes it in fire_watches_block.
+  t.MarkRangeValid(0x4000, 0x1000, /*written_by_gpu=*/false);
+  ZC_CHECK(!t.IsHostPageFullyValid(1));
+  ZC_CHECK(t.valid_mask(1) == 0x01u);
+  const uint8_t inv_partial = t.SetHostPageValidFromGpuWritten(1);
+  ZC_CHECK(inv_partial == 0x01u);
+  ZC_CHECK(t.valid_mask(1) == 0x00u);
+  // Repeating when nothing is CPU-valid returns 0.
+  ZC_CHECK(t.SetHostPageValidFromGpuWritten(1) == 0x00u);
+
+  // RewatchPages support for partially & fully valid unwatched host pages:
+  // Host page 2 has subpages 0, 2, 3 valid (partially valid -> host valid bit
+  // is 0), host page 3 has all 4 valid, host page 4 has none valid.
+  t.MarkRangeValid(0x8000, 0x1000, false);
+  t.MarkRangeValid(0xA000, 0x2000, false);
+  t.SetSubpageUploadHash(8, 1001);
+  t.SetSubpageUploadHash(10, 1002);
+  t.SetSubpageUploadHash(11, 1003);
+  t.MarkRangeValid(0xC000, 0x4000, false);
+  t.SetSubpageUploadHash(12, 2000);
+  t.SetSubpageUploadHash(13, 2001);
+  t.SetSubpageUploadHash(14, 2002);
+  t.SetSubpageUploadHash(15, 2003);
+  const uint64_t rewatch_mask =
+      (uint64_t(1) << 2) | (uint64_t(1) << 3) | (uint64_t(1) << 4);
+  const uint64_t to_protect =
+      t.FilterBlockMaskWithAnyValidSubpage(/*block=*/0, rewatch_mask);
+  // Pages 2 (partially valid!) and 3 (fully valid) MUST both be re-protected;
+  // page 4 (0 valid subpages) is excluded.
+  ZC_CHECK(to_protect == ((uint64_t(1) << 2) | (uint64_t(1) << 3)));
+
+  // Verify page 3 when all 4 subpage hashes match -> 0 mismatches (no spurious
+  // invalidation!).
+  const uint8_t mismatch_p3 = t.VerifyAndInvalidateHostPageSubpages(
+      3, /*mark_submission_invalidated=*/true,
+      [](uint32_t sp, uint64_t& out) -> bool {
+        out = 2000u + (sp - 12u);
+        return true;
+      });
+  ZC_CHECK(mismatch_p3 == 0x00u);
+  ZC_CHECK(t.IsHostPageFullyValid(3));
+
+  // Verify partially valid page 2 when subpage 10 changed (1002 -> 9999) while
+  // subpages 8 and 11 still match -> ONLY bit 2 (subpage 10) invalidated!
+  const uint8_t mismatch_p2 = t.VerifyAndInvalidateHostPageSubpages(
+      2, /*mark_submission_invalidated=*/true,
+      [](uint32_t sp, uint64_t& out) -> bool {
+        if (sp == 8) { out = 1001; return true; }
+        if (sp == 10) { out = 9999; return true; }
+        if (sp == 11) { out = 1003; return true; }
+        return false;
+      });
+  ZC_CHECK(mismatch_p2 == 0x04u);
+  ZC_CHECK(t.valid_mask(2) == 0x09u);  // Subpages 0 and 3 remain valid.
+
+  // Concurrent lockless reader (IsRangeValid / IsRangeGpuWritten) vs writer
+  // (MarkRangeValid / InvalidateHostPages) exercises atomic acquire/release
+  // ordering on valid_mask_ and gpu_written_mask_.
+  {
+    // 1) Monotonic publish: StoreGpuWrittenMask happens-before StoreValidMask,
+    // so any reader observing IsRangeValid()==true MUST observe
+    // IsRangeGpuWritten()==true immediately.
+    std::atomic<bool> pub_started{false};
+    std::atomic<bool> publish_done{false};
+    std::thread pub_reader([&]() {
+      pub_started.store(true, std::memory_order_release);
+      while (!publish_done.load(std::memory_order_acquire)) {
+        for (uint32_t hp = 4; hp < 36; ++hp) {
+          const uint32_t addr = hp << 14;
+          if (t.IsRangeValid(addr, 0x4000)) {
+            ZC_CHECK(t.IsRangeGpuWritten(addr, 0x4000));
+          }
+        }
+      }
+    });
+    while (!pub_started.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (uint32_t hp = 4; hp < 36; ++hp) {
+      t.MarkRangeValid(hp << 14, 0x4000, /*written_by_gpu=*/true);
+    }
+    publish_done.store(true, std::memory_order_release);
+    pub_reader.join();
+
+    // 2) Rapid concurrent mark/invalidate stress without data races.
+    std::atomic<bool> stress_started{false};
+    std::atomic<bool> stress_done{false};
+    std::atomic<uint64_t> reads{0};
+    std::thread stress_reader([&]() {
+      stress_started.store(true, std::memory_order_release);
+      uint64_t local = 0;
+      do {
+        (void)t.IsRangeValid(0x10000, 0x4000);
+        (void)t.IsRangeGpuWritten(0x10000, 0x4000);
+        ++local;
+      } while (!stress_done.load(std::memory_order_acquire));
+      reads.store(local, std::memory_order_relaxed);
+    });
+    while (!stress_started.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int iter = 0; iter < 4000; ++iter) {
+      t.MarkRangeValid(0x10000, 0x4000, /*written_by_gpu=*/(iter & 1) != 0);
+      t.InvalidateHostPages(4, 4, false);
+    }
+    stress_done.store(true, std::memory_order_release);
+    stress_reader.join();
+    ZC_CHECK(reads.load(std::memory_order_relaxed) > 0u);
+    t.InvalidateHostPages(4, 35, false);
+  }
 
   // Invalidating host page 0 clears GPU-written subpage 1's hash too.
   t.InvalidateHostPages(0, 0, true);
@@ -339,9 +458,20 @@ void TestSourceContracts(const fs::path& cpp_root) {
   const std::string shmem_h = ReadSourceText(gpu_dir / "shared_memory.h");
   const std::string shmem_cc = ReadSourceText(gpu_dir / "shared_memory.cc");
   ZC_CHECK(shmem_h.find("class SubpageTracker") != std::string::npos);
+  ZC_CHECK(shmem_h.find("__atomic_load_n(&valid_mask_") != std::string::npos);
+  ZC_CHECK(shmem_h.find("__atomic_load_n(&gpu_written_mask_") !=
+           std::string::npos);
+  ZC_CHECK(shmem_h.find("FilterBlockMaskWithAnyValidSubpage") !=
+           std::string::npos);
+  ZC_CHECK(shmem_h.find("VerifyAndInvalidateHostPageSubpages") !=
+           std::string::npos);
   ZC_CHECK(shmem_cc.find("shared_memory_subpage_tracking, false") !=
            std::string::npos);
   ZC_CHECK(shmem_cc.find("UPDATE_from_bool(shared_memory_subpage_tracking") ==
+           std::string::npos);
+  ZC_CHECK(shmem_cc.find("FilterBlockMaskWithAnyValidSubpage(block, mask)") !=
+           std::string::npos);
+  ZC_CHECK(shmem_cc.find("VerifyAndInvalidateHostPageSubpages(") !=
            std::string::npos);
 
   // 3. CommandProcessor GPU Commands thread nice cvar contracts (#55).
