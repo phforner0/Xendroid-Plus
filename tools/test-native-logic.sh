@@ -78,6 +78,8 @@ done
 "$build/wave4_crossblock_jprof_logic_test" "$cpp" "$build/wave4-scratch"
 "${cxx[@]}" "${flags[@]}" "$test/wave5_universal_perf_test.cc" -o "$build/wave5_universal_perf_test"
 "$build/wave5_universal_perf_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" "$test/wave6_cpu_kernel_edge_test.cc" -o "$build/wave6_cpu_kernel_edge_test"
+"$build/wave6_cpu_kernel_edge_test" "$cpp"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then

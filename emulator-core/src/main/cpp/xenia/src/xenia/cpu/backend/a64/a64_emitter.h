@@ -365,6 +365,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // the long-range form).
   bool near_branches_ = false;
   bool uses_stack_skew_skip_ = false;
+  bool uses_stackpoints_ = true;
 };
 
 }  // namespace a64

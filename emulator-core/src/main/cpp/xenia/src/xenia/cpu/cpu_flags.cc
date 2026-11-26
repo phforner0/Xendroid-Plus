@@ -68,6 +68,13 @@ DEFINE_uint32(
 
 DEFINE_bool(validate_hir, false,
             "Perform validation checks on the HIR during compilation.", "CPU");
+DEFINE_bool(
+    accurate_fpscr_status, false,
+    "Maintain FPSCR exception summary bits (FX/FEX/VX/OX) after scalar FP "
+    "instructions. Disabled by default: titles rarely inspect them and "
+    "skipping the FPSCR read-modify-write avoids overhead while preserving "
+    "CR1 copies when Rc=1.",
+    "CPU");
 
 // https://github.com/bitsh1ft3r/Xenon/blob/091e8cd4dc4a7c697b4979eb200be7c9dee3590b/Xenon/Core/XCPU/PPU/PowerPC.h#L370
 DEFINE_uint64(

@@ -152,6 +152,16 @@ class Processor {
   bool dynamic_code_enabled() const {
     return dynamic_code_enabled_.load(std::memory_order_relaxed);
   }
+  // VSCR[SAT] observability census: while active or if any module contains
+  // mfvscr (or dynamic code is enabled), saturating vector ops update VSCR.
+  void BeginVscrSatCensus();
+  void FinishVscrSatCensus();
+  void OnModuleReadsVscr() {
+    vscr_sat_observable_.store(true, std::memory_order_release);
+  }
+  bool vscr_sat_observable() const {
+    return vscr_sat_observable_.load(std::memory_order_acquire);
+  }
   // Whether |module| holds the code that no module claims.
   bool IsDynamicCodeModule(const Module* module) const {
     return module && module == dynamic_code_module_.get();
@@ -354,6 +364,7 @@ class Processor {
   // Consulted after modules_, so a loaded module always takes precedence.
   std::unique_ptr<Module> dynamic_code_module_;
   std::atomic<bool> dynamic_code_enabled_{false};
+  std::atomic<bool> vscr_sat_observable_{true};
   std::atomic<bool> keep_dynamic_context_stores_{false};
   std::atomic<SyscallHook> syscall_hook_{nullptr};
   std::atomic<CodeFaultHook> code_fault_hook_{nullptr};

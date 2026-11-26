@@ -92,6 +92,28 @@ static uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
   return 0;
 }
 
+static bool MakesCall(const hir::HIRBuilder* builder) {
+  for (const auto* block = builder->first_block(); block; block = block->next) {
+    for (const auto* instr = block->instr_head; instr; instr = instr->next) {
+      switch (instr->GetOpcodeNum()) {
+        case hir::OPCODE_CALL:
+        case hir::OPCODE_CALL_TRUE:
+        case hir::OPCODE_CALL_INDIRECT:
+        case hir::OPCODE_CALL_INDIRECT_TRUE:
+        case hir::OPCODE_CALL_EXTERN:
+        case hir::OPCODE_TRAP:
+        case hir::OPCODE_TRAP_TRUE:
+        case hir::OPCODE_DEBUG_BREAK:
+        case hir::OPCODE_DEBUG_BREAK_TRUE:
+          return true;
+        default:
+          break;
+      }
+    }
+  }
+  return false;
+}
+
 // Max host code per translated guest function. 1 MiB was too small for large,
 // FP-heavy guest functions (each PowerPC FP op emits NaN-handling overhead),
 // which overflowed the Xbyak buffer -> uncaught Xbyak_aarch64::Error "code is
@@ -166,6 +188,7 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
     uses_no_skew = false;
   }
   uses_stack_skew_skip_ = allow_skew_skip && uses_no_skew;
+  uses_stackpoints_ = MakesCall(builder);
 
   EmitFunctionInfo func_info = {};
   bool emitted = false;
@@ -200,6 +223,7 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   }
   near_branches_ = false;
   uses_stack_skew_skip_ = false;
+  uses_stackpoints_ = true;
   if (!emitted) {
     // Emplace only runs on success, so a failed compile has to reset too.
     ResetPerFunctionState();
@@ -1797,7 +1821,8 @@ void A64Emitter::HandleStackpointOverflowError(ppc::PPCContext* context) {
 }
 
 void A64Emitter::PushStackpoint() {
-  if (!cvars::a64_enable_host_guest_stack_synchronization) {
+  if (!cvars::a64_enable_host_guest_stack_synchronization ||
+      !uses_stackpoints_) {
     return;
   }
   // x8 = stackpoints array, w9 = current depth
@@ -1842,7 +1867,8 @@ void A64Emitter::PushStackpoint() {
 }
 
 void A64Emitter::PopStackpoint() {
-  if (!cvars::a64_enable_host_guest_stack_synchronization) {
+  if (!cvars::a64_enable_host_guest_stack_synchronization ||
+      !uses_stackpoints_) {
     return;
   }
   // Decrement current_stackpoint_depth.

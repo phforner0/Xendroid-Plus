@@ -101,12 +101,17 @@ void PPCHIRBuilder::Reset() {
   instr_offset_list_ = NULL;
   label_list_ = NULL;
   with_debug_info_ = false;
+  track_fpscr_status_ = false;
+  vscr_sat_observable_ = true;
   HIRBuilder::Reset();
 }
 
 bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags,
                          HleMemoryOp hle_memory_op) {
   SCOPE_profile_cpu_f("cpu");
+
+  track_fpscr_status_ = cvars::accurate_fpscr_status;
+  vscr_sat_observable_ = frontend_->processor()->vscr_sat_observable();
 
   Module* module = function->module();
   if (frontend_->processor()->KeepsContextStores(module)) {
@@ -648,6 +653,13 @@ void PPCHIRBuilder::StoreFPSCR(Value* value) {
 }
 
 void PPCHIRBuilder::UpdateFPSCR(Value* result, bool update_cr1) {
+  if (!track_fpscr_status_) {
+    if (update_cr1) {
+      CopyFPSCRToCR1();
+    }
+    return;
+  }
+
   // TODO(benvanik): detect overflow and nan cases.
   // fx and vx are the most important.
   /*
@@ -747,6 +759,9 @@ Value* PPCHIRBuilder::LoadSAT() {
 }
 
 void PPCHIRBuilder::StoreSAT(Value* value) {
+  if (!vscr_sat_observable_) {
+    return;
+  }
   value = Truncate(value, INT8_TYPE);
   StoreContext(offsetof(PPCContext, vscr_sat), value);
 

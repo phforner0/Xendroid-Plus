@@ -249,6 +249,7 @@ class XexModule : public xe::cpu::Module {
   bool IsCodeAddress(uint32_t address) const {
     return !(address & 3) && address >= low_address_ && address < high_address_;
   }
+  bool ReadsVscr() const;
 
  protected:
   std::unique_ptr<Function> CreateFunction(uint32_t address) override;
