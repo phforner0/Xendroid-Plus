@@ -1166,6 +1166,7 @@ void VulkanCommandProcessor::WaitUntilGpuIdleForBench() {
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
   shared_memory_->InvalidateAllPages();
+  small_readback_ring_.InvalidatePending();
   sysconst_dirty_tracker_.InvalidateAll();
   sysconst_memo_.valid = false;
   if (pipeline_cache_) {
@@ -9660,6 +9661,12 @@ bool VulkanCommandProcessor::TryEnqueueSmallReadback(uint32_t written_address,
   }
   const VkDeviceSize dst_offset =
       VkDeviceSize(slot_index) * draw_cuts::kSmallReadbackMaxBytes;
+  // Transition shared_memory_->last_usage_ to kRead (TRANSFER_READ) so any
+  // subsequent write/resolve in this submission emits a WAR TRANSFER_READ ->
+  // SHADER_WRITE/TRANSFER_WRITE barrier before overwriting the source region.
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  // Keep an explicit write -> transfer-read barrier too so in-pass resolve
+  // writes (MarkInPassWrite when last_usage_ was already kRead) are ordered.
   PushBufferMemoryBarrier(
       shared_memory_->buffer(), written_address, written_length,
       guest_shader_pipeline_stages_ | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
@@ -9697,22 +9704,26 @@ void VulkanCommandProcessor::DrainCompletedSmallReadbacks(
       !small_readback_ring_mapping_) {
     return;
   }
-  if (!small_readback_ring_coherent_) {
-    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
-    VkMappedMemoryRange range;
-    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    range.pNext = nullptr;
-    range.memory = small_readback_ring_memory_;
-    range.offset = 0;
-    range.size = VK_WHOLE_SIZE;
-    vulkan_device->functions().vkInvalidateMappedMemoryRanges(
-        vulkan_device->device(), 1, &range);
-  }
+  bool memory_invalidated = small_readback_ring_coherent_;
   small_readback_ring_.DrainCompleted(
       completed_submission,
-      [this](const draw_cuts::SmallReadbackRingSlot& slot) {
+      [this, &memory_invalidated](
+          const draw_cuts::SmallReadbackRingSlot& slot) {
         if (!IsResolveDestinationResident(slot.guest_address, slot.length)) {
           return;
+        }
+        if (!memory_invalidated) {
+          const ui::vulkan::VulkanDevice* const vulkan_device =
+              GetVulkanDevice();
+          VkMappedMemoryRange range;
+          range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+          range.pNext = nullptr;
+          range.memory = small_readback_ring_memory_;
+          range.offset = 0;
+          range.size = VK_WHOLE_SIZE;
+          vulkan_device->functions().vkInvalidateMappedMemoryRanges(
+              vulkan_device->device(), 1, &range);
+          memory_invalidated = true;
         }
         const uint8_t* src =
             small_readback_ring_mapping_ +

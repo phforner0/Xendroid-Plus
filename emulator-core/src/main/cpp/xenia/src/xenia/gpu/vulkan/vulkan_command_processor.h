@@ -615,6 +615,7 @@ inline bool IsSmallReadbackRingEligible(uint32_t length_bytes) {
 
 struct SmallReadbackRingSlot {
   uint64_t submission = 0;
+  uint64_t generation = 0;
   uint32_t guest_address = 0;
   uint32_t length = 0;
   uint32_t slot_index = 0;
@@ -625,10 +626,16 @@ class SmallReadbackRingState {
   bool empty() const { return count_ == 0u; }
   bool full() const { return count_ >= kSmallReadbackRingSlotCount; }
   uint32_t pending_count() const { return count_; }
+  uint64_t current_generation() const { return generation_; }
 
   uint64_t OldestSubmission() const {
     return count_ > 0u ? slots_[head_].submission : 0u;
   }
+
+  // Marks all currently queued slots as discarded (e.g. on InvalidateGpuMemory)
+  // WITHOUT resetting head_/tail_/count_, so in-flight GPU copies still retire
+  // before their ring slots can be reused (preventing WAW on the ring buffer).
+  void InvalidatePending() { ++generation_; }
 
   bool TryEnqueue(uint64_t submission, uint32_t guest_address, uint32_t length,
                   uint32_t& slot_index_out) {
@@ -638,6 +645,7 @@ class SmallReadbackRingState {
     const uint32_t idx = tail_;
     SmallReadbackRingSlot& slot = slots_[idx];
     slot.submission = submission;
+    slot.generation = generation_;
     slot.guest_address = guest_address;
     slot.length = length;
     slot.slot_index = idx;
@@ -654,7 +662,9 @@ class SmallReadbackRingState {
       const SmallReadbackRingSlot slot = slots_[head_];
       head_ = (head_ + 1u) % kSmallReadbackRingSlotCount;
       --count_;
-      on_slot(slot);
+      if (slot.generation == generation_) {
+        on_slot(slot);
+      }
       ++drained;
     }
     return drained;
@@ -664,6 +674,7 @@ class SmallReadbackRingState {
     head_ = 0u;
     tail_ = 0u;
     count_ = 0u;
+    generation_ = 1u;
   }
 
  private:
@@ -671,6 +682,7 @@ class SmallReadbackRingState {
   uint32_t head_ = 0u;
   uint32_t tail_ = 0u;
   uint32_t count_ = 0u;
+  uint64_t generation_ = 1u;
 };
 
 }  // namespace draw_cuts

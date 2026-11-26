@@ -452,6 +452,46 @@ void TestSmallReadbackAsyncRing() {
   DRAW_CUTS_CHECK(ring.full());
   ring.Reset();
   DRAW_CUTS_CHECK(ring.empty());
+
+  // Safe generation-based discard on InvalidateGpuMemory:
+  // In-flight slots MUST stay occupied until their submission retires (no WAW
+  // slot reuse), while DrainCompleted skips invoking the memcpy callback on
+  // discarded pre-invalidation slots and delivers post-invalidation slots.
+  uint32_t pre0 = UINT32_MAX;
+  uint32_t pre1 = UINT32_MAX;
+  uint32_t post0 = UINT32_MAX;
+  DRAW_CUTS_CHECK(ring.TryEnqueue(50, 0x05000000u, 64, pre0));
+  DRAW_CUTS_CHECK(ring.TryEnqueue(51, 0x05001000u, 64, pre1));
+  const uint64_t gen_before = ring.current_generation();
+  ring.InvalidatePending();
+  DRAW_CUTS_CHECK(ring.current_generation() == gen_before + 1);
+  // Pre-invalidation slots remain occupied until GPU retires them.
+  DRAW_CUTS_CHECK(ring.pending_count() == 2);
+  DRAW_CUTS_CHECK(ring.OldestSubmission() == 50);
+  // Post-invalidation enqueue gets a distinct slot (no WAW with in-flight pre0/pre1).
+  DRAW_CUTS_CHECK(ring.TryEnqueue(52, 0x05002000u, 128, post0));
+  DRAW_CUTS_CHECK(post0 != pre0 && post0 != pre1);
+  DRAW_CUTS_CHECK(ring.pending_count() == 3);
+  // Retire pre0 & pre1: ring releases both slots, but skips copying stale bytes.
+  std::vector<uint32_t> copied_addrs;
+  const uint32_t retired_pre =
+      ring.DrainCompleted(51, [&](const dc::SmallReadbackRingSlot& s) {
+        copied_addrs.push_back(s.guest_address);
+      });
+  DRAW_CUTS_CHECK(retired_pre == 2);
+  DRAW_CUTS_CHECK(copied_addrs.empty());
+  DRAW_CUTS_CHECK(ring.pending_count() == 1);
+  DRAW_CUTS_CHECK(ring.OldestSubmission() == 52);
+  // Retire post0: ring releases it AND invokes callback to copy fresh bytes.
+  const uint32_t retired_post =
+      ring.DrainCompleted(52, [&](const dc::SmallReadbackRingSlot& s) {
+        DRAW_CUTS_CHECK(s.slot_index == post0);
+        DRAW_CUTS_CHECK(s.length == 128);
+        copied_addrs.push_back(s.guest_address);
+      });
+  DRAW_CUTS_CHECK(retired_post == 1);
+  DRAW_CUTS_CHECK(copied_addrs.size() == 1 && copied_addrs[0] == 0x05002000u);
+  DRAW_CUTS_CHECK(ring.empty());
 }
 
 void TestGuestTimeHoldRefCount() {
@@ -623,10 +663,27 @@ void TestSourceInvariants(const fs::path& cpp_root) {
       cp_cc.find("VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR") !=
       std::string::npos);
 
-  // Feature 5: Small readback async ring.
+  // Feature 5: Small readback async ring + WAR Use(kRead) + InvalidatePending.
   DRAW_CUTS_CHECK(cp_cc.find("DrainCompletedSmallReadbacks(") !=
                   std::string::npos);
   DRAW_CUTS_CHECK(cp_cc.find("TryEnqueueSmallReadback(") != std::string::npos);
+  const size_t try_enqueue_pos =
+      cp_cc.find("bool VulkanCommandProcessor::TryEnqueueSmallReadback(");
+  const size_t drain_pos =
+      cp_cc.find("void VulkanCommandProcessor::DrainCompletedSmallReadbacks(");
+  DRAW_CUTS_CHECK(try_enqueue_pos != std::string::npos &&
+                  drain_pos != std::string::npos && try_enqueue_pos < drain_pos);
+  const std::string try_enqueue_body =
+      cp_cc.substr(try_enqueue_pos, drain_pos - try_enqueue_pos);
+  DRAW_CUTS_CHECK(
+      try_enqueue_body.find("shared_memory_->Use(VulkanSharedMemory::Usage::kRead);") !=
+      std::string::npos);
+  const size_t inv_gpu_mem_pos =
+      cp_cc.find("void VulkanCommandProcessor::InvalidateGpuMemory()");
+  DRAW_CUTS_CHECK(inv_gpu_mem_pos != std::string::npos);
+  const std::string inv_gpu_mem_head = cp_cc.substr(inv_gpu_mem_pos, 512);
+  DRAW_CUTS_CHECK(inv_gpu_mem_head.find("small_readback_ring_.InvalidatePending();") !=
+                  std::string::npos);
 
   // Feature 6: Clock::HoldGuestTime refcounted + pipeline waits.
   DRAW_CUTS_CHECK(clock_h.find("GuestTimeHoldRefCounter") != std::string::npos);
