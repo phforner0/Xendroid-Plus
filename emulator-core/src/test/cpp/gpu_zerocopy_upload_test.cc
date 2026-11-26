@@ -437,7 +437,7 @@ void TestSourceContracts(const fs::path& cpp_root) {
       ReadSourceText(vk_dir / "vulkan_shared_memory.h");
   const std::string vk_shmem_cc =
       ReadSourceText(vk_dir / "vulkan_shared_memory.cc");
-  ZC_CHECK(vk_shmem_cc.find("vulkan_shared_memory_zero_copy_upload, false") !=
+  ZC_CHECK(vk_shmem_cc.find("vulkan_shared_memory_zero_copy_upload, true") !=
            std::string::npos);
   ZC_CHECK(vk_shmem_cc.find("UPDATE_from_bool(vulkan_shared_memory_zero_copy_upload") ==
            std::string::npos);
@@ -474,13 +474,14 @@ void TestSourceContracts(const fs::path& cpp_root) {
   ZC_CHECK(shmem_cc.find("VerifyAndInvalidateHostPageSubpages(") !=
            std::string::npos);
 
-  // 3. CommandProcessor GPU Commands thread nice cvar contracts (#55).
+  // 3. CommandProcessor GPU Commands thread nice cvar contracts (#55, promoted #78).
   const std::string cp_cc = ReadSourceText(gpu_dir / "command_processor.cc");
-  ZC_CHECK(cp_cc.find("DEFINE_int32(\n    gpu_commands_thread_nice, 0,") !=
+  ZC_CHECK(cp_cc.find("DEFINE_int32(\n    gpu_commands_thread_nice, -12,") !=
                std::string::npos ||
-           cp_cc.find("gpu_commands_thread_nice, 0,") != std::string::npos);
+           cp_cc.find("gpu_commands_thread_nice, -12,") != std::string::npos);
   ZC_CHECK(cp_cc.find("UPDATE_from_int32(gpu_commands_thread_nice") ==
            std::string::npos);
+  ZC_CHECK(cp_cc.find("debug.xendroid.gpu_thread_nice") != std::string::npos);
   ZC_CHECK(cp_cc.find("setpriority(PRIO_PROCESS, 0,") != std::string::npos);
 }
 

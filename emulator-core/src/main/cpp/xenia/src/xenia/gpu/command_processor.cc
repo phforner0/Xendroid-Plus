@@ -137,10 +137,11 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_int32(
-    gpu_commands_thread_nice, 0,
+    gpu_commands_thread_nice, -12,
     "Android: POSIX nice value for the GPU Commands thread in [-20, 19]. "
-    "0 leaves the thread priority unchanged; e.g. -12 breaks the prio=110 "
-    "tie with Guest CPU 2 on the Prime core during A/B testing.",
+    "Default -12 breaks the prio=110 tie with Guest CPU 2 on the Prime core; "
+    "set to 0 (or debug.xendroid.gpu_thread_nice=0) to leave the thread "
+    "priority unchanged.",
     "GPU");
 
 DEFINE_bool(

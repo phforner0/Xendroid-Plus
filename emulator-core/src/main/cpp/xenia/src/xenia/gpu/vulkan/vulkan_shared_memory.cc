@@ -58,7 +58,7 @@ DEFINE_bool(vulkan_shared_memory_host_visible, true,
             "Vulkan");
 
 DEFINE_bool(
-    vulkan_shared_memory_zero_copy_upload, false,
+    vulkan_shared_memory_zero_copy_upload, true,
     "When the shared-memory buffer is densely host-mapped "
     "(DEVICE_LOCAL | HOST_VISIBLE | HOST_CACHED), write CPU uploads directly "
     "into host_mapped_data_ for pages whose last GPU submission has already "
