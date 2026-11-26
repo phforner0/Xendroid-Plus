@@ -1599,10 +1599,40 @@ static constexpr bool ColorResolveNumberFormatMatches(
   }
 }
 
+void GetResolveCopyShaderGroupCount(ResolveCopyShaderIndex shader,
+                                    uint32_t width, uint32_t height,
+                                    bool prefer_64x1_workgroup,
+                                    uint32_t& group_count_x_out,
+                                    uint32_t& group_count_y_out) {
+  if (shader == ResolveCopyShaderIndex::kUnknown ||
+      size_t(shader) >= size_t(ResolveCopyShaderIndex::kCount)) {
+    group_count_x_out = 0;
+    group_count_y_out = 0;
+    return;
+  }
+  const ResolveCopyShaderInfo& shader_info =
+      resolve_copy_shader_info[size_t(shader)];
+  const bool use_64x1 =
+      prefer_64x1_workgroup &&
+      (shader == ResolveCopyShaderIndex::kFast32bpp1x2xMSAA ||
+       shader == ResolveCopyShaderIndex::kFast32bpp4xMSAA ||
+       shader == ResolveCopyShaderIndex::kFast64bpp1x2xMSAA ||
+       shader == ResolveCopyShaderIndex::kFast64bpp4xMSAA);
+  const uint32_t group_size_x_log2 =
+      use_64x1 ? (shader_info.group_size_x_log2 + 3u)
+               : shader_info.group_size_x_log2;
+  const uint32_t group_size_y_log2 =
+      use_64x1 ? 0u : shader_info.group_size_y_log2;
+  group_count_x_out =
+      (width + ((uint32_t(1) << group_size_x_log2) - 1u)) >> group_size_x_log2;
+  group_count_y_out =
+      (height + ((uint32_t(1) << group_size_y_log2) - 1u)) >> group_size_y_log2;
+}
+
 ResolveCopyShaderIndex ResolveInfo::GetCopyShader(
     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
     ResolveCopyShaderConstants& constants_out, uint32_t& group_count_x_out,
-    uint32_t& group_count_y_out) const {
+    uint32_t& group_count_y_out, bool prefer_64x1_workgroup) const {
   ResolveCopyShaderIndex shader = ResolveCopyShaderIndex::kUnknown;
   bool is_depth = IsCopyingDepth();
   ResolveEdramInfo edram_info = is_depth ? depth_edram_info : color_edram_info;
@@ -1674,12 +1704,8 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(
         draw_resolution_scale_x;
     uint32_t height = (height_div_8 << xenos::kResolveAlignmentPixelsLog2) *
                       draw_resolution_scale_y;
-    const ResolveCopyShaderInfo& shader_info =
-        resolve_copy_shader_info[size_t(shader)];
-    group_count_x_out = (width + ((1 << shader_info.group_size_x_log2) - 1)) >>
-                        shader_info.group_size_x_log2;
-    group_count_y_out = (height + ((1 << shader_info.group_size_y_log2) - 1)) >>
-                        shader_info.group_size_y_log2;
+    GetResolveCopyShaderGroupCount(shader, width, height, prefer_64x1_workgroup,
+                                   group_count_x_out, group_count_y_out);
   } else {
     XELOGE("No resolve copy compute shader for the provided configuration");
     assert_always();

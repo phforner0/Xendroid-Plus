@@ -70,17 +70,21 @@ void main() {
   // is applied after sample averaging (the averaging 0.5 is explicit above,
   // where the full path folds it into the factor instead). RGB-only for
   // 7e3-float EDRAM (alpha is 2-bit fixed point) unless the destination can
-  // store alpha > 1.
+  // store alpha > 1. Skip the multiply when the bias factor is 1.0 so float
+  // formats preserve denormals and NaN payloads bitwise.
   dont_flatten_xe
-  if ((resolve_info.edram_format ==
-           kXenosColorRenderTargetFormat_2_10_10_10_FLOAT ||
-       resolve_info.edram_format ==
-           kXenosColorRenderTargetFormat_2_10_10_10_FLOAT_AS_16_16_16_16) &&
-      resolve_info.dest_format != kXenosFormat_16_16_16_16_FLOAT &&
-      resolve_info.dest_format != kXenosFormat_32_32_32_32_FLOAT) {
-    color.xyz *= resolve_info.dest_exp_bias_factor;
-  } else {
-    color *= resolve_info.dest_exp_bias_factor;
+  if (resolve_info.dest_exp_bias_factor != 1.0f) {
+    dont_flatten_xe
+    if ((resolve_info.edram_format ==
+             kXenosColorRenderTargetFormat_2_10_10_10_FLOAT ||
+         resolve_info.edram_format ==
+             kXenosColorRenderTargetFormat_2_10_10_10_FLOAT_AS_16_16_16_16) &&
+        resolve_info.dest_format != kXenosFormat_16_16_16_16_FLOAT &&
+        resolve_info.dest_format != kXenosFormat_32_32_32_32_FLOAT) {
+      color.xyz *= resolve_info.dest_exp_bias_factor;
+    } else {
+      color *= resolve_info.dest_exp_bias_factor;
+    }
   }
 #endif
 #if XE_RESOLVE_HOST_COLOR_BPP == 64
