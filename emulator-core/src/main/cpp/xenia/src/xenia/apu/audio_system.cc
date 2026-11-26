@@ -14,11 +14,11 @@
 #include "xenia/apu/apu_flags.h"
 #include "xenia/apu/audio_driver.h"
 #include "xenia/apu/xma_decoder.h"
+#include "../../../../xe_audio_adpf_logic.h"
 #include "../../../../xe_wave5_perf_logic.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_stream.h"
 #if XE_PLATFORM_xendroid
-#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -26,7 +26,6 @@
 #include <time.h>
 #include <unistd.h>
 #include <algorithm>
-#include <map>
 #include <string>
 #include <vector>
 #endif
@@ -86,8 +85,8 @@ DEFINE_bool(
     "APU");
 DEFINE_bool(
     apu_performance_hint, true,
-    "Register an ADPF performance hint session over the guest dispatch and "
-    "audio threads so the power HAL holds clocks for the audio deadline.",
+    "Register an ADPF performance hint session over the audio worker and XMA "
+    "decoder threads so the power HAL holds clocks for the audio deadline.",
     "APU");
 DEFINE_int32(
     apu_queue_target, 0,
@@ -159,112 +158,104 @@ X_STATUS AudioSystem::Setup(kernel::KernelState* kernel_state) {
 // Reporting pump duration against the block deadline is the unprivileged way
 // to stop a power profile parking cores below what the mixer needs.
 // dlsym'd: ADPF is API 33+, minSdk is 29.
+// Tracks ONLY Audio Worker + XMA Decoder (never Guest CPU 0..5) with RAII
+// closeSession and dynamic setThreads updates.
 class AudioPerformanceHint {
  public:
+  AudioPerformanceHint()
+      : session_(AudioSystem::kAudioPumpInterval * int64_t(1000),
+                 BuildAndroidOps()) {}
+
   void ReportPump(uint64_t actual_us) {
-    if (state_ == State::kDisabled) {
-      return;
-    }
-    if (state_ == State::kUninitialized) {
-      Initialize();
-      if (state_ == State::kDisabled) {
-        return;
-      }
-    }
-    report_(session_, static_cast<int64_t>(actual_us) * 1000);
+    session_.SyncAndReport(cvars::apu_performance_hint, actual_us,
+                           xendroid::GlobalAudioAdpfThreadRegistry());
   }
 
  private:
-  enum class State { kUninitialized, kActive, kDisabled };
+  struct AndroidApi {
+    void* manager = nullptr;
+    void* (*create_session)(void*, const int32_t*, size_t, int64_t) = nullptr;
+    int (*set_threads)(void*, const int32_t*, size_t) = nullptr;
+    int (*report_actual_work)(void*, int64_t) = nullptr;
+    void (*close_session)(void*) = nullptr;
+  };
 
-  void Initialize() {
-    state_ = State::kDisabled;
-    if (!cvars::apu_performance_hint) {
-      return;
-    }
-    void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!lib) {
-      return;
-    }
-    auto get_manager = reinterpret_cast<void* (*)()>(
-        dlsym(lib, "APerformanceHint_getManager"));
-    auto create_session = reinterpret_cast<void* (*)(
-        void*, const int32_t*, size_t, int64_t)>(
-        dlsym(lib, "APerformanceHint_createSession"));
-    report_ = reinterpret_cast<int (*)(void*, int64_t)>(
-        dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
-    if (!get_manager || !create_session || !report_) {
-      return;
-    }
-    void* manager = get_manager();
-    if (!manager) {
-      return;
-    }
-    // One thread per name, the oldest (lowest tid): a short-lived thread can
-    // carry a worker's name, and a session naming a thread that has exited by
-    // the time it is created fails as a whole (2 of 13 Forza launches: 10
-    // threads instead of 9).
-    std::map<std::string, int32_t> tid_by_name;
-    if (DIR* dir = opendir("/proc/self/task")) {
-      while (dirent* entry = readdir(dir)) {
-        int32_t tid = atoi(entry->d_name);
-        if (tid <= 0) {
-          continue;
-        }
-        char comm_path[64];
-        snprintf(comm_path, sizeof(comm_path), "/proc/self/task/%d/comm", tid);
-        char comm[32] = {0};
-        if (FILE* f = fopen(comm_path, "r")) {
-          fgets(comm, sizeof(comm), f);
-          fclose(f);
-        }
-        if (!strncmp(comm, "Guest CPU", 9) || !strncmp(comm, "Audio Worker", 12) ||
-            !strncmp(comm, "XMA Decoder", 11)) {
-          auto it = tid_by_name.emplace(comm, tid).first;
-          it->second = std::min(it->second, tid);
-        }
+  static xendroid::AudioAdpfOps BuildAndroidOps() {
+    xendroid::AudioAdpfOps ops;
+    static AndroidApi api = []() -> AndroidApi {
+      AndroidApi loaded;
+      void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
+      if (!lib) {
+        lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
       }
-      closedir(dir);
+      if (!lib) {
+        return loaded;
+      }
+      auto get_manager = reinterpret_cast<void* (*)()>(
+          dlsym(lib, "APerformanceHint_getManager"));
+      loaded.create_session = reinterpret_cast<decltype(loaded.create_session)>(
+          dlsym(lib, "APerformanceHint_createSession"));
+      loaded.set_threads = reinterpret_cast<decltype(loaded.set_threads)>(
+          dlsym(lib, "APerformanceHint_setThreads"));
+      loaded.report_actual_work =
+          reinterpret_cast<decltype(loaded.report_actual_work)>(
+              dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+      loaded.close_session = reinterpret_cast<decltype(loaded.close_session)>(
+          dlsym(lib, "APerformanceHint_closeSession"));
+      loaded.manager = get_manager ? get_manager() : nullptr;
+      return loaded;
+    }();
+    if (!api.manager || !api.create_session || !api.report_actual_work ||
+        !api.close_session) {
+      return ops;
     }
-    std::vector<int32_t> tids;
-    for (const auto& name_tid : tid_by_name) {
-      tids.push_back(name_tid.second);
-    }
-    if (tids.empty()) {
-      return;
-    }
-    session_ = create_session(manager, tids.data(), tids.size(),
-                              AudioSystem::kAudioPumpInterval * int64_t(1000));
-    if (!session_) {
-      // Once more with the threads still alive.
-      std::vector<int32_t> alive;
-      for (int32_t tid : tids) {
-        char task_path[48];
-        snprintf(task_path, sizeof(task_path), "/proc/self/task/%d", tid);
-        if (access(task_path, F_OK) == 0) {
-          alive.push_back(tid);
+    ops.user = &api;
+    ops.create_session = [](void* u, const int32_t* tids, size_t count,
+                            int64_t target_ns) -> void* {
+      auto* a = static_cast<AndroidApi*>(u);
+      void* s = a->create_session(a->manager, tids, count, target_ns);
+      if (s) {
+        XELOGI("AudioPerformanceHint: session over {} audio thread(s), target {}us",
+               count, target_ns / 1000);
+      } else {
+        XELOGW("AudioPerformanceHint: createSession failed ({} audio thread(s))",
+               count);
+      }
+      return s;
+    };
+    if (api.set_threads) {
+      ops.set_threads = [](void* u, void* session, const int32_t* tids,
+                           size_t count) -> int {
+        auto* a = static_cast<AndroidApi*>(u);
+        const int rc = a->set_threads(session, tids, count);
+        if (rc == 0) {
+          XELOGI("AudioPerformanceHint: updated session to {} audio thread(s)",
+                 count);
         }
-      }
-      if (!alive.empty() && alive.size() != tids.size()) {
-        tids.swap(alive);
-        session_ =
-            create_session(manager, tids.data(), tids.size(),
-                           AudioSystem::kAudioPumpInterval * int64_t(1000));
-      }
+        return rc;
+      };
     }
-    if (!session_) {
-      XELOGW("AudioPerformanceHint: createSession failed ({} threads)",
-             tids.size());
-      return;
-    }
-    XELOGI("AudioPerformanceHint: session over {} threads, target {}us",
-           tids.size(), AudioSystem::kAudioPumpInterval);
-    state_ = State::kActive;
+    ops.report_actual_work = [](void* u, void* session,
+                                int64_t actual_ns) -> int {
+      auto* a = static_cast<AndroidApi*>(u);
+      return a->report_actual_work(session, actual_ns);
+    };
+    ops.close_session = [](void* u, void* session) {
+      auto* a = static_cast<AndroidApi*>(u);
+      a->close_session(session);
+    };
+    ops.is_tid_alive = [](void* /*u*/, int32_t tid) -> bool {
+      if (tid <= 0) {
+        return false;
+      }
+      char task_path[48];
+      std::snprintf(task_path, sizeof(task_path), "/proc/self/task/%d", tid);
+      return access(task_path, F_OK) == 0;
+    };
+    return ops;
   }
 
-  State state_ = State::kUninitialized;
-  void* session_ = nullptr;
-  int (*report_)(void*, int64_t) = nullptr;
+  xendroid::AudioAdpfSession session_;
 };
 
 // Reports the first failure rather than dropping it: an app that is not
@@ -333,6 +324,10 @@ void AudioSystem::WorkerThreadMain() {
   // Re-applied in the loop below, because a later set_priority would undo it.
   ApplyAudioThreadPriority("Audio Worker");
   auto priority_last = std::chrono::steady_clock::now();
+  const xendroid::ScopedAudioAdpfThread audio_worker_adpf_tid(
+      xendroid::GlobalAudioAdpfThreadRegistry(),
+      xendroid::AudioAdpfThreadRole::kAudioWorker,
+      static_cast<int32_t>(xe::threading::current_thread_system_id()));
 #endif
 #if XE_PLATFORM_xendroid
   AudioPerformanceHint audio_perf_hint;
@@ -354,11 +349,14 @@ void AudioSystem::WorkerThreadMain() {
     uint64_t callback_cpu_us_sum = 0;
     uint64_t slowest_callback_cpu_us = 0;
     uint32_t pumps_on_cpu[8] = {};
-    // Android: time runnable but waiting for a core - in the slowest
-    // callback, the most in one callback - the rest of a slow callback's wall
-    // time beyond its CPU time is the guest waiting.
+    // Android: time runnable but waiting for a core vs blocked/sleeping inside
+    // guest callbacks (events, locks, or XMA waits).
+    uint64_t callback_run_wait_us_sum = 0;
     uint64_t slowest_callback_run_wait_us = 0;
     uint64_t callback_run_wait_us_max = 0;
+    uint64_t callback_blocked_us_sum = 0;
+    uint64_t slowest_callback_blocked_us = 0;
+    uint64_t callback_blocked_us_max = 0;
   } pump_stats;
   auto pump_stats_last = std::chrono::steady_clock::now();
 #if XE_PLATFORM_xendroid
@@ -445,6 +443,30 @@ void AudioSystem::WorkerThreadMain() {
             pump_stats.slowest_callback_run_wait_us,
             pump_stats.callback_run_wait_us_max,
             counted_since(run_wait_us_now, run_wait_us_before));
+        const uint64_t wall_avg =
+            pump_stats.pumps ? pump_stats.callback_us_sum / pump_stats.pumps
+                             : 0;
+        const uint64_t cpu_avg =
+            pump_stats.pumps ? pump_stats.callback_cpu_us_sum / pump_stats.pumps
+                             : 0;
+        const uint64_t run_wait_avg =
+            pump_stats.pumps
+                ? pump_stats.callback_run_wait_us_sum / pump_stats.pumps
+                : 0;
+        const uint64_t blocked_avg =
+            pump_stats.pumps
+                ? pump_stats.callback_blocked_us_sum / pump_stats.pumps
+                : 0;
+        XELOGI(
+            "AudioWorker: callback breakdown wall {} us avg {} max, cpu {} us "
+            "avg ({} us slowest), run_queue_wait {} us avg {} max ({} us "
+            "slowest), blocked_sleep {} us avg {} max ({} us slowest)",
+            wall_avg, pump_stats.callback_us_max, cpu_avg,
+            pump_stats.slowest_callback_cpu_us, run_wait_avg,
+            pump_stats.callback_run_wait_us_max,
+            pump_stats.slowest_callback_run_wait_us, blocked_avg,
+            pump_stats.callback_blocked_us_max,
+            pump_stats.slowest_callback_blocked_us);
         run_wait_us_before = run_wait_us_now;
 #endif
         pump_stats = PumpStats();
@@ -600,17 +622,28 @@ void AudioSystem::WorkerThreadMain() {
         if (timed) {
           timespec cpu_end;
           clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end);
-          const uint64_t cpu_us = static_cast<uint64_t>(
+          const int64_t cpu_delta_us =
               (int64_t(cpu_end.tv_sec) - int64_t(cpu_begin.tv_sec)) * 1000000 +
-              (int64_t(cpu_end.tv_nsec) - int64_t(cpu_begin.tv_nsec)) / 1000);
+              (int64_t(cpu_end.tv_nsec) - int64_t(cpu_begin.tv_nsec)) / 1000;
+          const uint64_t cpu_us =
+              cpu_delta_us > 0 ? static_cast<uint64_t>(cpu_delta_us) : 0;
           pump_stats.callback_cpu_us_sum += cpu_us;
           const uint64_t run_wait_us =
               counted_since(run_queue_wait.TotalUs(), run_wait_begin_us);
-          pump_stats.callback_run_wait_us_max =
-              std::max(pump_stats.callback_run_wait_us_max, run_wait_us);
+          const auto breakdown =
+              xendroid::ComputeCallbackTimeBreakdown(us, cpu_us, run_wait_us);
+          pump_stats.callback_run_wait_us_sum += breakdown.run_queue_wait_us;
+          pump_stats.callback_run_wait_us_max = std::max(
+              pump_stats.callback_run_wait_us_max, breakdown.run_queue_wait_us);
+          pump_stats.callback_blocked_us_sum += breakdown.blocked_sleep_us;
+          pump_stats.callback_blocked_us_max = std::max(
+              pump_stats.callback_blocked_us_max, breakdown.blocked_sleep_us);
           if (us >= pump_stats.callback_us_max) {
             pump_stats.slowest_callback_cpu_us = cpu_us;
-            pump_stats.slowest_callback_run_wait_us = run_wait_us;
+            pump_stats.slowest_callback_run_wait_us =
+                breakdown.run_queue_wait_us;
+            pump_stats.slowest_callback_blocked_us =
+                breakdown.blocked_sleep_us;
           }
           if (cpu >= 0 && cpu < int(xe::countof(pump_stats.pumps_on_cpu))) {
             ++pump_stats.pumps_on_cpu[cpu];
@@ -831,6 +864,13 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
 void AudioSystem::SubmitFrame(size_t index, float* samples) {
   SCOPE_profile_cpu_f("apu");
 
+  const bool check_silence =
+      cvars::apu_aaudio_log_stats && samples && index < kMaximumClientCount;
+  const bool silent =
+      check_silence ? xendroid::IsAudioFrameSamplesSilent(
+                          samples, AudioDriver::kFrameSamplesMax)
+                    : false;
+
   std::lock_guard<std::mutex> clients_lock(clients_mutex_);
   assert_true(index < kMaximumClientCount);
   if (index >= kMaximumClientCount || !clients_[index].in_use ||
@@ -856,14 +896,7 @@ void AudioSystem::SubmitFrame(size_t index, float* samples) {
   }
   clients_[index].frames_submitted++;
   clients_[index].frames_processed++;
-  if (cvars::apu_aaudio_log_stats && samples) {
-    // All zero bytes in either byte order.
-    const uint32_t* words = reinterpret_cast<const uint32_t*>(samples);
-    uint32_t any = 0;
-    for (uint32_t i = 0; i < AudioDriver::kFrameSamplesMax; ++i) {
-      any |= words[i];
-    }
-    const bool silent = any == 0;
+  if (check_silence) {
     if (silent) {
       clients_[index].frames_silent.fetch_add(1, std::memory_order_relaxed);
       if (!clients_[index].last_frame_silent) {

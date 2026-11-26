@@ -98,7 +98,8 @@ foreach ($Pair in @(
   @("wave3_jit_hle_logic_test", $Cpp),
   @("wave5_universal_perf_test", $Cpp),
   @("gpu_pipeline_async_test", $Cpp),
-  @("wave6_cpu_kernel_edge_test", $Cpp)
+  @("wave6_cpu_kernel_edge_test", $Cpp),
+  @("audio_adpf_logic_test", $Cpp)
 )) {
   $TName = $Pair[0]
   $TArg = $Pair[1]

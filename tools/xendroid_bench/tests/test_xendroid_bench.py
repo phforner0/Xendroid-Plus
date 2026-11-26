@@ -793,6 +793,50 @@ class XendroidBenchTests(unittest.TestCase):
         self.assertEqual(parsed["compression"], "basic")
         self.assertTrue(all(sz <= 64 * 1024 for sz in read_sizes), f"Unexpected unbounded read sizes: {read_sizes}")
 
+    def test_smoke_breakdown_passes_flag_toggles_gpu_pass_cvar(self) -> None:
+        from xendroid_bench import cli
+
+        parser = cli.build_parser()
+        args_default = parser.parse_args(["smoke", "--game-uri", "/sdcard/g.iso"])
+        self.assertFalse(args_default.breakdown_passes)
+        args_enabled = parser.parse_args(["smoke", "--game-uri", "/sdcard/g.iso", "--breakdown-passes"])
+        self.assertTrue(args_enabled.breakdown_passes)
+
+        for flag, expected in ((False, False), (True, True)):
+            written_configs: dict[str, str] = {}
+            with tempfile.TemporaryDirectory() as tmp:
+                tdir = pathlib.Path(tmp)
+                with mock.patch("xendroid_bench.smoke.AdbDevice") as smoke_dev_cls:
+                    inst = smoke_dev_cls.return_value
+                    inst.storage_root.return_value = "/sdcard/x"
+                    inst.file_uid.side_effect = lambda p: 10554 if p.endswith(".config.toml") else None
+                    inst.run.return_value = "[GPU]\nlog_gpu_frame_time_breakdown_passes = false\n"
+                    inst.pidof_emu.return_value = 1234
+
+                    def _capture_write(path: str, text: str) -> None:
+                        if path not in written_configs:
+                            written_configs[path] = text
+
+                    inst.write_text_inplace.side_effect = _capture_write
+                    with mock.patch("xendroid_bench.smoke.time.sleep", return_value=None), mock.patch(
+                        "xendroid_bench.smoke.analyze_frame_sequence",
+                        return_value={"classification": "NO_FRAMES"},
+                    ):
+                        smoke.run_smoke_adb(
+                            serial="dev1",
+                            adb_bin="adb",
+                            package="xendroid.compose.fork",
+                            game_uri="/sdcard/x/game.iso",
+                            title_id="5454082B",
+                            duration_s=0,
+                            out_dir=tdir / "smoke_out",
+                            breakdown_passes=flag,
+                        )
+            parsed = tomllib.loads(written_configs["/sdcard/x/xenia-canary.config.toml"])
+            self.assertEqual(parsed["GPU"]["log_gpu_frame_time_breakdown_passes"], expected)
+            parsed_title = tomllib.loads(written_configs["/sdcard/x/config/5454082B.config.toml"])
+            self.assertEqual(parsed_title["GPU"]["log_gpu_frame_time_breakdown_passes"], expected)
+
 
 if __name__ == "__main__":
     unittest.main()

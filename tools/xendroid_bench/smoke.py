@@ -189,6 +189,7 @@ def run_smoke_adb(
     pad_script_path: pathlib.Path | None = None,
     vlm_cmd: str | None = None,
     uncapped: bool = False,
+    breakdown_passes: bool = False,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     dev = AdbDevice(serial=serial, adb_bin=adb_bin)
@@ -237,7 +238,7 @@ def run_smoke_adb(
         updates: dict[str, dict[str, Any]] = {
             "GPU": {
                 "log_gpu_frame_time_breakdown": True,
-                "log_gpu_frame_time_breakdown_passes": False,
+                "log_gpu_frame_time_breakdown_passes": bool(breakdown_passes),
             },
             "APU": {
                 "apu_aaudio_log_stats": True,
