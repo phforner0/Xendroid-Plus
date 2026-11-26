@@ -20,6 +20,7 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/shader_compile_counter.h"
 #include "xenia/base/logging.h"
@@ -27,6 +28,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/xxhash.h"
+#include "xenia/memory.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/pipeline_util.h"
@@ -118,6 +120,22 @@ DEFINE_bool(
     "VkPipeline wait/resolution from IssueDraw to DeferredCommandBuffer::Execute "
     "so creation threads compile a submission's pipelines in parallel instead of "
     "serializing per draw. Default false for thermal ABBA validation.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_shader_load_watch_cache, false,
+    "Cache PM4_IM_LOAD (phys_addr, dword_count) -> VulkanShader* using an "
+    "atomic epoch write-watch on guest shader memory to avoid re-hashing "
+    "unchanged shader microcode with XXH3_64bits every draw. Default false "
+    "for ABBA validation (debug.xendroid.shader_load_watch_cache on Android).",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_hold_guest_time_on_pipeline_wait, false,
+    "Hold guest clock progression (via refcounted Clock::HoldGuestTime) during "
+    "synchronous Vulkan pipeline compilation waits so shader compile stalls do "
+    "not advance guest timers or trigger frame-delta spikes. Default false for "
+    "ABBA validation (debug.xendroid.hold_guest_time_pipeline_wait on Android).",
     "Vulkan");
 
 DEFINE_bool(
@@ -362,6 +380,11 @@ void LogPipelineStatistics(const ui::vulkan::VulkanDevice& vulkan_device,
   }
 }
 }  // namespace
+
+struct VulkanPipelineCache::ShaderLoadWatchCacheState {
+  draw_cuts::ShaderLoadWatchCache<VulkanShader> cache;
+  void* invalidation_callback_handle = nullptr;
+};
 
 VulkanPipelineCache::VulkanPipelineCache(
     VulkanCommandProcessor& command_processor,
@@ -778,6 +801,10 @@ void VulkanPipelineCache::Shutdown() {
   }
   geometry_shaders_.clear();
 
+  // Unregister write-watch callback and clear cached shader pointers before
+  // deleting VulkanShader instances.
+  ShutdownShaderLoadWatchCache();
+
   // Destroy all translated shaders.
   for (auto it : shaders_) {
     delete it.second;
@@ -788,6 +815,48 @@ void VulkanPipelineCache::Shutdown() {
 
   // Shut down shader translation.
   guest_shader_cache_.Shutdown();
+}
+
+std::pair<uint32_t, uint32_t> VulkanPipelineCache::ShaderWatchInvalidationThunk(
+    void* context_ptr, uint32_t physical_address_start, uint32_t length,
+    bool exact_range) {
+  auto* self = static_cast<VulkanPipelineCache*>(context_ptr);
+  if (self->shader_load_watch_cache_) {
+    return self->shader_load_watch_cache_->cache.OnMemoryInvalidatedForUnwatch(
+        physical_address_start, length, exact_range);
+  }
+  return std::make_pair(uint32_t(0), UINT32_MAX);
+}
+
+void VulkanPipelineCache::ShutdownShaderLoadWatchCache() {
+  if (!shader_load_watch_cache_) {
+    shader_load_watch_cache_was_enabled_ = false;
+    return;
+  }
+  if (shader_load_watch_cache_->invalidation_callback_handle) {
+    if (Memory* mem = command_processor_.memory()) {
+      mem->UnregisterPhysicalMemoryInvalidationCallback(
+          shader_load_watch_cache_->invalidation_callback_handle);
+    }
+    shader_load_watch_cache_->invalidation_callback_handle = nullptr;
+  }
+  shader_load_watch_cache_->cache.InvalidateAll();
+  shader_load_watch_cache_.reset();
+  shader_load_watch_cache_was_enabled_ = false;
+}
+
+void VulkanPipelineCache::InvalidateShaderLoadWatchCache() {
+  if (shader_load_watch_cache_) {
+    shader_load_watch_cache_->cache.InvalidateAll();
+  }
+}
+
+void VulkanPipelineCache::OnShaderMemoryInvalidated(uint32_t physical_address,
+                                                    uint32_t length) {
+  if (shader_load_watch_cache_) {
+    shader_load_watch_cache_->cache.OnMemoryInvalidated(physical_address,
+                                                        length);
+  }
 }
 
 VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
@@ -808,6 +877,53 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
       new VulkanShader(command_processor_.GetVulkanDevice(), shader_type,
                        data_hash, host_address, dword_count);
   shaders_.emplace(data_hash, shader);
+  return shader;
+}
+
+VulkanShader* VulkanPipelineCache::LoadShaderFromGuestAddress(
+    xenos::ShaderType shader_type, uint32_t guest_physical_address,
+    const uint32_t* host_address, uint32_t dword_count) {
+  if (!cvars::vulkan_shader_load_watch_cache || !dword_count) {
+    shader_load_watch_cache_was_enabled_ = false;
+    return LoadShader(shader_type, host_address, dword_count);
+  }
+  Memory* mem = command_processor_.memory();
+  if (!mem) {
+    return LoadShader(shader_type, host_address, dword_count);
+  }
+  if (!shader_load_watch_cache_) {
+    shader_load_watch_cache_ = std::make_unique<ShaderLoadWatchCacheState>();
+    shader_load_watch_cache_->invalidation_callback_handle =
+        mem->RegisterPhysicalMemoryInvalidationCallback(
+            ShaderWatchInvalidationThunk, this);
+  } else if (!shader_load_watch_cache_was_enabled_) {
+    // Re-enabled after being toggled off: drop any entries cached earlier.
+    shader_load_watch_cache_->cache.InvalidateAll();
+  }
+  shader_load_watch_cache_was_enabled_ = true;
+
+  auto& watch_cache = shader_load_watch_cache_->cache;
+  const uint32_t type_u32 = static_cast<uint32_t>(shader_type);
+  if (VulkanShader* cached =
+          watch_cache.Lookup(type_u32, guest_physical_address, dword_count)) {
+    return cached;
+  }
+
+  draw_cuts::ShaderWatchSnapshot snapshot;
+  const bool can_watch = watch_cache.BeginArmAndSnapshot(
+      guest_physical_address, dword_count, snapshot);
+  if (can_watch) {
+    // Arm physical write-watch BEFORE hashing so any concurrent guest write
+    // during XXH3_64bits bumps the page epoch and causes CommitIfUnchanged to
+    // reject caching stale data.
+    mem->EnablePhysicalMemoryAccessCallbacks(snapshot.phys_address,
+                                             snapshot.byte_length, true, false);
+  }
+  VulkanShader* shader = LoadShader(shader_type, host_address, dword_count);
+  if (can_watch && shader) {
+    watch_cache.CommitIfUnchanged(type_u32, guest_physical_address, dword_count,
+                                  snapshot, shader);
+  }
   return shader;
 }
 
@@ -1377,6 +1493,8 @@ void VulkanPipelineCache::EndSubmission() {
       }
     }
     if (await_creation_completion_event) {
+      Clock::ScopedGuestTimeHold guest_time_hold(
+          cvars::vulkan_hold_guest_time_on_pipeline_wait);
       creation_request_cond_.notify_one();
       xe::threading::Wait(creation_completion_event_.get(), false);
     }
@@ -1411,6 +1529,8 @@ void VulkanPipelineCache::AwaitPipelineCompletion() {
   }
 
   if (await_creation_completion_event) {
+    Clock::ScopedGuestTimeHold guest_time_hold(
+        cvars::vulkan_hold_guest_time_on_pipeline_wait);
     creation_request_cond_.notify_one();
     xe::threading::Wait(creation_completion_event_.get(), false);
   }
@@ -1532,6 +1652,8 @@ bool VulkanPipelineCache::ExpeditePipeline(Pipeline* pipeline) {
   if (real_pipeline_ready()) {
     return true;
   }
+  Clock::ScopedGuestTimeHold guest_time_hold(
+      cvars::vulkan_hold_guest_time_on_pipeline_wait);
   PipelineCreationArguments creation_arguments;
   {
     std::unique_lock<std::mutex> lock(creation_request_lock_);
@@ -1581,6 +1703,8 @@ bool VulkanPipelineCache::WaitForPipeline(Pipeline* pipeline,
       pipeline->creation_failed.load(std::memory_order_acquire)) {
     return real_pipeline_ready();
   }
+  Clock::ScopedGuestTimeHold guest_time_hold(
+      cvars::vulkan_hold_guest_time_on_pipeline_wait);
   std::unique_lock<std::mutex> lock(creation_request_lock_);
   if (!creation_queue_.empty()) {
     creation_request_cond_.notify_one();

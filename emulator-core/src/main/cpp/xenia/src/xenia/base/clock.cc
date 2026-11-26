@@ -48,8 +48,8 @@ std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
 uint64_t last_guest_tick_count_ = 0;
 // Last sampled host tick count.
 uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
-// Whether guest time progression is frozen while the emulator is paused.
-bool guest_time_held_ = false;
+// Refcounted hold state: guest time progression is frozen whenever count > 0.
+GuestTimeHoldRefCounter guest_time_hold_counter_;
 uint64_t held_host_tick_count_ = 0;
 uint64_t held_host_system_time_ = 0;
 
@@ -86,14 +86,15 @@ uint64_t UpdateGuestClock() {
 
   if (cvars::clock_no_scaling) {
     std::lock_guard<tick_mutex_type> lock(tick_mutex_);
-    const uint64_t effective_ticks =
-        guest_time_held_ ? held_host_tick_count_ : host_tick_count;
+    const uint64_t effective_ticks = guest_time_hold_counter_.is_held()
+                                         ? held_host_tick_count_
+                                         : host_tick_count;
     return effective_ticks * guest_tick_ratio_.first / guest_tick_ratio_.second;
   }
 
   std::unique_lock<tick_mutex_type> lock(tick_mutex_, std::defer_lock);
   if (lock.try_lock()) {
-    if (guest_time_held_) {
+    if (guest_time_hold_counter_.is_held()) {
       last_host_tick_count_ = host_tick_count;
       return last_guest_tick_count_;
     }
@@ -117,8 +118,9 @@ uint64_t UpdateGuestClock() {
 inline uint64_t QueryGuestSystemTimeOffset() {
   if (cvars::clock_no_scaling) {
     std::lock_guard<tick_mutex_type> lock(tick_mutex_);
-    const uint64_t sys_time =
-        guest_time_held_ ? held_host_system_time_ : Clock::QueryHostSystemTime();
+    const uint64_t sys_time = guest_time_hold_counter_.is_held()
+                                  ? held_host_system_time_
+                                  : Clock::QueryHostSystemTime();
     return sys_time - guest_system_time_base_;
   }
 
@@ -179,8 +181,8 @@ uint64_t* Clock::GetGuestTickCountPointer() { return &last_guest_tick_count_; }
 uint64_t Clock::QueryGuestSystemTime() {
   if (cvars::clock_no_scaling) {
     std::lock_guard<tick_mutex_type> lock(tick_mutex_);
-    return guest_time_held_ ? held_host_system_time_
-                            : Clock::QueryHostSystemTime();
+    return guest_time_hold_counter_.is_held() ? held_host_system_time_
+                                              : Clock::QueryHostSystemTime();
   }
 
   auto guest_system_time_offset = QueryGuestSystemTimeOffset();
@@ -212,10 +214,10 @@ void Clock::HoldGuestTime(bool hold) {
   const uint64_t host_tick_count = Clock::QueryHostTickCount();
   const uint64_t host_system_time = Clock::QueryHostSystemTime();
   std::lock_guard<tick_mutex_type> lock(tick_mutex_);
-  if (guest_time_held_ == hold) {
-    return;
-  }
   if (hold) {
+    if (!guest_time_hold_counter_.Acquire()) {
+      return;
+    }
     if (!cvars::clock_no_scaling) {
       const uint64_t host_tick_delta =
           host_tick_count > last_host_tick_count_
@@ -228,15 +230,18 @@ void Clock::HoldGuestTime(bool hold) {
       held_host_system_time_ = host_system_time;
     }
     last_host_tick_count_ = host_tick_count;
-    guest_time_held_ = true;
   } else {
+    if (!guest_time_hold_counter_.Release()) {
+      return;
+    }
     if (cvars::clock_no_scaling && host_system_time > held_host_system_time_) {
       guest_system_time_base_ += (host_system_time - held_host_system_time_);
     }
     last_host_tick_count_ = host_tick_count;
-    guest_time_held_ = false;
   }
 }
+
+int32_t Clock::GuestTimeHoldCount() { return guest_time_hold_counter_.count(); }
 
 uint32_t Clock::ScaleGuestDurationMillis(uint32_t guest_ms) {
   if (cvars::clock_no_scaling) {

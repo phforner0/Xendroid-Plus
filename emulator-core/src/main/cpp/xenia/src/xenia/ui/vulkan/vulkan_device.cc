@@ -489,6 +489,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // #291 + #321. Graphics pipeline libraries for fast partial linking.
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_library)
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_graphics_pipeline_library)
+      // #81. Push descriptors (gated by vulkan_use_push_descriptors and strict
+      // driver blacklist in VulkanCommandProcessor).
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_push_descriptor)
       // #483. Shader objects for zero-PSO draw binding with dynamic rendering.
       if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
         XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_object)
@@ -847,6 +850,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT
       properties_EXT_graphics_pipeline_library = {
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+  VkPhysicalDevicePushDescriptorPropertiesKHR
+      properties_KHR_push_descriptor = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
 
   // All QCOM probe structures are linked for supported queries only. v2,
   // cubic weights/clamp are never linked to device creation in this batch.
@@ -1031,6 +1037,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
                                                   device_create_info);
       properties_EXT_graphics_pipeline_library.pNext = properties_2.pNext;
       properties_2.pNext = &properties_EXT_graphics_pipeline_library;
+    }
+    if (device->extensions_.ext_KHR_push_descriptor) {
+      properties_KHR_push_descriptor.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_KHR_push_descriptor;
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -1875,6 +1885,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     device->extensions_.ext_EXT_shader_object = false;
   }
 
+  // VK_KHR_push_descriptor (#81): expose reported maxPushDescriptors; the
+  // command processor applies the driver blacklist and Eden clamp.
+  if (device->extensions_.ext_KHR_push_descriptor && with_gpu_emulation) {
+    XE_UI_VULKAN_PROPERTY_2(properties_KHR_push_descriptor, maxPushDescriptors);
+  } else {
+    device->extensions_.ext_KHR_push_descriptor = false;
+    device->properties_.maxPushDescriptors = 0;
+  }
+
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
 #undef XE_UI_VULKAN_FEATURE
@@ -2288,6 +2307,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       device->properties_.leastRepresentableValueForceUnormRepresentation =
           false;
       device->properties_.depthBiasExact = false;
+    }
+  }
+
+  // Optional VK_KHR_push_descriptor (#81) entry point (non-fatal).
+  if (device->extensions_.ext_KHR_push_descriptor) {
+    bool push_descriptor_loaded = true;
+#define XE_UI_VULKAN_FUNCTION(name)                                       \
+  push_descriptor_loaded &= (dfn.name = PFN_##name(ifn.vkGetDeviceProcAddr( \
+                                 device->device_, #name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_khr_push_descriptor.inc"
+#undef XE_UI_VULKAN_FUNCTION
+    if (!push_descriptor_loaded) {
+      XELOGW(
+          "VulkanDevice: VK_KHR_push_descriptor entry point missing on '{}', "
+          "disabling push descriptors",
+          properties.deviceName);
+      device->extensions_.ext_KHR_push_descriptor = false;
+      device->properties_.maxPushDescriptors = 0;
     }
   }
 

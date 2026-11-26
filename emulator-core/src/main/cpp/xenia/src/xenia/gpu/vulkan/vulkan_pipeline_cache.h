@@ -283,6 +283,13 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type,
                            const uint32_t* host_address, uint32_t dword_count);
+  // Write-watch cached shader lookup for PM4_IM_LOAD (guest physical address).
+  VulkanShader* LoadShaderFromGuestAddress(xenos::ShaderType shader_type,
+                                           uint32_t guest_physical_address,
+                                           const uint32_t* host_address,
+                                           uint32_t dword_count);
+  void InvalidateShaderLoadWatchCache();
+  void OnShaderMemoryInvalidated(uint32_t physical_address, uint32_t length);
   // Analyze shader microcode on the translator thread.
   void AnalyzeShaderUcode(Shader& shader) {
     shader.AnalyzeUcode(ucode_disasm_buffer_);
@@ -773,6 +780,16 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   std::unordered_map<uint64_t, VulkanShader*,
                      xe::hash::IdentityHasher<uint64_t>>
       shaders_;
+
+  // Write-watch cache for PM4_IM_LOAD (lazily allocated when
+  // vulkan_shader_load_watch_cache is enabled).
+  struct ShaderLoadWatchCacheState;
+  std::unique_ptr<ShaderLoadWatchCacheState> shader_load_watch_cache_;
+  bool shader_load_watch_cache_was_enabled_ = false;
+  static std::pair<uint32_t, uint32_t> ShaderWatchInvalidationThunk(
+      void* context_ptr, uint32_t physical_address_start, uint32_t length,
+      bool exact_range);
+  void ShutdownShaderLoadWatchCache();
 
   // Geometry shaders for Xenos primitive types not supported by Vulkan.
   // Stores VK_NULL_HANDLE if failed to create.
