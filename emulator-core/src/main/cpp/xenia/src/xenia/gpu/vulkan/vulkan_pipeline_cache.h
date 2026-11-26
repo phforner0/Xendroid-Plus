@@ -903,6 +903,7 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   static constexpr uint64_t kVkPipelineCacheSaveIntervalMs = 20000;
   static constexpr uint64_t kVkPipelineCachePrecreateSaveIntervalMs = 5000;
   static constexpr size_t kVkPipelineCachePrecreateSaveBatch = 256;
+  std::atomic<bool> vk_pipeline_cache_active_{false};
   std::atomic<bool> vk_pipeline_cache_dirty_{false};
   std::atomic<bool> vk_pipeline_cache_saved_since_init_{false};
   uint64_t vk_pipeline_cache_last_save_ms_ = 0;

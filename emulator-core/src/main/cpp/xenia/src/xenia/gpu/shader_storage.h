@@ -29,13 +29,24 @@ class CoalescingSnapshotSlot {
   using Task = std::function<void(bool execute)>;
 
   // Enqueues a new snapshot task, replacing any pending unstarted task.
-  // Returns true if an older pending task was coalesced (superseded).
+  // If closed (shutting down), immediately invokes task(false) so handles are
+  // cleaned up without leaking. Returns true if an older pending task was
+  // coalesced (superseded).
   bool Enqueue(Task task) {
+    Task rejected;
     Task superseded;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      superseded = std::move(pending_);
-      pending_ = std::move(task);
+      if (closed_) {
+        rejected = std::move(task);
+      } else {
+        superseded = std::move(pending_);
+        pending_ = std::move(task);
+      }
+    }
+    if (rejected) {
+      rejected(false);
+      return false;
     }
     if (superseded) {
       superseded(false);
@@ -44,11 +55,34 @@ class CoalescingSnapshotSlot {
     return false;
   }
 
+  // Swaps a new pending task in while returning any superseded task (or the
+  // incoming task itself if closed) for the caller to invoke with false
+  // outside any external lock.
+  Task SwapPending(Task task) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_) {
+      return task;
+    }
+    Task superseded = std::move(pending_);
+    pending_ = std::move(task);
+    return superseded;
+  }
+
   Task Take() {
     std::lock_guard<std::mutex> lock(mutex_);
     Task task = std::move(pending_);
     pending_ = nullptr;
     return task;
+  }
+
+  void Close() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    closed_ = true;
+  }
+
+  void Reopen() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    closed_ = false;
   }
 
   bool HasPending() const {
@@ -59,6 +93,7 @@ class CoalescingSnapshotSlot {
  private:
   mutable std::mutex mutex_;
   Task pending_;
+  bool closed_ = false;
 };
 
 // Returns true only for Arm Mali proprietary drivers (VK_DRIVER_ID_ARM_PROPRIETARY
@@ -523,24 +558,31 @@ class ShaderStorageWriter {
     }
 
     // Start the write thread.
-    storage_write_thread_shutdown_ = false;
-    storage_write_thread_ =
-        xe::threading::Thread::Create({}, [this]() { WriteThread(); });
-    storage_write_thread_->set_name("Shader Storage Writer");
+    {
+      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+      pipeline_cache_save_slot_.Reopen();
+      storage_write_thread_shutdown_ = false;
+      storage_write_thread_ =
+          xe::threading::Thread::Create({}, [this]() { WriteThread(); });
+      storage_write_thread_->set_name("Shader Storage Writer");
+    }
 
     return true;
   }
 
   // Shutdown storage: drains pending writes/saves, stops write thread, closes files.
   void ShutdownShaderStorage() {
-    if (storage_write_thread_) {
-      {
-        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-        storage_write_thread_shutdown_ = true;
-      }
+    std::unique_ptr<xe::threading::Thread> write_thread_to_join;
+    {
+      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+      pipeline_cache_save_slot_.Close();
+      storage_write_thread_shutdown_ = true;
+      write_thread_to_join = std::move(storage_write_thread_);
+    }
+    if (write_thread_to_join) {
       storage_write_request_cond_.notify_one();
-      xe::threading::Wait(storage_write_thread_.get(), false);
-      storage_write_thread_.reset();
+      xe::threading::Wait(write_thread_to_join.get(), false);
+      write_thread_to_join.reset();
     }
 
     if (auto leftover = pipeline_cache_save_slot_.Take()) {
@@ -598,17 +640,34 @@ class ShaderStorageWriter {
   }
 
   void QueuePipelineCacheSave(CoalescingSnapshotSlot::Task task) {
-    if (!storage_write_thread_) {
-      if (task) {
-        task(true);
-      }
+    if (!task) {
       return;
     }
-    pipeline_cache_save_slot_.Enqueue(std::move(task));
+    CoalescingSnapshotSlot::Task superseded;
+    bool reject_shutdown = false;
+    bool run_inline = false;
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+      if (storage_write_thread_shutdown_) {
+        reject_shutdown = true;
+      } else if (!storage_write_thread_) {
+        run_inline = true;
+      } else {
+        superseded = pipeline_cache_save_slot_.SwapPending(std::move(task));
+      }
+    }
+    if (reject_shutdown) {
+      task(false);
+      return;
+    }
+    if (run_inline) {
+      task(true);
+      return;
     }
     storage_write_request_cond_.notify_one();
+    if (superseded) {
+      superseded(false);
+    }
   }
 
   void RequestFlush(bool flush_shaders, bool flush_pipelines) {

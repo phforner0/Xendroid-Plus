@@ -1310,7 +1310,8 @@ void VulkanPipelineCache::MaybeSaveVkPipelineCache() {
   // created since the last save. Safe concurrently with the creation threads
   // (the pipeline cache is internally synchronized and saves are serialized).
   if (vk_pipeline_cache_dirty_.load(std::memory_order_relaxed) &&
-      vk_pipeline_cache_ != VK_NULL_HANDLE && !vk_pipeline_cache_path_.empty()) {
+      vk_pipeline_cache_active_.load(std::memory_order_acquire) &&
+      vk_pipeline_cache_ != VK_NULL_HANDLE) {
     const uint64_t save_interval_ms =
         startup_loading_.load(std::memory_order_relaxed)
             ? kVkPipelineCachePrecreateSaveIntervalMs
@@ -4184,6 +4185,8 @@ void VulkanPipelineCache::InitializeShaderStorage(
     dfn.vkCreatePipelineCache(device, &pipeline_cache_create_info, nullptr,
                               &vk_pipeline_cache_);
   }
+  vk_pipeline_cache_active_.store(vk_pipeline_cache_ != VK_NULL_HANDLE,
+                                  std::memory_order_release);
 
   // Create pipelines from stored descriptions.
   if (!cvars::pipeline_storage_precreate) {
@@ -4512,11 +4515,8 @@ void VulkanPipelineCache::SaveVkPipelineCacheFromHandle(
 }
 
 void VulkanPipelineCache::SaveVkPipelineCacheAsync() {
-  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) {
-    return;
-  }
-  if (!storage_writer_.is_active()) {
-    SaveVkPipelineCacheSync();
+  if (!vk_pipeline_cache_active_.load(std::memory_order_acquire) ||
+      vk_pipeline_cache_ == VK_NULL_HANDLE) {
     return;
   }
   const ui::vulkan::VulkanDevice* const vulkan_device =
@@ -4566,6 +4566,10 @@ void VulkanPipelineCache::SaveVkPipelineCacheSync() {
 }
 
 void VulkanPipelineCache::ShutdownShaderStorage() {
+  // Block new async snapshot saves from command/creation threads before
+  // draining storage_writer_ and tearing down vk_pipeline_cache_store_.
+  vk_pipeline_cache_active_.store(false, std::memory_order_release);
+
   // Drain any queued/in-flight async VkPipelineCache save and flush storage
   // files BEFORE tearing down vk_pipeline_cache_store_ or vk_pipeline_cache_.
   storage_writer_.ShutdownShaderStorage();

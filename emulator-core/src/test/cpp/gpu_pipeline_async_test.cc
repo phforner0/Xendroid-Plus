@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -126,6 +127,47 @@ void TestCoalescingSnapshotSlot() {
   worker.join();
   GPU_ASYNC_CHECK(task6_executed.load(std::memory_order_relaxed) == 1);
   GPU_ASYNC_CHECK(!slot.HasPending());
+
+  // Shutdown/Close behavior: pending task before Close() is still drained by
+  // Take(), while any Enqueue/SwapPending after Close() is rejected with
+  // execute=false so temporary VkPipelineCache handles never leak.
+  int pre_close_ran = 0;
+  int post_close_cleaned = 0;
+  int post_close_swap_cleaned = 0;
+  GPU_ASYNC_CHECK(!slot.Enqueue([&](bool execute) {
+    GPU_ASYNC_CHECK(execute);
+    ++pre_close_ran;
+  }));
+  slot.Close();
+  GPU_ASYNC_CHECK(!slot.Enqueue([&](bool execute) {
+    GPU_ASYNC_CHECK(!execute);
+    ++post_close_cleaned;
+  }));
+  GPU_ASYNC_CHECK(post_close_cleaned == 1);
+  auto rejected = slot.SwapPending([&](bool execute) {
+    GPU_ASYNC_CHECK(!execute);
+    ++post_close_swap_cleaned;
+  });
+  GPU_ASYNC_CHECK(static_cast<bool>(rejected));
+  rejected(false);
+  GPU_ASYNC_CHECK(post_close_swap_cleaned == 1);
+  auto drained = slot.Take();
+  GPU_ASYNC_CHECK(static_cast<bool>(drained));
+  drained(true);
+  GPU_ASYNC_CHECK(pre_close_ran == 1);
+  GPU_ASYNC_CHECK(!slot.HasPending());
+
+  // Reopen restores queueing for the next title's shader storage session.
+  slot.Reopen();
+  int reopened_ran = 0;
+  GPU_ASYNC_CHECK(!slot.Enqueue([&](bool execute) {
+    GPU_ASYNC_CHECK(execute);
+    ++reopened_ran;
+  }));
+  auto t_reopen = slot.Take();
+  GPU_ASYNC_CHECK(static_cast<bool>(t_reopen));
+  t_reopen(true);
+  GPU_ASYNC_CHECK(reopened_ran == 1);
 }
 
 void TestIsProprietaryMaliDriver() {
@@ -206,6 +248,8 @@ void TestSourceInvariants(const fs::path& cpp_root) {
                   std::string::npos);
   GPU_ASYNC_CHECK(shader_storage.find("CoalescingSnapshotSlot") !=
                   std::string::npos);
+  GPU_ASYNC_CHECK(shader_storage.find("SwapPending(") != std::string::npos);
+  GPU_ASYNC_CHECK(shader_storage.find("reject_shutdown") != std::string::npos);
 
   const std::string pcache_h =
       ReadSourceText(vk_dir / "vulkan_pipeline_cache.h");
@@ -213,12 +257,16 @@ void TestSourceInvariants(const fs::path& cpp_root) {
       ReadSourceText(vk_dir / "vulkan_pipeline_cache.cc");
   GPU_ASYNC_CHECK(pcache_h.find("ResolvePipelineForReplay") !=
                   std::string::npos);
+  GPU_ASYNC_CHECK(pcache_h.find("vk_pipeline_cache_active_") !=
+                  std::string::npos);
   GPU_ASYNC_CHECK(pcache_cc.find("vulkan_async_pipeline_bind_on_replay, false") !=
                   std::string::npos);
   GPU_ASYNC_CHECK(pcache_cc.find("UPDATE_from_bool(vulkan_async_pipeline_bind_on_replay") ==
                   std::string::npos);
   GPU_ASYNC_CHECK(pcache_cc.find("vkMergePipelineCaches") != std::string::npos);
   GPU_ASYNC_CHECK(pcache_cc.find("QueuePipelineCacheSave") != std::string::npos);
+  GPU_ASYNC_CHECK(pcache_cc.find("vk_pipeline_cache_active_.load") !=
+                  std::string::npos);
 
   const std::string dcb_h =
       ReadSourceText(vk_dir / "deferred_command_buffer.h");
@@ -234,6 +282,8 @@ void TestSourceInvariants(const fs::path& cpp_root) {
   GPU_ASYNC_CHECK(shmem_h.find("buffer_device_address()") != std::string::npos);
   GPU_ASYNC_CHECK(shmem_cc.find("vkGetBufferDeviceAddress") !=
                   std::string::npos);
+  GPU_ASYNC_CHECK(shmem_cc.find("cvars::vulkan_shared_memory_bda") ==
+                  std::string::npos);
 
   const std::string cp_cc =
       ReadSourceText(vk_dir / "vulkan_command_processor.cc");
@@ -241,6 +291,8 @@ void TestSourceInvariants(const fs::path& cpp_root) {
                   std::string::npos);
   GPU_ASYNC_CHECK(cp_cc.find("vkGetBufferDeviceAddress") == std::string::npos);
   GPU_ASYNC_CHECK(cp_cc.find("vulkan_async_pipeline_bind_on_replay") !=
+                  std::string::npos);
+  GPU_ASYNC_CHECK(cp_cc.find("(defer_bind_to_replay && replay_expedite_pipeline)") !=
                   std::string::npos);
   GPU_ASYNC_CHECK(cp_cc.find("current_pipeline != VK_NULL_HANDLE &&") !=
                   std::string::npos);

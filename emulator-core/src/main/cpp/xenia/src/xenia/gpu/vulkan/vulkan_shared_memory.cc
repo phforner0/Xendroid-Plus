@@ -24,7 +24,6 @@
 DECLARE_bool(gpu_allow_invalid_upload_range);
 DECLARE_bool(memexport_enable);
 DECLARE_bool(shared_memory_zero_copy);
-DECLARE_bool(vulkan_shared_memory_bda);
 DECLARE_string(readback_resolve);
 
 DEFINE_bool(vulkan_sparse_shared_memory, true,
@@ -389,10 +388,10 @@ bool VulkanSharedMemory::Initialize() {
     }
   }
 
-  // Cache the static VkDeviceAddress once at initialization when BDA is active
-  // so IssueDraw doesn't query vkGetBufferDeviceAddress every draw.
-  if (buffer_ != VK_NULL_HANDLE && buffer_has_bda &&
-      cvars::vulkan_shared_memory_bda && !zero_copy_) {
+  // Cache the static VkDeviceAddress once at initialization whenever the buffer
+  // was created with SHADER_DEVICE_ADDRESS_BIT so IssueDraw never calls
+  // vkGetBufferDeviceAddress per draw (even if BDA is enabled post-init).
+  if (buffer_ != VK_NULL_HANDLE && buffer_has_bda && !zero_copy_) {
     VkBufferDeviceAddressInfo bda_info = {};
     bda_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
     bda_info.buffer = buffer_;

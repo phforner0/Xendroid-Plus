@@ -7668,9 +7668,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         if (!memexport_ranges_.empty()) {
           pipeline_wait_reason = "memexport";
         } else if (bind_on_replay) {
-          if (cvars::vulkan_async_wait_persistent_draws &&
-              (render_target_cache_->IsLastUpdateDrawTargetSmall() ||
-               (!draw_target_recurring && !vertex_shader_drawn))) {
+          if (!cvars::vulkan_async_skip_draws ||
+              (cvars::vulkan_async_wait_persistent_draws &&
+               (render_target_cache_->IsLastUpdateDrawTargetSmall() ||
+                (!draw_target_recurring && !vertex_shader_drawn)))) {
             replay_expedite_pipeline = true;
           }
         } else if (configured_pipeline == VK_NULL_HANDLE &&
@@ -7955,6 +7956,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         bind_on_replay && current_pipeline == VK_NULL_HANDLE;
     if (current_shader_objects_bound_ ||
         current_guest_graphics_pipeline_ != &pipeline->pipeline ||
+        (defer_bind_to_replay && replay_expedite_pipeline) ||
         ((!bind_on_replay ||
           current_guest_graphics_pipeline_handle_ != VK_NULL_HANDLE) &&
          current_guest_graphics_pipeline_handle_ != current_pipeline)) {
