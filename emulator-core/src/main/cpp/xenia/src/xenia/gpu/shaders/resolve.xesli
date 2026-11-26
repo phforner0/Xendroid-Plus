@@ -543,6 +543,65 @@ uint XeResolveEdramPixelStrideBytes(XeResolveInfo resolve_info) {
     }
   }
 
+  // Gamma RTs store linear 10 bit color through an 8 bit PWL curve.
+  // Host sRGB is not a substitute. Some titles appear overexposed if full
+  // 8_8_8_8_GAMMA resolves average the encoded bytes directly (5345085D,
+  // 45410934), so we decode before MSAA averaging and encode again only
+  // for compatible 8_8_8_8 destinations.
+  // Exposed outside XE_RESOLVE_COPY_EDRAM_BYTE_BUFFER_ALIGNMENT == 4 so direct
+  // host resolves of k_8_8_8_8_GAMMA re-aliased as k_8_8_8_8 share the exact
+  // same PWL gamma curve.
+  // The PWL segment is derived arithmetically instead of by nested
+  // branches: the four segments scale by 1/2/4/8 and offset by
+  // 0/-64/-256/-1024, so counting thresholds passed gives both. Inlined per
+  // component per sample, where live branch bodies cost occupancy.
+#define XE_PWL_GAMMA_TO_LINEAR_BODY(vec_float, splat)                     \
+    gamma = saturate_xe(gamma);                                           \
+    vec_float past_first = step(splat(64.0f / 255.0f), gamma);            \
+    vec_float segment = past_first +                                      \
+                        step(splat(96.0f / 255.0f), gamma) +              \
+                        step(splat(192.0f / 255.0f), gamma);              \
+    vec_float scale = exp2(segment) * splat(1.0f / 1024.0f);              \
+    vec_float offset = splat(-16.0f) * exp2(segment + segment) *          \
+                       past_first;                                        \
+    vec_float linear_value =                                              \
+        gamma * splat(255.0f * 1024.0f) * scale + offset;                 \
+    linear_value += trunc(linear_value * scale);                          \
+    return linear_value * splat(1.0f / 1023.0f);
+
+  float XePWLGammaToLinear(float gamma) {
+    XE_PWL_GAMMA_TO_LINEAR_BODY(float, float)
+  }
+
+  float3_xe XePWLGammaToLinear3(float3_xe gamma) {
+    XE_PWL_GAMMA_TO_LINEAR_BODY(float3_xe, float_x3_xe)
+  }
+
+  float4_xe XePWLGammaToLinear4(float4_xe gamma) {
+    XE_PWL_GAMMA_TO_LINEAR_BODY(float4_xe, float_x4_xe)
+  }
+
+  // Inverse of the above, same segment-counting trick: scales are
+  // 1023/1/2/4/8 and offsets 0/32/64/128 over 255.
+#define XE_LINEAR_TO_PWL_GAMMA_BODY(vec_float, splat)                      \
+    linear_value = saturate_xe(linear_value);                              \
+    vec_float past_first = step(splat(64.0f / 1023.0f), linear_value);     \
+    vec_float segment = past_first +                                       \
+                        step(splat(128.0f / 1023.0f), linear_value) +      \
+                        step(splat(512.0f / 1023.0f), linear_value);       \
+    vec_float scale = splat(1023.0f) * exp2(-segment);                     \
+    vec_float offset =                                                     \
+        splat(16.0f / 255.0f) * exp2(segment) * past_first;                \
+    return trunc(linear_value * scale) * splat(1.0f / 255.0f) + offset;
+
+  float XeLinearToPWLGamma(float linear_value) {
+    XE_LINEAR_TO_PWL_GAMMA_BODY(float, float)
+  }
+
+  float3_xe XeLinearToPWLGamma3(float3_xe linear_value) {
+    XE_LINEAR_TO_PWL_GAMMA_BODY(float3_xe, float_x3_xe)
+  }
+
   #if XE_RESOLVE_COPY_EDRAM_BYTE_BUFFER_ALIGNMENT == 4
     void XeResolveLoad2RGBAUnswappedPixelSamplesFromRaw(
         param_byte_buffer_xe(xe_resolve_edram) param_next_after_byte_buffer_xe
@@ -661,62 +720,6 @@ uint XeResolveEdramPixelStrideBytes(XeResolveInfo resolve_info) {
                                            source_blue, source_alpha,
                                            pixels_0123, pixels_4567);
       }
-    }
-
-    // Gamma RTs store linear 10 bit color through an 8 bit PWL curve.
-    // Host sRGB is not a substitute. Some titles appear overexposed if full
-    // 8_8_8_8_GAMMA resolves average the encoded bytes directly (5345085D,
-    // 45410934), so we decode before MSAA averaging and encode again only
-    // for compatible 8_8_8_8 destinations.
-    // The PWL segment is derived arithmetically instead of by nested
-    // branches: the four segments scale by 1/2/4/8 and offset by
-    // 0/-64/-256/-1024, so counting thresholds passed gives both. Inlined per
-    // component per sample, where live branch bodies cost occupancy.
-#define XE_PWL_GAMMA_TO_LINEAR_BODY(vec_float, splat)                     \
-      gamma = saturate_xe(gamma);                                         \
-      vec_float past_first = step(splat(64.0f / 255.0f), gamma);          \
-      vec_float segment = past_first +                                    \
-                          step(splat(96.0f / 255.0f), gamma) +            \
-                          step(splat(192.0f / 255.0f), gamma);            \
-      vec_float scale = exp2(segment) * splat(1.0f / 1024.0f);            \
-      vec_float offset = splat(-16.0f) * exp2(segment + segment) *        \
-                         past_first;                                      \
-      vec_float linear_value =                                            \
-          gamma * splat(255.0f * 1024.0f) * scale + offset;               \
-      linear_value += trunc(linear_value * scale);                        \
-      return linear_value * splat(1.0f / 1023.0f);
-
-    float XePWLGammaToLinear(float gamma) {
-      XE_PWL_GAMMA_TO_LINEAR_BODY(float, float)
-    }
-
-    float3_xe XePWLGammaToLinear3(float3_xe gamma) {
-      XE_PWL_GAMMA_TO_LINEAR_BODY(float3_xe, float_x3_xe)
-    }
-
-    float4_xe XePWLGammaToLinear4(float4_xe gamma) {
-      XE_PWL_GAMMA_TO_LINEAR_BODY(float4_xe, float_x4_xe)
-    }
-
-    // Inverse of the above, same segment-counting trick: scales are
-    // 1023/1/2/4/8 and offsets 0/32/64/128 over 255.
-#define XE_LINEAR_TO_PWL_GAMMA_BODY(vec_float, splat)                      \
-      linear_value = saturate_xe(linear_value);                            \
-      vec_float past_first = step(splat(64.0f / 1023.0f), linear_value);   \
-      vec_float segment = past_first +                                     \
-                          step(splat(128.0f / 1023.0f), linear_value) +    \
-                          step(splat(512.0f / 1023.0f), linear_value);     \
-      vec_float scale = splat(1023.0f) * exp2(-segment);                   \
-      vec_float offset =                                                   \
-          splat(16.0f / 255.0f) * exp2(segment) * past_first;              \
-      return trunc(linear_value * scale) * splat(1.0f / 255.0f) + offset;
-
-    float XeLinearToPWLGamma(float linear_value) {
-      XE_LINEAR_TO_PWL_GAMMA_BODY(float, float)
-    }
-
-    float3_xe XeLinearToPWLGamma3(float3_xe linear_value) {
-      XE_LINEAR_TO_PWL_GAMMA_BODY(float3_xe, float_x3_xe)
     }
 
     bool XeResolveSourceUsesPWLGamma(XeResolveInfo resolve_info) {

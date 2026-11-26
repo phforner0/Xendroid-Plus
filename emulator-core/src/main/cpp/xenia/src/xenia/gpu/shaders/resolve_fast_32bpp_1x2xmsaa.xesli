@@ -22,6 +22,9 @@ entry_bindings_begin_compute_xe
   entry_binding_next_xe
   XE_RESOLVE_COPY_EDRAM_BINDING
 entry_bindings_end_inputs_begin_compute_xe
+#if SHADING_LANGUAGE_GLSL_XE
+  layout(local_size_x_id = 0, local_size_y_id = 1) in;
+#endif
   entry_in_global_thread_id_xe
 entry_inputs_end_code_begin_compute_xe
 {
