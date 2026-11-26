@@ -14,15 +14,689 @@
 #include <array>
 #include <atomic>
 #include <climits>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <memory>
+#include <unordered_map>
+#include <utility>
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__SSSE3__)
+#include <tmmintrin.h>
+#endif
+
+namespace xe {
+namespace gpu {
+namespace draw_cuts {
+
+struct FloatConstantWriteResult {
+  bool any_changed = false;
+  bool vertex_dirty = false;
+  bool pixel_dirty = false;
+};
+
+inline uint32_t LoadSwap32Unaligned(const uint32_t* ptr) {
+  uint32_t raw;
+  std::memcpy(&raw, ptr, sizeof(raw));
+#if defined(_MSC_VER)
+  return _byteswap_ulong(raw);
+#else
+  return __builtin_bswap32(raw);
+#endif
+}
+
+// Byte-swaps big-endian guest float constant dwords into `dst` only where
+// values actually differ (bitwise XOR exactness), and reports whether any
+// changed vec4 is referenced by the active vertex/pixel float constant maps.
+inline FloatConstantWriteResult CopySwapAndTrackFloatConstants(
+    uint32_t* dst, const uint32_t* src, uint32_t start_index,
+    uint32_t float_base_index, uint32_t num_registers,
+    const uint64_t vertex_map[4], const uint64_t pixel_map[4],
+    bool check_vertex, bool check_pixel) {
+  FloatConstantWriteResult result;
+  if (!num_registers) {
+    return result;
+  }
+
+  auto mark_vec4_dirty = [&](uint32_t vec4_index) {
+    if (vec4_index < 256u) {
+      if (check_vertex &&
+          (vertex_map[vec4_index >> 6] & (UINT64_C(1) << (vec4_index & 63)))) {
+        result.vertex_dirty = true;
+        check_vertex = false;
+      }
+    } else {
+      const uint32_t pixel_index = vec4_index - 256u;
+      if (pixel_index < 256u && check_pixel &&
+          (pixel_map[pixel_index >> 6] & (UINT64_C(1) << (pixel_index & 63)))) {
+        result.pixel_dirty = true;
+        check_pixel = false;
+      }
+    }
+  };
+
+  uint32_t index = start_index;
+  uint32_t remaining = num_registers;
+
+  // Unaligned head dwords until vec4 boundary.
+  while (remaining > 0 && ((index - float_base_index) & 3u) != 0) {
+    const uint32_t val = LoadSwap32Unaligned(src);
+    if (*dst != val) {
+      *dst = val;
+      result.any_changed = true;
+      mark_vec4_dirty((index - float_base_index) >> 2);
+    }
+    ++dst;
+    ++src;
+    ++index;
+    --remaining;
+  }
+
+  // Main vec4 (16-byte) SIMD/XOR loop.
+#if defined(__SSSE3__)
+  const __m128i kBswapMask =
+      _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+  const __m128i kZero = _mm_setzero_si128();
+#endif
+  uint32_t vec4_index = (index - float_base_index) >> 2;
+  while (remaining >= 4u) {
+    bool vec4_changed = false;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const uint8x16_t raw = vld1q_u8(reinterpret_cast<const uint8_t*>(src));
+    const uint32x4_t swapped = vreinterpretq_u32_u8(vrev32q_u8(raw));
+    const uint32x4_t cur = vld1q_u32(dst);
+    const uint64x2_t diff64 = vreinterpretq_u64_u32(veorq_u32(swapped, cur));
+    if ((vgetq_lane_u64(diff64, 0) | vgetq_lane_u64(diff64, 1)) != 0) {
+      vst1q_u32(dst, swapped);
+      vec4_changed = true;
+    }
+#elif defined(__SSSE3__)
+    const __m128i raw =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+    const __m128i swapped = _mm_shuffle_epi8(raw, kBswapMask);
+    const __m128i cur =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst));
+    const __m128i diff = _mm_xor_si128(swapped, cur);
+    if (_mm_movemask_epi8(_mm_cmpeq_epi32(diff, kZero)) != 0xFFFF) {
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), swapped);
+      vec4_changed = true;
+    }
+#else
+    const uint32_t v0 = LoadSwap32Unaligned(src + 0);
+    const uint32_t v1 = LoadSwap32Unaligned(src + 1);
+    const uint32_t v2 = LoadSwap32Unaligned(src + 2);
+    const uint32_t v3 = LoadSwap32Unaligned(src + 3);
+    if (((dst[0] ^ v0) | (dst[1] ^ v1) | (dst[2] ^ v2) | (dst[3] ^ v3)) != 0) {
+      dst[0] = v0;
+      dst[1] = v1;
+      dst[2] = v2;
+      dst[3] = v3;
+      vec4_changed = true;
+    }
+#endif
+    if (vec4_changed) {
+      result.any_changed = true;
+      mark_vec4_dirty(vec4_index);
+    }
+    dst += 4;
+    src += 4;
+    index += 4;
+    ++vec4_index;
+    remaining -= 4;
+  }
+
+  // Trailing 0..3 dwords.
+  while (remaining > 0) {
+    const uint32_t val = LoadSwap32Unaligned(src);
+    if (*dst != val) {
+      *dst = val;
+      result.any_changed = true;
+      mark_vec4_dirty((index - float_base_index) >> 2);
+    }
+    ++dst;
+    ++src;
+    ++index;
+    --remaining;
+  }
+
+  return result;
+}
+
+// Dirty-group bitmask for UpdateSystemConstantValues memoization.
+constexpr uint32_t kSysConstGroupFlags = UINT32_C(1) << 0;
+constexpr uint32_t kSysConstGroupIndex = UINT32_C(1) << 1;
+constexpr uint32_t kSysConstGroupUcp = UINT32_C(1) << 2;
+constexpr uint32_t kSysConstGroupTess = UINT32_C(1) << 3;
+constexpr uint32_t kSysConstGroupPoint = UINT32_C(1) << 4;
+constexpr uint32_t kSysConstGroupTextures = UINT32_C(1) << 5;
+constexpr uint32_t kSysConstGroupColorExpBias = UINT32_C(1) << 6;
+constexpr uint32_t kSysConstGroupFsi = UINT32_C(1) << 7;
+constexpr uint32_t kSysConstGroupAll = 0xFFu;
+
+inline uint32_t ClassifySysConstRegisterDirtyGroups(uint32_t reg_index) {
+  if (reg_index >= 0x4800u && reg_index <= 0x48BFu) {
+    return kSysConstGroupTextures;
+  }
+  if (reg_index < 0x2000u || reg_index > 0x239Fu) {
+    return 0u;
+  }
+  if (reg_index >= 0x2388u && reg_index <= 0x239Fu) {
+    // PA_CL_UCP_0_X .. PA_CL_UCP_5_W
+    return kSysConstGroupUcp;
+  }
+  if (reg_index >= 0x2380u && reg_index <= 0x2383u) {
+    // PA_SU_POLY_OFFSET_FRONT/BACK_SCALE/OFFSET (FSI)
+    return kSysConstGroupFsi;
+  }
+  switch (reg_index) {
+    case 0x2000u:  // RB_SURFACE_INFO
+    case 0x2002u:  // RB_DEPTH_INFO
+      return kSysConstGroupFlags | kSysConstGroupFsi;
+    case 0x2001u:  // RB_COLOR_INFO
+    case 0x2003u:  // RB_COLOR1_INFO
+    case 0x2004u:  // RB_COLOR2_INFO
+    case 0x2005u:  // RB_COLOR3_INFO
+      return kSysConstGroupFlags | kSysConstGroupColorExpBias |
+             kSysConstGroupFsi;
+    case 0x2100u:  // VGT_MAX_VTX_INDX
+    case 0x2101u:  // VGT_MIN_VTX_INDX
+      return kSysConstGroupTess;
+    case 0x2102u:  // VGT_INDX_OFFSET
+      return kSysConstGroupIndex | kSysConstGroupTess;
+    case 0x2105u:  // RB_BLEND_RED
+    case 0x2106u:  // RB_BLEND_GREEN
+    case 0x2107u:  // RB_BLEND_BLUE
+    case 0x2108u:  // RB_BLEND_ALPHA
+    case 0x210Cu:  // RB_STENCILREFMASK_BF
+    case 0x210Du:  // RB_STENCILREFMASK
+      return kSysConstGroupFsi;
+    case 0x210Eu:  // RB_ALPHA_REF
+      return kSysConstGroupFlags;
+    case 0x21FCu:  // VGT_DRAW_INITIATOR
+      return kSysConstGroupFlags | kSysConstGroupIndex | kSysConstGroupPoint;
+    case 0x2201u:  // RB_BLENDCONTROL0
+    case 0x2205u:  // PA_SU_SC_MODE_CNTL
+    case 0x2209u:  // RB_BLENDCONTROL1
+    case 0x220Au:  // RB_BLENDCONTROL2
+    case 0x220Bu:  // RB_BLENDCONTROL3
+      return kSysConstGroupFsi;
+    case 0x2202u:  // RB_COLORCONTROL
+      return kSysConstGroupFlags | kSysConstGroupFsi;
+    case 0x2204u:  // PA_CL_CLIP_CNTL
+      return kSysConstGroupUcp;
+    case 0x2206u:  // PA_CL_VTE_CNTL
+    case 0x2284u:  // VGT_OUTPUT_PATH_CNTL
+      return kSysConstGroupFlags;
+    case 0x2280u:  // PA_SU_POINT_SIZE
+    case 0x2281u:  // PA_SU_POINT_MINMAX
+      return kSysConstGroupPoint;
+    case 0x2286u:  // VGT_HOS_MAX_TESS_LEVEL
+    case 0x2287u:  // VGT_HOS_MIN_TESS_LEVEL
+      return kSysConstGroupTess;
+    default:
+      return 0u;
+  }
+}
+
+inline uint32_t ClassifySysConstRangeDirtyGroups(uint32_t start_index,
+                                                 uint32_t num_registers) {
+  if (!num_registers) {
+    return 0u;
+  }
+  const uint64_t lo = start_index;
+  const uint64_t hi = uint64_t(start_index) + uint64_t(num_registers);
+  uint32_t mask = 0u;
+  auto overlaps = [lo, hi](uint32_t a, uint32_t b_incl) {
+    return lo <= b_incl && hi > a;
+  };
+  if (overlaps(0x4800u, 0x48BFu)) {
+    mask |= kSysConstGroupTextures;
+  }
+  if (!overlaps(0x2000u, 0x239Fu)) {
+    return mask;
+  }
+  if (overlaps(0x2000u, 0x2005u)) {
+    mask |= kSysConstGroupFlags | kSysConstGroupFsi;
+    if (overlaps(0x2001u, 0x2001u) || overlaps(0x2003u, 0x2005u)) {
+      mask |= kSysConstGroupColorExpBias;
+    }
+  }
+  if (overlaps(0x2100u, 0x2102u)) {
+    mask |= kSysConstGroupTess;
+    if (overlaps(0x2102u, 0x2102u)) {
+      mask |= kSysConstGroupIndex;
+    }
+  }
+  if (overlaps(0x2105u, 0x210Du)) {
+    mask |= kSysConstGroupFsi;
+  }
+  if (overlaps(0x210Eu, 0x210Eu)) {
+    mask |= kSysConstGroupFlags;
+  }
+  if (overlaps(0x21FCu, 0x21FCu)) {
+    mask |= kSysConstGroupFlags | kSysConstGroupIndex | kSysConstGroupPoint;
+  }
+  if (overlaps(0x2201u, 0x220Bu)) {
+    if (overlaps(0x2201u, 0x2202u) || overlaps(0x2205u, 0x2205u) ||
+        overlaps(0x2209u, 0x220Bu)) {
+      mask |= kSysConstGroupFsi;
+    }
+    if (overlaps(0x2202u, 0x2202u) || overlaps(0x2206u, 0x2206u)) {
+      mask |= kSysConstGroupFlags;
+    }
+    if (overlaps(0x2204u, 0x2204u)) {
+      mask |= kSysConstGroupUcp;
+    }
+  }
+  if (overlaps(0x2280u, 0x2287u)) {
+    if (overlaps(0x2280u, 0x2281u)) {
+      mask |= kSysConstGroupPoint;
+    }
+    if (overlaps(0x2284u, 0x2284u)) {
+      mask |= kSysConstGroupFlags;
+    }
+    if (overlaps(0x2286u, 0x2287u)) {
+      mask |= kSysConstGroupTess;
+    }
+  }
+  if (overlaps(0x2380u, 0x2383u)) {
+    mask |= kSysConstGroupFsi;
+  }
+  if (overlaps(0x2388u, 0x239Fu)) {
+    mask |= kSysConstGroupUcp;
+  }
+  return mask;
+}
+
+class SystemConstantsDirtyTracker {
+ public:
+  void InvalidateAll() { dirty_mask_ = kSysConstGroupAll; }
+  void ClearAll() { dirty_mask_ = 0u; }
+  void MarkDirty(uint32_t groups) { dirty_mask_ |= groups; }
+  void NoteRegisterWrite(uint32_t reg_index) {
+    dirty_mask_ |= ClassifySysConstRegisterDirtyGroups(reg_index);
+  }
+  void NoteRegisterRangeWrite(uint32_t start_index, uint32_t num_registers) {
+    dirty_mask_ |=
+        ClassifySysConstRangeDirtyGroups(start_index, num_registers);
+  }
+  uint32_t dirty_mask() const { return dirty_mask_; }
+
+ private:
+  uint32_t dirty_mask_ = kSysConstGroupAll;
+};
+
+// Lock-free atomic epoch write-watch cache for PM4_IM_LOAD shader loads.
+// Guest CPU threads run OnMemoryInvalidated() inside the fault handler with
+// zero locks or heap allocations; the GPU command thread calls Lookup(),
+// BeginArmAndSnapshot(), and CommitIfUnchanged() exclusively.
+constexpr uint32_t kShaderWatchPhysicalMemoryMask = 0x1FFFFFFFu;
+constexpr uint32_t kShaderWatchPhysicalMemorySize = 512u * 1024u * 1024u;
+constexpr uint32_t kShaderWatchPageShift = 12u;
+constexpr uint32_t kShaderWatchPageCount =
+    kShaderWatchPhysicalMemorySize >> kShaderWatchPageShift;
+constexpr uint32_t kShaderWatchMaxPagesPerShader = 8u;
+constexpr size_t kShaderWatchMaxEntries = 4096u;
+
+struct ShaderWatchSnapshot {
+  uint32_t phys_address = 0;
+  uint32_t byte_length = 0;
+  uint32_t first_page = 0;
+  uint32_t page_count = 0;
+  uint64_t global_epoch = 0;
+  std::array<uint32_t, kShaderWatchMaxPagesPerShader> page_epochs{};
+};
+
+template <typename ShaderT>
+class ShaderLoadWatchCache {
+ public:
+  ShaderLoadWatchCache()
+      : page_epochs_(std::make_unique<std::atomic<uint32_t>[]>(
+            kShaderWatchPageCount)),
+        armed_pages_(std::make_unique<std::atomic<uint64_t>[]>(
+            kShaderWatchPageCount / 64u)) {
+    for (uint32_t i = 0; i < kShaderWatchPageCount; ++i) {
+      page_epochs_[i].store(0u, std::memory_order_relaxed);
+    }
+    for (uint32_t i = 0; i < kShaderWatchPageCount / 64u; ++i) {
+      armed_pages_[i].store(0u, std::memory_order_relaxed);
+    }
+  }
+
+  // Called from Guest CPU fault handler (or trace playback): wait-free,
+  // lock-free, no allocations. Skips non-shader pages via the 16 KiB bitset.
+  // Returns the safe unwatch range (start, length) for Memory's fault handler:
+  // if another armed shader page exists inside Memory's 4 MiB max unwatch
+  // excess window outside [physical_address, physical_address + length), clamps
+  // the unwatch range to (physical_address, length) so adjacent cached shader
+  // pages are never silently unprotected without bumping their epochs.
+  std::pair<uint32_t, uint32_t> OnMemoryInvalidatedForUnwatch(
+      uint32_t physical_address, uint32_t length, bool exact_range) {
+    if (!length) {
+      return {0u, UINT32_MAX};
+    }
+    const uint32_t phys = physical_address & kShaderWatchPhysicalMemoryMask;
+    const uint32_t first_page = phys >> kShaderWatchPageShift;
+    if (first_page >= kShaderWatchPageCount) {
+      return {0u, UINT32_MAX};
+    }
+    const uint64_t end_excl = std::min<uint64_t>(
+        uint64_t(phys) + uint64_t(length), kShaderWatchPhysicalMemorySize);
+    if (end_excl <= phys) {
+      return {0u, UINT32_MAX};
+    }
+    const uint32_t last_page =
+        static_cast<uint32_t>((end_excl - 1u) >> kShaderWatchPageShift);
+    for (uint32_t page = first_page; page <= last_page; ++page) {
+      const uint64_t word =
+          armed_pages_[page >> 6].load(std::memory_order_acquire);
+      if (word & (UINT64_C(1) << (page & 63u))) {
+        page_epochs_[page].fetch_add(1u, std::memory_order_acq_rel);
+      }
+    }
+    if (exact_range) {
+      return {physical_address, length};
+    }
+    // Check Memory's kMaxUnwatchExcess (4 MiB) window for any OTHER armed
+    // shader page; if present, clamp unwatch to the invalidated range so that
+    // sibling shader pages keep PROT_READ.
+    constexpr uint32_t kMaxUnwatchExcess = 4u * 1024u * 1024u;
+    const uint32_t win_first_addr = phys & ~(kMaxUnwatchExcess - 1u);
+    const uint32_t win_last_addr = std::min<uint32_t>(
+        static_cast<uint32_t>((end_excl - 1u) | (kMaxUnwatchExcess - 1u)),
+        kShaderWatchPhysicalMemorySize - 1u);
+    const uint32_t win_first_word = (win_first_addr >> kShaderWatchPageShift) >> 6;
+    const uint32_t win_last_word = (win_last_addr >> kShaderWatchPageShift) >> 6;
+    for (uint32_t w = win_first_word; w <= win_last_word; ++w) {
+      uint64_t armed = armed_pages_[w].load(std::memory_order_acquire);
+      if (!armed) {
+        continue;
+      }
+      const uint32_t word_base_page = w << 6;
+      const uint32_t word_end_page = word_base_page + 63u;
+      if (first_page <= word_end_page && last_page >= word_base_page) {
+        const uint32_t lo_bit =
+            first_page > word_base_page ? first_page - word_base_page : 0u;
+        const uint32_t hi_bit =
+            last_page < word_end_page ? last_page - word_base_page : 63u;
+        const uint32_t span = hi_bit - lo_bit + 1u;
+        const uint64_t invalidated_mask =
+            span >= 64u ? ~UINT64_C(0)
+                        : (((UINT64_C(1) << span) - 1u) << lo_bit);
+        armed &= ~invalidated_mask;
+      }
+      if (armed != 0u) {
+        return {physical_address, length};
+      }
+    }
+    return {0u, UINT32_MAX};
+  }
+
+  void OnMemoryInvalidated(uint32_t physical_address, uint32_t length) {
+    OnMemoryInvalidatedForUnwatch(physical_address, length, true);
+  }
+
+  // GPU thread only: invalidates all cached entries immediately.
+  void InvalidateAll() {
+    global_epoch_.fetch_add(1u, std::memory_order_acq_rel);
+    entries_.clear();
+  }
+
+  // GPU thread only: returns cached shader pointer if all watched pages still
+  // match the snapshot epochs recorded before the shader was hashed.
+  ShaderT* Lookup(uint32_t shader_type, uint32_t guest_address,
+                  uint32_t dword_count) const {
+    if (!dword_count) {
+      return nullptr;
+    }
+    const uint32_t phys = guest_address & kShaderWatchPhysicalMemoryMask;
+    auto it = entries_.find(MakeKey(shader_type, phys, dword_count));
+    if (it == entries_.end()) {
+      return nullptr;
+    }
+    const Entry& e = it->second;
+    if (e.global_epoch != global_epoch_.load(std::memory_order_acquire)) {
+      return nullptr;
+    }
+    for (uint32_t i = 0; i < e.page_count; ++i) {
+      if (page_epochs_[e.first_page + i].load(std::memory_order_acquire) !=
+          e.page_epochs[i]) {
+        return nullptr;
+      }
+    }
+    return e.shader;
+  }
+
+  // GPU thread only: prepares a watch snapshot BEFORE arming OS write-watch
+  // and hashing microcode. Returns false if the shader range cannot be cached.
+  bool BeginArmAndSnapshot(uint32_t guest_address, uint32_t dword_count,
+                           ShaderWatchSnapshot& out) {
+    if (!dword_count) {
+      return false;
+    }
+    const uint32_t phys = guest_address & kShaderWatchPhysicalMemoryMask;
+    const uint64_t bytes = uint64_t(dword_count) * sizeof(uint32_t);
+    if (uint64_t(phys) + bytes > kShaderWatchPhysicalMemorySize) {
+      return false;
+    }
+    const uint32_t first_page = phys >> kShaderWatchPageShift;
+    const uint32_t last_page =
+        static_cast<uint32_t>((uint64_t(phys) + bytes - 1u) >>
+                              kShaderWatchPageShift);
+    const uint32_t page_count = last_page - first_page + 1u;
+    if (page_count > kShaderWatchMaxPagesPerShader) {
+      return false;
+    }
+    out.phys_address = phys;
+    out.byte_length = static_cast<uint32_t>(bytes);
+    out.first_page = first_page;
+    out.page_count = page_count;
+    // Mark pages armed BEFORE reading epochs so any concurrent CPU fault
+    // observes the armed bit and bumps the page epoch.
+    for (uint32_t i = 0; i < page_count; ++i) {
+      const uint32_t p = first_page + i;
+      armed_pages_[p >> 6].fetch_or(UINT64_C(1) << (p & 63u),
+                                    std::memory_order_acq_rel);
+    }
+    out.global_epoch = global_epoch_.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < page_count; ++i) {
+      out.page_epochs[i] =
+          page_epochs_[first_page + i].load(std::memory_order_acquire);
+    }
+    return true;
+  }
+
+  // GPU thread only: commits `shader` into the watch cache ONLY if zero
+  // invalidations happened across [BeginArmAndSnapshot .. now].
+  bool CommitIfUnchanged(uint32_t shader_type, uint32_t guest_address,
+                         uint32_t dword_count,
+                         const ShaderWatchSnapshot& snap, ShaderT* shader) {
+    if (!shader || !snap.page_count) {
+      return false;
+    }
+    if (global_epoch_.load(std::memory_order_acquire) != snap.global_epoch) {
+      return false;
+    }
+    for (uint32_t i = 0; i < snap.page_count; ++i) {
+      if (page_epochs_[snap.first_page + i].load(std::memory_order_acquire) !=
+          snap.page_epochs[i]) {
+        return false;
+      }
+    }
+    if (entries_.size() >= kShaderWatchMaxEntries) {
+      entries_.clear();
+    }
+    const uint32_t phys = guest_address & kShaderWatchPhysicalMemoryMask;
+    Entry& e = entries_[MakeKey(shader_type, phys, dword_count)];
+    e.shader = shader;
+    e.first_page = snap.first_page;
+    e.page_count = snap.page_count;
+    e.global_epoch = snap.global_epoch;
+    e.page_epochs = snap.page_epochs;
+    return true;
+  }
+
+ private:
+  struct Entry {
+    ShaderT* shader = nullptr;
+    uint32_t first_page = 0;
+    uint32_t page_count = 0;
+    uint64_t global_epoch = 0;
+    std::array<uint32_t, kShaderWatchMaxPagesPerShader> page_epochs{};
+  };
+
+  static uint64_t MakeKey(uint32_t shader_type, uint32_t phys_address,
+                          uint32_t dword_count) {
+    // phys_address fits in 29 bits (512 MiB), dword_count in 16 bits, type in 2 bits.
+    return (uint64_t(shader_type & 0x3u) << 48) |
+           (uint64_t(dword_count & 0xFFFFu) << 32) | uint64_t(phys_address);
+  }
+
+  std::unique_ptr<std::atomic<uint32_t>[]> page_epochs_;
+  std::unique_ptr<std::atomic<uint64_t>[]> armed_pages_;
+  std::atomic<uint64_t> global_epoch_{1};
+  std::unordered_map<uint64_t, Entry> entries_;
+};
+
+// VK_KHR_push_descriptor driver blacklist + Eden maxPushDescriptors clamp.
+constexpr uint32_t kMaxPushDescriptorsClamp = 32u;
+
+struct PushDescriptorPolicyResult {
+  bool enabled = false;
+  uint32_t clamped_max_push_descriptors = 0;
+};
+
+inline PushDescriptorPolicyResult EvaluatePushDescriptorPolicy(
+    bool cvar_enabled, bool extension_enabled, bool function_loaded,
+    uint32_t vendor_id, uint32_t driver_id,
+    uint32_t reported_max_push_descriptors, uint32_t required_bindings) {
+  PushDescriptorPolicyResult result;
+  if (!cvar_enabled || !extension_enabled || !function_loaded) {
+    return result;
+  }
+  constexpr uint32_t kVendorIdArm = 0x13B5u;
+  constexpr uint32_t kVendorIdQualcomm = 0x5143u;
+  constexpr uint32_t kDriverIdQualcommProprietary = 8u;
+  constexpr uint32_t kDriverIdArmProprietary = 9u;
+
+  // Strict blacklist: Qualcomm proprietary Adreno blob and Arm Mali proprietary
+  // blob (including pre-1.2 driverID == 0). Mesa Turnip (18) and PanVK /
+  // malisx2 (20) are explicitly permitted.
+  const bool is_qualcomm_proprietary =
+      driver_id == kDriverIdQualcommProprietary ||
+      (driver_id == 0u && vendor_id == kVendorIdQualcomm);
+  const bool is_arm_proprietary =
+      driver_id == kDriverIdArmProprietary ||
+      (driver_id == 0u && vendor_id == kVendorIdArm);
+  if (is_qualcomm_proprietary || is_arm_proprietary) {
+    return result;
+  }
+
+  // Eden lesson: clamp reported maxPushDescriptors to a safe upper bound.
+  const uint32_t clamped =
+      std::min(reported_max_push_descriptors, kMaxPushDescriptorsClamp);
+  if (clamped < required_bindings || required_bindings == 0u) {
+    return result;
+  }
+  result.enabled = true;
+  result.clamped_max_push_descriptors = clamped;
+  return result;
+}
+
+// Asynchronous ring state machine for small UMA resolve readbacks (<= 4 KiB).
+constexpr uint32_t kSmallReadbackMaxBytes = 4096u;
+constexpr uint32_t kSmallReadbackRingSlotCount = 64u;
+
+inline bool IsSmallReadbackRingEligible(uint32_t length_bytes) {
+  return length_bytes > 0u && length_bytes <= kSmallReadbackMaxBytes;
+}
+
+struct SmallReadbackRingSlot {
+  uint64_t submission = 0;
+  uint64_t generation = 0;
+  uint32_t guest_address = 0;
+  uint32_t length = 0;
+  uint32_t slot_index = 0;
+};
+
+class SmallReadbackRingState {
+ public:
+  bool empty() const { return count_ == 0u; }
+  bool full() const { return count_ >= kSmallReadbackRingSlotCount; }
+  uint32_t pending_count() const { return count_; }
+  uint64_t current_generation() const { return generation_; }
+
+  uint64_t OldestSubmission() const {
+    return count_ > 0u ? slots_[head_].submission : 0u;
+  }
+
+  // Marks all currently queued slots as discarded (e.g. on InvalidateGpuMemory)
+  // WITHOUT resetting head_/tail_/count_, so in-flight GPU copies still retire
+  // before their ring slots can be reused (preventing WAW on the ring buffer).
+  void InvalidatePending() { ++generation_; }
+
+  bool TryEnqueue(uint64_t submission, uint32_t guest_address, uint32_t length,
+                  uint32_t& slot_index_out) {
+    if (full() || !IsSmallReadbackRingEligible(length)) {
+      return false;
+    }
+    const uint32_t idx = tail_;
+    SmallReadbackRingSlot& slot = slots_[idx];
+    slot.submission = submission;
+    slot.generation = generation_;
+    slot.guest_address = guest_address;
+    slot.length = length;
+    slot.slot_index = idx;
+    tail_ = (tail_ + 1u) % kSmallReadbackRingSlotCount;
+    ++count_;
+    slot_index_out = idx;
+    return true;
+  }
+
+  template <typename Fn>
+  uint32_t DrainCompleted(uint64_t completed_submission, Fn&& on_slot) {
+    uint32_t drained = 0u;
+    while (count_ > 0u && slots_[head_].submission <= completed_submission) {
+      const SmallReadbackRingSlot slot = slots_[head_];
+      head_ = (head_ + 1u) % kSmallReadbackRingSlotCount;
+      --count_;
+      if (slot.generation == generation_) {
+        on_slot(slot);
+      }
+      ++drained;
+    }
+    return drained;
+  }
+
+  void Reset() {
+    head_ = 0u;
+    tail_ = 0u;
+    count_ = 0u;
+    generation_ = 1u;
+  }
+
+ private:
+  std::array<SmallReadbackRingSlot, kSmallReadbackRingSlotCount> slots_{};
+  uint32_t head_ = 0u;
+  uint32_t tail_ = 0u;
+  uint32_t count_ = 0u;
+  uint64_t generation_ = 1u;
+};
+
+}  // namespace draw_cuts
+}  // namespace gpu
+}  // namespace xe
+
+#if !defined(XENIA_GPU_DRAW_CUTS_PURE_LOGIC_ONLY)
+
 #include <deque>
 #include <filesystem>
 #include <functional>
 #include <map>
-#include <memory>
 #include <string>
 #include <tuple>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -186,6 +860,15 @@ class VulkanCommandProcessor final : public CommandProcessor {
                graphics_system_->provider())
         ->vulkan_device();
   }
+
+  Memory* memory() const { return memory_; }
+
+  // Guest-address-aware shader load hook invoked by PM4_IM_LOAD so the
+  // pipeline cache can hit its write-watch cache before hashing microcode.
+  Shader* LoadShaderFromGuestAddress(xenos::ShaderType shader_type,
+                                     uint32_t guest_physical_address,
+                                     const uint32_t* host_address,
+                                     uint32_t dword_count);
 
   // Returns the deferred drawing command list for the currently open
   // submission.
@@ -1608,6 +2291,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // VkWriteDescriptorSet type and the bind's pDynamicOffsets switch on it
   // together (a partial switch is a VUID violation).
   bool use_dynamic_constants_ = false;
+  // VK_KHR_push_descriptor for set 1 (constants): mutually exclusive with
+  // use_dynamic_constants_ (VUID-VkDescriptorSetLayoutCreateInfo-flags-00280).
+  bool use_push_descriptors_ = false;
+  uint32_t max_push_descriptors_ = 0;
   // Value-cache for the constants descriptor set (one shared set, 5 bindings).
   // Mirrors the sentinel-free validity discipline of the texture hash caches
   // above: constants_descriptor_set_buffers_[i] records the VkBuffer handle last
@@ -1706,6 +2393,38 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // System shader constants, including user clip planes and tessellation
   // constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
+
+  // Dirty-mask memoization for UpdateSystemConstantValues (gated by
+  // vulkan_memoize_system_constants).
+  draw_cuts::SystemConstantsDirtyTracker sysconst_dirty_tracker_;
+  struct SysConstMemoState {
+    bool valid = false;
+    bool edram_fsi = false;
+    bool gamma_as_unorm16 = false;
+    bool alpha_to_coverage_as_test = false;
+    bool texture_point_snap = false;
+    bool primitive_polygonal = false;
+    bool shader_32bit_index_dma = false;
+    bool host_builtin_index_dma = false;
+    bool has_host_depth_polygon_offset = false;
+    uint32_t draw_scale_x = 0;
+    uint32_t draw_scale_y = 0;
+    uint32_t rb_surface_info = 0;
+    uint32_t vgt_draw_initiator = 0;
+    uint32_t used_texture_mask = 0;
+    uint32_t normalized_depth_control = 0;
+    uint32_t normalized_color_mask = 0;
+    uint32_t zpd_fsi_counter_index = UINT32_MAX;
+    uint64_t texture_usage_generation = UINT64_MAX;
+    uint32_t cached_base_flags = 0;
+    uint32_t cached_fsi_flags = 0;
+    xenos::Endian host_shader_index_endian = xenos::Endian::kNone;
+    float ndc_scale[3] = {};
+    float ndc_offset[3] = {};
+    uint32_t viewport_xy_extent[2] = {};
+    draw_util::HostDepthPolygonOffset host_depth_polygon_offset = {};
+  };
+  SysConstMemoState sysconst_memo_;
 
   // Host viewport of the previous draw, reused while the inputs it was derived
   // from stay the same.
@@ -1840,6 +2559,19 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Guest frame of each destination's last uma readback, for the bounded
   // fence collection staleness cap.
   std::unordered_map<uint64_t, uint64_t> uma_readback_last_read_frame_;
+  // Asynchronous staging ring for small UMA resolve readbacks (<= 4 KiB),
+  // gated by vulkan_small_readback_async_ring. Avoids first_use and
+  // kMaxFramesInFlight stalls while preserving per-frame exposure readbacks.
+  bool EnsureSmallReadbackRing();
+  void DestroySmallReadbackRing();
+  bool TryEnqueueSmallReadback(uint32_t written_address,
+                               uint32_t written_length);
+  void DrainCompletedSmallReadbacks(uint64_t completed_submission);
+  draw_cuts::SmallReadbackRingState small_readback_ring_;
+  VkBuffer small_readback_ring_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory small_readback_ring_memory_ = VK_NULL_HANDLE;
+  const uint8_t* small_readback_ring_mapping_ = nullptr;
+  bool small_readback_ring_coherent_ = false;
   // Per-backend trampoline from the memory read callback into the shared
   // MarkResolvePagesRead.
   static void ResolveReadCallbackThunk(void* context, uint32_t physical_address,
@@ -1853,5 +2585,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 }  // namespace vulkan
 }  // namespace gpu
 }  // namespace xe
+
+#endif  // !defined(XENIA_GPU_DRAW_CUTS_PURE_LOGIC_ONLY)
 
 #endif  // XENIA_GPU_VULKAN_VULKAN_COMMAND_PROCESSOR_H_

@@ -10,8 +10,51 @@
 #ifndef XENIA_BASE_CLOCK_H_
 #define XENIA_BASE_CLOCK_H_
 
-#include <chrono>
+#include <atomic>
 #include <cstdint>
+
+namespace xe {
+
+// Atomic refcounted hold counter for guest time progression.
+// Supports nested holds (e.g. Emulator::Pause() overlapping with synchronous
+// Vulkan pipeline compilation waits) without ever resuming while an outer hold
+// is active, and guards against underflow on redundant releases (e.g.
+// Emulator::Shutdown() calling HoldGuestTime(false) when already unheld).
+class GuestTimeHoldRefCounter {
+ public:
+  // Increments the hold count. Returns true only on the 0 -> 1 transition
+  // (when guest time actually freezes).
+  bool Acquire() {
+    return count_.fetch_add(1, std::memory_order_acq_rel) == 0;
+  }
+
+  // Decrements the hold count if > 0. Returns true only on the 1 -> 0
+  // transition (when guest time actually resumes). Never underflows below 0.
+  bool Release() {
+    int32_t current = count_.load(std::memory_order_acquire);
+    while (current > 0) {
+      if (count_.compare_exchange_weak(current, current - 1,
+                                       std::memory_order_acq_rel,
+                                       std::memory_order_acquire)) {
+        return current == 1;
+      }
+    }
+    return false;
+  }
+
+  int32_t count() const { return count_.load(std::memory_order_acquire); }
+  bool is_held() const { return count_.load(std::memory_order_acquire) > 0; }
+
+ private:
+  std::atomic<int32_t> count_{0};
+};
+
+}  // namespace xe
+
+#if !defined(XENIA_BASE_CLOCK_PURE_LOGIC_ONLY)
+
+#include <chrono>
+#include <utility>
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/platform.h"
@@ -83,8 +126,30 @@ class Clock {
   // Sets the system time of the guest.
   static void SetGuestSystemTime(uint64_t system_time);
 
-  // Freezes or resumes guest tick/system time progression while paused.
+  // Freezes or resumes guest tick/system time progression via an atomic
+  // reference count so nested holds (pause + pipeline compilation waits) never
+  // unpause the emulator prematurely.
   static void HoldGuestTime(bool hold);
+  static int32_t GuestTimeHoldCount();
+
+  class ScopedGuestTimeHold {
+   public:
+    explicit ScopedGuestTimeHold(bool active = true) : active_(active) {
+      if (active_) {
+        Clock::HoldGuestTime(true);
+      }
+    }
+    ~ScopedGuestTimeHold() {
+      if (active_) {
+        Clock::HoldGuestTime(false);
+      }
+    }
+    ScopedGuestTimeHold(const ScopedGuestTimeHold&) = delete;
+    ScopedGuestTimeHold& operator=(const ScopedGuestTimeHold&) = delete;
+
+   private:
+    bool active_;
+  };
 
   // Scales a time duration in milliseconds, from guest time.
   static uint32_t ScaleGuestDurationMillis(uint32_t guest_ms);
@@ -95,5 +160,7 @@ class Clock {
 };
 
 }  // namespace xe
+
+#endif  // !defined(XENIA_BASE_CLOCK_PURE_LOGIC_ONLY)
 
 #endif  // XENIA_BASE_CLOCK_H_

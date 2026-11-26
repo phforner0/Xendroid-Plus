@@ -861,6 +861,29 @@ class DeferredCommandBuffer {
     args.value = enable;
   }
 
+  // VK_KHR_push_descriptor: inline uniform-buffer descriptor push (avoids
+  // descriptor set allocation + vkUpdateDescriptorSets for set 1 constants).
+  void CmdVkPushDescriptorSetKHR(VkPipelineBindPoint pipeline_bind_point,
+                                 VkPipelineLayout layout, uint32_t set,
+                                 uint32_t buffer_count,
+                                 const VkDescriptorBufferInfo* buffer_infos) {
+    assert_true(buffer_count <= 8);
+    constexpr size_t header_size = xe::align(sizeof(ArgsVkPushDescriptorSetKHR),
+                                             alignof(VkDescriptorBufferInfo));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
+        Command::kVkPushDescriptorSetKHR,
+        header_size + sizeof(VkDescriptorBufferInfo) * buffer_count));
+    auto& args = *reinterpret_cast<ArgsVkPushDescriptorSetKHR*>(args_ptr);
+    args.pipeline_bind_point = pipeline_bind_point;
+    args.layout = layout;
+    args.set = set;
+    args.buffer_count = buffer_count;
+    if (buffer_count) {
+      std::memcpy(args_ptr + header_size, buffer_infos,
+                  sizeof(VkDescriptorBufferInfo) * buffer_count);
+    }
+  }
+
   void SetViewportClipEnabled(bool enabled) {
     viewport_clip_enabled_ = enabled;
   }
@@ -933,6 +956,7 @@ class DeferredCommandBuffer {
     kVkSetAlphaToOneEnableEXT,
     kVkSetLogicOpEnableEXT,
     kVkSetDepthBoundsTestEnable,
+    kVkPushDescriptorSetKHR,
     kCount,
   };
 
@@ -1296,6 +1320,15 @@ class DeferredCommandBuffer {
     VkSampleMask sample_mask;
   };
 
+  struct ArgsVkPushDescriptorSetKHR {
+    VkPipelineBindPoint pipeline_bind_point;
+    VkPipelineLayout layout;
+    uint32_t set;
+    uint32_t buffer_count;
+    // Followed by aligned VkDescriptorBufferInfo[buffer_count].
+    static_assert(alignof(VkDescriptorBufferInfo) <= alignof(uintmax_t));
+  };
+
   void* WriteCommand(Command command, size_t arguments_size_bytes);
   void ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
                      size_t stream_remaining,
@@ -1319,7 +1352,7 @@ class DeferredCommandBuffer {
   // vulkan_replay_stats: what the replays sent to the driver, and how much of
   // it repeated the state already set in the same command buffer (the same
   // pipeline, descriptor sets, push constant bytes or dynamic state value).
-  static constexpr size_t kReplayStatCommandCount = 66;
+  static constexpr size_t kReplayStatCommandCount = 67;
   struct ReplayStats {
     uint64_t commands[kReplayStatCommandCount] = {};
     uint64_t redundant[kReplayStatCommandCount] = {};

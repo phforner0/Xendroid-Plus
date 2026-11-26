@@ -1898,8 +1898,19 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_IM_LOAD(uint32_t packet,
   }
 
   trace_writer_.WriteMemoryRead(CpuToGpu(addr), size_dwords * 4);
-  auto shader = COMMAND_PROCESSOR::LoadShader(
-      shader_type, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+  const uint32_t* host_shader_ptr = memory_->TranslatePhysical<uint32_t*>(addr);
+  Shader* shader = [&]<typename Cp>(Cp* cp) -> Shader* {
+    if constexpr (requires(Cp& c, xenos::ShaderType st, uint32_t guest_addr,
+                           const uint32_t* host_ptr, uint32_t dwords) {
+                    c.LoadShaderFromGuestAddress(st, guest_addr, host_ptr,
+                                                 dwords);
+                  }) {
+      return cp->LoadShaderFromGuestAddress(shader_type, addr, host_shader_ptr,
+                                            size_dwords);
+    } else {
+      return cp->LoadShader(shader_type, host_shader_ptr, size_dwords);
+    }
+  }(this);
   switch (shader_type) {
     case xenos::ShaderType::kVertex:
       active_vertex_shader_ = shader;

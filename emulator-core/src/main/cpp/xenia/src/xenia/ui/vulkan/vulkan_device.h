@@ -335,6 +335,9 @@ class VulkanDevice {
     bool graphicsPipelineLibraryFastLinking = false;
     bool graphicsPipelineLibraryIndependentInterpolationDecoration = false;
 
+    // VK_KHR_push_descriptor (#81, promoted to 1.4)
+    uint32_t maxPushDescriptors = 0;
+
     // Arm Mali driver version (r<M>p<N>) & errata flags (SDEN-3735689)
     int32_t maliDriverMajorR = 0;
     int32_t maliDriverMinorP = 0;
@@ -412,6 +415,8 @@ class VulkanDevice {
     // VK_KHR_pipeline_library (#291) & VK_EXT_graphics_pipeline_library (#321)
     bool ext_KHR_pipeline_library = false;
     bool ext_EXT_graphics_pipeline_library = false;
+    // VK_KHR_push_descriptor (#81, promoted to 1.4)
+    bool ext_KHR_push_descriptor = false;
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
     // ZeroFG independent Android presenter support. These are enabled only
     // when a ZeroFG session requests them and remain optional capability gates.
@@ -511,6 +516,8 @@ class VulkanDevice {
     // VK_EXT_extended_dynamic_state3 (#456) - never promoted, always loaded by
     // EXT name and only when the extension is present (optional, non-fatal).
 #include "xenia/ui/vulkan/functions/device_ext_extended_dynamic_state3.inc"
+    // VK_KHR_push_descriptor (#81, optional, non-fatal).
+#include "xenia/ui/vulkan/functions/device_khr_push_descriptor.inc"
 #undef XE_UI_VULKAN_FUNCTION
     // Stage 0 optional extension entry points (loaded by VulkanDevice when enabled).
     PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress = nullptr;

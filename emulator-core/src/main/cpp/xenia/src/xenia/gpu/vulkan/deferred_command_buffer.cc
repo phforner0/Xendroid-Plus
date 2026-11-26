@@ -147,6 +147,12 @@ void DeferredCommandBuffer::ExecuteStream(
           key |= (uint64_t(args.pipeline_bind_point) << 8) | args.first_set;
           replay_stats_.descriptor_sets += args.descriptor_set_count;
         } break;
+        case Command::kVkPushDescriptorSetKHR: {
+          auto& args =
+              *reinterpret_cast<const ArgsVkPushDescriptorSetKHR*>(stream);
+          key |= (uint64_t(args.pipeline_bind_point) << 8) | args.set;
+          replay_stats_.descriptor_sets += 1;
+        } break;
         case Command::kVkPushConstants: {
           auto& args = *reinterpret_cast<const ArgsVkPushConstants*>(stream);
           key |= (uint64_t(args.offset) << 16) | args.size;
@@ -211,6 +217,34 @@ void DeferredCommandBuffer::ExecuteStream(
                                     args.layout, args.first_set,
                                     args.descriptor_set_count, descriptor_sets,
                                     args.dynamic_offset_count, dynamic_offsets);
+      } break;
+
+      case Command::kVkPushDescriptorSetKHR: {
+        auto& args =
+            *reinterpret_cast<const ArgsVkPushDescriptorSetKHR*>(stream);
+        constexpr size_t header_size = xe::align(
+            sizeof(ArgsVkPushDescriptorSetKHR), alignof(VkDescriptorBufferInfo));
+        const VkDescriptorBufferInfo* buffer_infos =
+            reinterpret_cast<const VkDescriptorBufferInfo*>(
+                reinterpret_cast<const uint8_t*>(stream) + header_size);
+        assert_true(args.buffer_count <= 8);
+        VkWriteDescriptorSet writes[8];
+        for (uint32_t i = 0; i < args.buffer_count; ++i) {
+          VkWriteDescriptorSet& write = writes[i];
+          write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          write.pNext = nullptr;
+          write.dstSet = VK_NULL_HANDLE;
+          write.dstBinding = i;
+          write.dstArrayElement = 0;
+          write.descriptorCount = 1;
+          write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+          write.pImageInfo = nullptr;
+          write.pBufferInfo = &buffer_infos[i];
+          write.pTexelBufferView = nullptr;
+        }
+        dfn.vkCmdPushDescriptorSetKHR(command_buffer, args.pipeline_bind_point,
+                                      args.layout, args.set, args.buffer_count,
+                                      writes);
       } break;
 
       case Command::kVkBindIndexBuffer: {
@@ -1125,6 +1159,7 @@ void DeferredCommandBuffer::CountReplayedCommand(uint32_t command,
     case Command::kVkSetAlphaToOneEnableEXT:
     case Command::kVkSetLogicOpEnableEXT:
     case Command::kVkSetDepthBoundsTestEnable:
+    case Command::kVkPushDescriptorSetKHR:
       break;
     default:
       return;
@@ -1173,6 +1208,7 @@ const char* DeferredCommandBuffer::GetReplayStatCommandName(size_t index) {
       "SetRasterizationSamplesEXT", "SetSampleMaskEXT",
       "SetAlphaToCoverageEnableEXT", "SetAlphaToOneEnableEXT",
       "SetLogicOpEnableEXT", "SetDepthBoundsTestEnable",
+      "PushDescriptorSetKHR",
   };
   static_assert(xe::countof(kNames) == kReplayStatCommandCount);
   return index < kReplayStatCommandCount ? kNames[index] : "?";
