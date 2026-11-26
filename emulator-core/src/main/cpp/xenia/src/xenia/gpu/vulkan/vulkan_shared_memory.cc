@@ -12,6 +12,10 @@
 #include <algorithm>
 #include <cstring>
 
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -53,6 +57,17 @@ DEFINE_bool(vulkan_shared_memory_host_visible, true,
             "pass structure.",
             "Vulkan");
 
+DEFINE_bool(
+    vulkan_shared_memory_zero_copy_upload, false,
+    "When the shared-memory buffer is densely host-mapped "
+    "(DEVICE_LOCAL | HOST_VISIBLE | HOST_CACHED), write CPU uploads directly "
+    "into host_mapped_data_ for pages whose last GPU submission has already "
+    "completed, avoiding staging copies and pass breaks. Falls back to "
+    "upload_buffer_pool_ whenever a page may still be in flight or was used "
+    "earlier in the current submission. debug.xendroid.zero_copy_upload "
+    "('0'|'1') overrides on Android.",
+    "Vulkan");
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
@@ -72,6 +87,10 @@ bool VulkanSharedMemory::Initialize() {
   if (!InitializeCommon()) {
     return false;
   }
+
+  PollZeroCopyUploadProperty();
+  zero_copy_submission_tracker_.Initialize(kBufferSizeLog2);
+  zero_copy_prop_poll_counter_ = 0;
 
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
@@ -133,6 +152,7 @@ bool VulkanSharedMemory::Initialize() {
   const ReadbackResolveMode readback_mode = GetReadbackResolveMode();
   const bool needs_host_mapping =
       readback_mode == ReadbackResolveMode::kUma ||
+      cvars::vulkan_shared_memory_zero_copy_upload ||
       (host_buffer_ == VK_NULL_HANDLE &&
        (readback_mode != ReadbackResolveMode::kDisabled ||
         cvars::memexport_enable));
@@ -673,6 +693,13 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   // No import left to pin the alias.
   memory().SetPhysicalAliasSkipHostProtect(false);
 
+  zero_copy_submission_tracker_.Reset();
+  zero_copy_spans_.clear();
+  staging_spans_.clear();
+  zero_copy_flush_ranges_.clear();
+  vk_flush_ranges_.clear();
+  zero_copy_prop_poll_counter_ = 0;
+
   // If calling from the destructor, the SharedMemory destructor will call
   // ShutdownCommon.
   if (!from_destructor) {
@@ -690,7 +717,46 @@ void VulkanSharedMemory::CompletedSubmissionUpdated() {
   upload_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
 }
 
-void VulkanSharedMemory::EndSubmission() { upload_buffer_pool_->FlushWrites(); }
+void VulkanSharedMemory::EndSubmission() {
+  upload_buffer_pool_->FlushWrites();
+  if (++zero_copy_prop_poll_counter_ >= 30) {
+    zero_copy_prop_poll_counter_ = 0;
+    PollZeroCopyUploadProperty();
+  }
+}
+
+void VulkanSharedMemory::PollZeroCopyUploadProperty() {
+#if defined(__ANDROID__)
+  char value[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.xendroid.zero_copy_upload", value) > 0) {
+    bool enabled = false;
+    if (ParseBinaryDebugProperty(value, enabled) &&
+        cvars::vulkan_shared_memory_zero_copy_upload != enabled) {
+      cvars::vulkan_shared_memory_zero_copy_upload = enabled;
+      XELOGI(
+          "debug.xendroid.zero_copy_upload: "
+          "vulkan_shared_memory_zero_copy_upload = {}",
+          enabled);
+    }
+  }
+#endif
+}
+
+void VulkanSharedMemory::NoteByteRangeUsedByGpu(uint32_t start,
+                                                uint32_t length) {
+  if (!length || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  if (!subpage_tracking_active()) {
+    const uint32_t page_first = start >> page_size_log2();
+    const uint32_t page_last = (start + length - 1) >> page_size_log2();
+    start = page_first << page_size_log2();
+    length = (page_last - page_first + 1) << page_size_log2();
+  }
+  zero_copy_submission_tracker_.MarkByteRangeUsed(
+      start, length, command_processor_.GetCurrentSubmission());
+}
 
 void VulkanSharedMemory::Use(Usage usage,
                              std::pair<uint32_t, uint32_t> written_range) {
@@ -698,6 +764,9 @@ void VulkanSharedMemory::Use(Usage usage,
   written_range.second =
       std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
+  if (written_range.second) {
+    NoteByteRangeUsedByGpu(written_range.first, written_range.second);
+  }
   if (last_usage_ != usage || last_written_range_.second) {
     VkPipelineStageFlags src_stage_mask, dst_stage_mask;
     VkAccessFlags src_access_mask, dst_access_mask;
@@ -745,6 +814,12 @@ VulkanSharedMemory::DrawBarrier VulkanSharedMemory::UseForGuestDraw(
     const std::pair<uint32_t, uint32_t>* reads, size_t read_count,
     const std::pair<uint32_t, uint32_t>* exports, size_t export_count,
     uint64_t export_batch) {
+  for (size_t i = 0; i < read_count; ++i) {
+    NoteByteRangeUsedByGpu(reads[i].first, reads[i].second);
+  }
+  for (size_t i = 0; i < export_count; ++i) {
+    NoteByteRangeUsedByGpu(exports[i].first, exports[i].second);
+  }
   // The extent of the exports: what the next barrier has to make available.
   uint32_t export_start = UINT32_MAX, export_end = 0;
   for (size_t i = 0; i < export_count; ++i) {
@@ -898,6 +973,7 @@ bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {
     VkBufferCopy& download_region = download_regions[i];
     const std::pair<uint32_t, uint32_t>& download_range =
         trace_download_ranges()[i];
+    NoteByteRangeUsedByGpu(download_range.first, download_range.second);
     download_region.srcOffset = download_range.first;
     download_region.dstOffset = download_buffer_offset;
     download_region.size = download_range.second;
@@ -1007,73 +1083,246 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(
 bool VulkanSharedMemory::UploadRanges(
     const std::pair<uint32_t, uint32_t>* upload_page_ranges,
     uint32_t num_upload_ranges) {
-  if (!num_upload_ranges) {
+  return UploadUnitRanges(upload_page_ranges, num_upload_ranges,
+                          page_size_log2());
+}
+
+bool VulkanSharedMemory::UploadSubpageRanges(
+    const std::pair<uint32_t, uint32_t>* upload_subpage_ranges,
+    uint32_t num_upload_ranges) {
+  return UploadUnitRanges(upload_subpage_ranges, num_upload_ranges,
+                          SubpageTracker::kSubpageSizeLog2);
+}
+
+bool VulkanSharedMemory::UploadUnitRanges(
+    const std::pair<uint32_t, uint32_t>* upload_ranges, uint32_t num_ranges,
+    uint32_t unit_size_log2) {
+  if (!num_ranges) {
     return true;
   }
 
   if (zero_copy_) {
     // The buffer aliases guest RAM - nothing to copy, just mark the pages valid
     // so RequestRange stops asking to upload them.
-    for (uint32_t i = 0; i < num_upload_ranges; ++i) {
-      trace_writer_.WriteMemoryRead(
-          upload_page_ranges[i].first << page_size_log2(),
-          upload_page_ranges[i].second << page_size_log2());
-      MakeRangeValid(upload_page_ranges[i].first << page_size_log2(),
-                     upload_page_ranges[i].second << page_size_log2(), false);
+    for (uint32_t i = 0; i < num_ranges; ++i) {
+      trace_writer_.WriteMemoryRead(upload_ranges[i].first << unit_size_log2,
+                                    upload_ranges[i].second << unit_size_log2);
+      MakeRangeValid(upload_ranges[i].first << unit_size_log2,
+                     upload_ranges[i].second << unit_size_log2, false);
     }
     return true;
   }
+
+  const uint64_t submission_current = command_processor_.GetCurrentSubmission();
 
   // Ranges holding memexport output live in host_buffer_ (guest RAM) and may
   // still be being written by the GPU, so reading them with the CPU below races
   // those writes. Refresh those on the GPU and upload only what is left.
   cpu_upload_ranges_.clear();
-  for (uint32_t i = 0; i < num_upload_ranges; ++i) {
-    uint32_t range_base = upload_page_ranges[i].first << page_size_log2();
-    uint32_t range_size = upload_page_ranges[i].second << page_size_log2();
+  for (uint32_t i = 0; i < num_ranges; ++i) {
+    uint32_t range_base = upload_ranges[i].first << unit_size_log2;
+    uint32_t range_size = upload_ranges[i].second << unit_size_log2;
     if (command_processor_.EnsureMemexportRangeInDeviceBuffer(range_base,
                                                               range_size)) {
       MakeRangeValid(range_base, range_size, false);
+      NoteByteRangeUsedByGpu(range_base, range_size);
       continue;
     }
-    cpu_upload_ranges_.push_back(upload_page_ranges[i]);
+    cpu_upload_ranges_.push_back(upload_ranges[i]);
   }
   if (cpu_upload_ranges_.empty()) {
     return true;
   }
-  upload_page_ranges = cpu_upload_ranges_.data();
-  num_upload_ranges = uint32_t(cpu_upload_ranges_.size());
+  upload_ranges = cpu_upload_ranges_.data();
+  num_ranges = uint32_t(cpu_upload_ranges_.size());
 
-  auto& range_front = upload_page_ranges[0];
-  auto& range_back = upload_page_ranges[num_upload_ranges - 1];
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const bool can_zero_copy = cvars::vulkan_shared_memory_zero_copy_upload &&
+                             host_mapped_data_ != nullptr &&
+                             !buffer_memory_.empty();
+  const uint64_t completed_submission =
+      command_processor_.GetCompletedSubmission();
+  const uint64_t atom_size =
+      host_mapped_coherent_
+          ? uint64_t(1)
+          : std::max<uint64_t>(
+                vulkan_device->properties().nonCoherentAtomSize, uint64_t(1));
+
+  zero_copy_spans_.clear();
+  staging_spans_.clear();
+
+  // Marks decommitted units valid without copying them: the buffer keeps its
+  // last-uploaded contents, which is what the console's GPU would have read
+  // out of physical RAM.
+  auto skip_span = [&](uint32_t unit_first, uint32_t unit_end) {
+    MakeRangeValid(unit_first << unit_size_log2,
+                   (unit_end - unit_first) << unit_size_log2, false);
+    XELOGW(
+        "Vulkan shared memory: skipped upload of {} decommitted unit(s) at "
+        "{:08X}, keeping last-uploaded contents",
+        unit_end - unit_first, unit_first << unit_size_log2);
+  };
+
+  auto route_readable_span = [&](uint32_t span_start, uint32_t span_len) {
+    if (!span_len) {
+      return;
+    }
+    if (can_zero_copy) {
+      PartitionZeroCopySpans(zero_copy_submission_tracker_, span_start,
+                             span_len, unit_size_log2, completed_submission,
+                             host_mapped_coherent_, atom_size, zero_copy_spans_,
+                             staging_spans_);
+    } else {
+      staging_spans_.emplace_back(span_start, span_len);
+    }
+  };
+
+  // Pages the guest decommitted are PROT_NONE host-side, so they can be
+  // neither copied nor refused: a refusal is retried by every draw that still
+  // references the memory, and games legally free memory that live textures
+  // point at (the console GPU reads physical RAM, ignoring CPU page tables).
+  for (uint32_t i = 0; i < num_ranges; ++i) {
+    const uint32_t upload_range_start = upload_ranges[i].first;
+    const uint32_t upload_range_length = upload_ranges[i].second;
+    trace_writer_.WriteMemoryRead(upload_range_start << unit_size_log2,
+                                  upload_range_length << unit_size_log2);
+    if (!upload_range_length) {
+      continue;
+    }
+
+    auto* heap = memory().GetPhysicalHeap();
+    if (cvars::gpu_allow_invalid_upload_range ||
+        heap->QueryRangeAccess(
+            upload_range_start << unit_size_log2,
+            (upload_range_start + upload_range_length - 1) << unit_size_log2) !=
+            xe::memory::PageAccess::kNoAccess) {
+      route_readable_span(upload_range_start, upload_range_length);
+      continue;
+    }
+
+    uint32_t span_start = UINT32_MAX;
+    uint32_t skipped_start = UINT32_MAX;
+    for (uint32_t unit = upload_range_start;
+         unit <= upload_range_start + upload_range_length; ++unit) {
+      const uint32_t unit_addr = unit << unit_size_log2;
+      const bool readable =
+          unit < upload_range_start + upload_range_length &&
+          heap->QueryRangeAccess(unit_addr, unit_addr) !=
+              xe::memory::PageAccess::kNoAccess;
+      if (readable) {
+        if (skipped_start != UINT32_MAX) {
+          skip_span(skipped_start, unit);
+          skipped_start = UINT32_MAX;
+        }
+        if (span_start == UINT32_MAX) {
+          span_start = unit;
+        }
+      } else {
+        if (span_start != UINT32_MAX) {
+          route_readable_span(span_start, unit - span_start);
+          span_start = UINT32_MAX;
+        }
+        if (unit < upload_range_start + upload_range_length &&
+            skipped_start == UINT32_MAX) {
+          skipped_start = unit;
+        }
+      }
+    }
+    if (skipped_start != UINT32_MAX) {
+      skip_span(skipped_start, upload_range_start + upload_range_length);
+    }
+  }
+
+  // Zero-copy direct CPU write path into persistently mapped
+  // DEVICE_LOCAL | HOST_VISIBLE | HOST_CACHED buffer for spans proven hazard-
+  // free against all in-flight and current-submission GPU accesses.
+  if (!zero_copy_spans_.empty()) {
+    zero_copy_flush_ranges_.clear();
+    for (const auto& span : zero_copy_spans_) {
+      const uint32_t byte_offset = span.first << unit_size_log2;
+      const uint32_t byte_size = span.second << unit_size_log2;
+      MakeRangeValid(byte_offset, byte_size, false);
+      command_processor_.NoteSharedMemoryUpload(byte_size);
+
+      uint8_t* guest_src = memory().TranslatePhysical(byte_offset);
+      if (unit_size_log2 == page_size_log2()) {
+        SetPageUploadHashes(span.first, span.second, guest_src);
+      }
+      if (subpage_tracking_active()) {
+        SetSubpageUploadHashes(byte_offset, byte_size, guest_src);
+      }
+      std::atomic_thread_fence(std::memory_order_acquire);
+
+      if (byte_size > 8192) {
+        memory::vastcpy(host_mapped_data_ + byte_offset, guest_src, byte_size);
+        swcache::WriteFence();
+      } else {
+        std::memcpy(host_mapped_data_ + byte_offset, guest_src, byte_size);
+      }
+      NoteByteRangeUsedByGpu(byte_offset, byte_size);
+      if (!host_mapped_coherent_) {
+        zero_copy_flush_ranges_.push_back(
+            {uint64_t(byte_offset), uint64_t(byte_size)});
+      }
+    }
+    if (!host_mapped_coherent_ && !zero_copy_flush_ranges_.empty()) {
+      const std::vector<ByteRange> coalesced = CoalesceAlignedFlushRanges(
+          zero_copy_flush_ranges_, atom_size, kBufferSize);
+      if (!coalesced.empty()) {
+        vk_flush_ranges_.clear();
+        vk_flush_ranges_.reserve(coalesced.size());
+        const VkDeviceMemory mapped_memory = buffer_memory_.front();
+        for (const ByteRange& r : coalesced) {
+          VkMappedMemoryRange& range = vk_flush_ranges_.emplace_back();
+          range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+          range.pNext = nullptr;
+          range.memory = mapped_memory;
+          range.offset = VkDeviceSize(r.offset);
+          range.size = VkDeviceSize(r.size);
+        }
+        vulkan_device->functions().vkFlushMappedMemoryRanges(
+            vulkan_device->device(), uint32_t(vk_flush_ranges_.size()),
+            vk_flush_ranges_.data());
+      }
+    }
+  }
+
+  if (staging_spans_.empty()) {
+    return true;
+  }
+
+  auto& range_front = staging_spans_.front();
+  auto& range_back = staging_spans_.back();
 
   // Copies of pages never invalidated while this submission was recording
   // can't have been read by an already-recorded command, so they can execute
   // at the head of the submission's command buffer without breaking the
   // current render pass.
   bool hoist = cvars::vulkan_hoist_shmem_uploads &&
-               !AnyPageInvalidatedSinceSubmissionOpen(upload_page_ranges,
-                                                      num_upload_ranges);
+               !AnyRangeInvalidatedSinceSubmissionOpen(
+                   staging_spans_.data(), uint32_t(staging_spans_.size()),
+                   unit_size_log2);
 
   if (!hoist) {
-    // upload_page_ranges are sorted - the bounds give the barrier range.
+    // staging_spans_ are sorted - the bounds give the barrier range.
     Use(Usage::kTransferDestination,
         std::make_pair(
-            range_front.first << page_size_log2(),
+            range_front.first << unit_size_log2,
             (range_back.first + range_back.second - range_front.first)
-                << page_size_log2()));
+                << unit_size_log2));
     // Submit barriers (may end render pass) before pushing debug marker so
     // EndRenderPass is not inside the SharedMem Upload marker.
     command_processor_.SubmitBarriers(true);
 
     uint32_t total_upload_bytes =
         (range_back.first + range_back.second - range_front.first)
-        << page_size_log2();
+        << unit_size_log2;
     command_processor_.PushDebugMarker(
-        "UploadRanges (SharedMem): 0x%08X-0x%08X (%u KB, %u ranges)",
-        range_front.first << page_size_log2(),
-        (range_back.first + range_back.second) << page_size_log2(),
-        total_upload_bytes / 1024, num_upload_ranges);
+        "UploadRanges (SharedMem): 0x%08X-0x%08X (%u KB, %zu ranges)",
+        range_front.first << unit_size_log2,
+        (range_back.first + range_back.second) << unit_size_log2,
+        total_upload_bytes / 1024, staging_spans_.size());
   }
   DeferredCommandBuffer& command_buffer =
       hoist ? command_processor_.deferred_setup_command_buffer()
@@ -1090,34 +1339,38 @@ bool VulkanSharedMemory::UploadRanges(
                                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
                                         &barrier, 0, nullptr, 0, nullptr);
   }
-  uint64_t submission_current = command_processor_.GetCurrentSubmission();
+
   bool successful = true;
   upload_regions_.clear();
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
 
-  // Uploads one span of pages that is known host-readable.
   auto upload_span = [&](uint32_t upload_range_start,
                          uint32_t upload_range_length) -> bool {
     while (upload_range_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
       uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
-          submission_current, upload_range_length << page_size_log2(),
-          size_t(1) << page_size_log2(), upload_buffer, upload_buffer_offset,
+          submission_current, size_t(upload_range_length) << unit_size_log2,
+          size_t(1) << unit_size_log2, upload_buffer, upload_buffer_offset,
           upload_buffer_size);
       if (upload_buffer_mapping == nullptr) {
         XELOGE("Shared memory: Failed to get a Vulkan upload buffer");
         return false;
       }
-      MakeRangeValid(upload_range_start << page_size_log2(),
-                     uint32_t(upload_buffer_size), false);
+      const uint32_t byte_offset = upload_range_start << unit_size_log2;
+      const uint32_t byte_size = uint32_t(upload_buffer_size);
+      MakeRangeValid(byte_offset, byte_size, false);
       command_processor_.NoteSharedMemoryUpload(upload_buffer_size);
 
-      uint32_t upload_buffer_pages =
-          uint32_t(upload_buffer_size >> page_size_log2());
-      uint8_t* guest_src =
-          memory().TranslatePhysical(upload_range_start << page_size_log2());
-      SetPageUploadHashes(upload_range_start, upload_buffer_pages, guest_src);
+      uint32_t upload_buffer_units =
+          uint32_t(upload_buffer_size >> unit_size_log2);
+      uint8_t* guest_src = memory().TranslatePhysical(byte_offset);
+      if (unit_size_log2 == page_size_log2()) {
+        SetPageUploadHashes(upload_range_start, upload_buffer_units, guest_src);
+      }
+      if (subpage_tracking_active()) {
+        SetSubpageUploadHashes(byte_offset, byte_size, guest_src);
+      }
       std::atomic_thread_fence(std::memory_order_acquire);
 
       if (upload_buffer_size < (1ULL << 32) && upload_buffer_size > 8192) {
@@ -1137,89 +1390,19 @@ bool VulkanSharedMemory::UploadRanges(
       upload_buffer_previous = upload_buffer;
       VkBufferCopy& upload_region = upload_regions_.emplace_back();
       upload_region.srcOffset = upload_buffer_offset;
-      upload_region.dstOffset =
-          VkDeviceSize(upload_range_start << page_size_log2());
+      upload_region.dstOffset = VkDeviceSize(byte_offset);
       upload_region.size = upload_buffer_size;
-      upload_range_start += upload_buffer_pages;
-      upload_range_length -= upload_buffer_pages;
+      NoteByteRangeUsedByGpu(byte_offset, byte_size);
+      upload_range_start += upload_buffer_units;
+      upload_range_length -= upload_buffer_units;
     }
     return true;
   };
 
-  // Marks decommitted pages valid without copying them: the buffer keeps its
-  // last-uploaded contents, which is what the console's GPU would have read
-  // out of physical RAM.
-  auto skip_span = [&](uint32_t page_first, uint32_t page_end) {
-    MakeRangeValid(page_first << page_size_log2(),
-                   (page_end - page_first) << page_size_log2(), false);
-    XELOGW(
-        "Vulkan shared memory: skipped upload of {} decommitted page(s) at "
-        "{:08X}, keeping last-uploaded contents",
-        page_end - page_first, page_first << page_size_log2());
-  };
-
-  // Pages the guest decommitted are PROT_NONE host-side, so they can be
-  // neither copied nor refused: a refusal is retried by every draw that still
-  // references the memory, and games legally free memory that live textures
-  // point at (the console GPU reads physical RAM, ignoring CPU page tables).
-  for (unsigned int i = 0; i < num_upload_ranges; ++i) {
-    const uint32_t upload_range_start = upload_page_ranges[i].first;
-    const uint32_t upload_range_length = upload_page_ranges[i].second;
-    trace_writer_.WriteMemoryRead(upload_range_start << page_size_log2(),
-                                  upload_range_length << page_size_log2());
-    if (!upload_range_length) {
-      continue;
-    }
-
-    auto* heap = memory().GetPhysicalHeap();
-    if (cvars::gpu_allow_invalid_upload_range ||
-        heap->QueryRangeAccess(
-            upload_range_start << page_size_log2(),
-            (upload_range_start + upload_range_length - 1)
-                << page_size_log2()) != xe::memory::PageAccess::kNoAccess) {
-      if (!upload_span(upload_range_start, upload_range_length)) {
-        successful = false;
-        break;
-      }
-      continue;
-    }
-
-    uint32_t span_start = UINT32_MAX;
-    uint32_t skipped_start = UINT32_MAX;
-    for (uint32_t page = upload_range_start;
-         page <= upload_range_start + upload_range_length; ++page) {
-      const uint32_t page_addr = page << page_size_log2();
-      const bool readable =
-          page < upload_range_start + upload_range_length &&
-          heap->QueryRangeAccess(page_addr, page_addr) !=
-              xe::memory::PageAccess::kNoAccess;
-      if (readable) {
-        if (skipped_start != UINT32_MAX) {
-          skip_span(skipped_start, page);
-          skipped_start = UINT32_MAX;
-        }
-        if (span_start == UINT32_MAX) {
-          span_start = page;
-        }
-      } else {
-        if (span_start != UINT32_MAX) {
-          if (!upload_span(span_start, page - span_start)) {
-            successful = false;
-            break;
-          }
-          span_start = UINT32_MAX;
-        }
-        if (page < upload_range_start + upload_range_length &&
-            skipped_start == UINT32_MAX) {
-          skipped_start = page;
-        }
-      }
-    }
-    if (!successful) {
+  for (const auto& span : staging_spans_) {
+    if (!upload_span(span.first, span.second)) {
+      successful = false;
       break;
-    }
-    if (skipped_start != UINT32_MAX) {
-      skip_span(skipped_start, upload_range_start + upload_range_length);
     }
   }
   if (!upload_regions_.empty()) {

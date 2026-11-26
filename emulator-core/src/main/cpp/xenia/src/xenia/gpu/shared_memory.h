@@ -10,6 +10,427 @@
 #ifndef XENIA_GPU_SHARED_MEMORY_H_
 #define XENIA_GPU_SHARED_MEMORY_H_
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+namespace xe {
+namespace gpu {
+
+// Tracks logical 4 KB subpage validity, GPU-written ownership, upload hashes,
+// and submission-local invalidations inside larger host pages (e.g. 16 KB
+// Android kernels: 4 subpages per host page -> 4-bit mask 0x0F).
+class SubpageTracker {
+ public:
+  static constexpr uint32_t kSubpageSizeLog2 = 12;
+  static constexpr uint32_t kSubpageSize = uint32_t(1) << kSubpageSizeLog2;
+
+  bool Initialize(uint32_t buffer_size_log2, uint32_t host_page_size_log2) {
+    Reset();
+    if (host_page_size_log2 <= kSubpageSizeLog2 ||
+        host_page_size_log2 > kSubpageSizeLog2 + 3 ||
+        buffer_size_log2 <= host_page_size_log2) {
+      return false;
+    }
+    buffer_size_ = uint32_t(1) << buffer_size_log2;
+    host_page_size_log2_ = host_page_size_log2;
+    subpages_per_host_page_log2_ = host_page_size_log2 - kSubpageSizeLog2;
+    subpages_per_host_page_ = uint32_t(1) << subpages_per_host_page_log2_;
+    full_host_page_mask_ =
+        uint8_t((uint32_t(1) << subpages_per_host_page_) - 1u);
+    host_page_count_ = uint32_t(1) << (buffer_size_log2 - host_page_size_log2);
+    subpage_count_ = uint32_t(1) << (buffer_size_log2 - kSubpageSizeLog2);
+
+    valid_mask_.assign(host_page_count_, 0);
+    gpu_written_mask_.assign(host_page_count_, 0);
+    hash_valid_mask_.assign(host_page_count_, 0);
+    invalidated_in_submission_mask_.assign(host_page_count_,
+                                           full_host_page_mask_);
+    upload_hash_.assign(subpage_count_, 0);
+    active_ = true;
+    return true;
+  }
+
+  void Reset() {
+    active_ = false;
+    buffer_size_ = 0;
+    host_page_size_log2_ = 0;
+    subpages_per_host_page_log2_ = 0;
+    subpages_per_host_page_ = 0;
+    full_host_page_mask_ = 0;
+    host_page_count_ = 0;
+    subpage_count_ = 0;
+    valid_mask_.clear();
+    gpu_written_mask_.clear();
+    hash_valid_mask_.clear();
+    invalidated_in_submission_mask_.clear();
+    upload_hash_.clear();
+  }
+
+  bool active() const { return active_; }
+  uint32_t host_page_size_log2() const { return host_page_size_log2_; }
+  uint32_t subpages_per_host_page_log2() const {
+    return subpages_per_host_page_log2_;
+  }
+  uint32_t subpages_per_host_page() const { return subpages_per_host_page_; }
+  uint8_t full_host_page_mask() const { return full_host_page_mask_; }
+  uint32_t host_page_count() const { return host_page_count_; }
+  uint32_t subpage_count() const { return subpage_count_; }
+
+  uint8_t valid_mask(uint32_t host_page) const {
+    return host_page < host_page_count_ ? valid_mask_[host_page] : 0;
+  }
+  uint8_t gpu_written_mask(uint32_t host_page) const {
+    return host_page < host_page_count_ ? gpu_written_mask_[host_page] : 0;
+  }
+  uint8_t hash_valid_mask(uint32_t host_page) const {
+    return host_page < host_page_count_ ? hash_valid_mask_[host_page] : 0;
+  }
+  bool IsHostPageFullyValid(uint32_t host_page) const {
+    return host_page < host_page_count_ &&
+           valid_mask_[host_page] == full_host_page_mask_;
+  }
+  bool HasAnyGpuWrittenSubpage(uint32_t host_page) const {
+    return host_page < host_page_count_ && gpu_written_mask_[host_page] != 0;
+  }
+
+  static uint8_t LocalSubpageRangeMask(uint32_t local_first,
+                                       uint32_t local_last) {
+    return uint8_t(((uint32_t(1) << (local_last - local_first + 1)) - 1u)
+                   << local_first);
+  }
+
+  uint8_t SubpageMaskForHostPage(uint32_t host_page, uint32_t sp_first,
+                                 uint32_t sp_last) const {
+    const uint32_t page_sp_base = host_page << subpages_per_host_page_log2_;
+    const uint32_t page_sp_end = page_sp_base + subpages_per_host_page_ - 1;
+    const uint32_t local_first =
+        (sp_first > page_sp_base) ? (sp_first - page_sp_base) : 0u;
+    const uint32_t local_last = (sp_last < page_sp_end)
+                                    ? (sp_last - page_sp_base)
+                                    : (subpages_per_host_page_ - 1);
+    return LocalSubpageRangeMask(local_first, local_last);
+  }
+
+  void InvalidateAll() {
+    if (!active_) {
+      return;
+    }
+    std::fill(valid_mask_.begin(), valid_mask_.end(), uint8_t(0));
+    std::fill(gpu_written_mask_.begin(), gpu_written_mask_.end(), uint8_t(0));
+    std::fill(hash_valid_mask_.begin(), hash_valid_mask_.end(), uint8_t(0));
+    std::fill(invalidated_in_submission_mask_.begin(),
+              invalidated_in_submission_mask_.end(), full_host_page_mask_);
+  }
+
+  void OnGpuSubmissionOpened() {
+    if (!active_) {
+      return;
+    }
+    std::fill(invalidated_in_submission_mask_.begin(),
+              invalidated_in_submission_mask_.end(), uint8_t(0));
+  }
+
+  void MarkRangeValid(uint32_t start, uint32_t length, bool written_by_gpu) {
+    if (!active_ || !length || start >= buffer_size_) {
+      return;
+    }
+    length = std::min(length, buffer_size_ - start);
+    const uint32_t sp_first = start >> kSubpageSizeLog2;
+    const uint32_t sp_last = (start + length - 1) >> kSubpageSizeLog2;
+    const uint32_t hp_first = sp_first >> subpages_per_host_page_log2_;
+    const uint32_t hp_last = sp_last >> subpages_per_host_page_log2_;
+    for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
+      const uint8_t mask = SubpageMaskForHostPage(hp, sp_first, sp_last);
+      valid_mask_[hp] |= mask;
+      if (written_by_gpu) {
+        gpu_written_mask_[hp] |= mask;
+        hash_valid_mask_[hp] &= uint8_t(~mask);
+      } else {
+        gpu_written_mask_[hp] &= uint8_t(~mask);
+      }
+    }
+  }
+
+  void SetSubpageUploadHash(uint32_t subpage, uint64_t hash) {
+    if (!active_ || subpage >= subpage_count_) {
+      return;
+    }
+    upload_hash_[subpage] = hash;
+    const uint32_t hp = subpage >> subpages_per_host_page_log2_;
+    const uint32_t local = subpage & (subpages_per_host_page_ - 1);
+    hash_valid_mask_[hp] |= uint8_t(uint32_t(1) << local);
+  }
+
+  void InvalidateSubpage(uint32_t subpage, bool mark_submission_invalidated) {
+    if (!active_ || subpage >= subpage_count_) {
+      return;
+    }
+    const uint32_t hp = subpage >> subpages_per_host_page_log2_;
+    const uint32_t local = subpage & (subpages_per_host_page_ - 1);
+    const uint8_t bit = uint8_t(uint32_t(1) << local);
+    valid_mask_[hp] &= uint8_t(~bit);
+    gpu_written_mask_[hp] &= uint8_t(~bit);
+    hash_valid_mask_[hp] &= uint8_t(~bit);
+    if (mark_submission_invalidated) {
+      invalidated_in_submission_mask_[hp] |= bit;
+    }
+  }
+
+  void InvalidateHostPages(uint32_t hp_first, uint32_t hp_last,
+                           bool mark_submission_invalidated) {
+    if (!active_ || hp_first >= host_page_count_) {
+      return;
+    }
+    hp_last = std::min(hp_last, host_page_count_ - 1);
+    for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
+      const uint8_t gpu_bits = gpu_written_mask_[hp];
+      valid_mask_[hp] = 0;
+      gpu_written_mask_[hp] = 0;
+      hash_valid_mask_[hp] &= uint8_t(~gpu_bits);
+      if (mark_submission_invalidated) {
+        invalidated_in_submission_mask_[hp] = full_host_page_mask_;
+      }
+    }
+  }
+
+  void InvalidateExactByteRangeOnUnprotectedHostPages(
+      uint32_t start, uint32_t length, uint32_t hp_first, uint32_t hp_last,
+      bool mark_submission_invalidated) {
+    if (!active_ || !length || start >= buffer_size_ ||
+        hp_first >= host_page_count_) {
+      return;
+    }
+    length = std::min(length, buffer_size_ - start);
+    const uint32_t sp_first = start >> kSubpageSizeLog2;
+    const uint32_t sp_last = (start + length - 1) >> kSubpageSizeLog2;
+    hp_last = std::min(hp_last, host_page_count_ - 1);
+    for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
+      const uint8_t gpu_bits = gpu_written_mask_[hp];
+      const uint8_t exact_bits =
+          (hp >= (sp_first >> subpages_per_host_page_log2_) &&
+           hp <= (sp_last >> subpages_per_host_page_log2_))
+              ? SubpageMaskForHostPage(hp, sp_first, sp_last)
+              : uint8_t(0);
+      valid_mask_[hp] = 0;
+      gpu_written_mask_[hp] = 0;
+      hash_valid_mask_[hp] &= uint8_t(~(gpu_bits | exact_bits));
+      if (mark_submission_invalidated) {
+        invalidated_in_submission_mask_[hp] = full_host_page_mask_;
+      }
+    }
+  }
+
+  void SetHostPageValidFromGpuWritten(uint32_t hp) {
+    if (!active_ || hp >= host_page_count_) {
+      return;
+    }
+    const uint8_t prev_valid = valid_mask_[hp];
+    const uint8_t gpu_mask = gpu_written_mask_[hp];
+    invalidated_in_submission_mask_[hp] |= uint8_t(prev_valid & ~gpu_mask);
+    valid_mask_[hp] = gpu_mask;
+    hash_valid_mask_[hp] &= uint8_t(~gpu_mask);
+  }
+
+  bool IsRangeValid(uint32_t start, uint32_t length) const {
+    if (!length) {
+      return true;
+    }
+    if (!active_ || start > buffer_size_ || (buffer_size_ - start) < length) {
+      return false;
+    }
+    const uint32_t sp_first = start >> kSubpageSizeLog2;
+    const uint32_t sp_last = (start + length - 1) >> kSubpageSizeLog2;
+    const uint32_t hp_first = sp_first >> subpages_per_host_page_log2_;
+    const uint32_t hp_last = sp_last >> subpages_per_host_page_log2_;
+    for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
+      const uint8_t req_mask = SubpageMaskForHostPage(hp, sp_first, sp_last);
+      if ((valid_mask_[hp] & req_mask) != req_mask) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool IsRangeGpuWritten(uint32_t start, uint32_t length) const {
+    if (!length || !active_ || start > buffer_size_ ||
+        (buffer_size_ - start) < length) {
+      return false;
+    }
+    const uint32_t sp_first = start >> kSubpageSizeLog2;
+    const uint32_t sp_last = (start + length - 1) >> kSubpageSizeLog2;
+    const uint32_t hp_first = sp_first >> subpages_per_host_page_log2_;
+    const uint32_t hp_last = sp_last >> subpages_per_host_page_log2_;
+    for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
+      const uint8_t req_mask = SubpageMaskForHostPage(hp, sp_first, sp_last);
+      if ((valid_mask_[hp] & gpu_written_mask_[hp] & req_mask) != req_mask) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void CollectDirtySubpageRanges(
+      uint32_t start, uint32_t length,
+      std::vector<std::pair<uint32_t, uint32_t>>& out_ranges) const {
+    out_ranges.clear();
+    if (!active_ || !length || start >= buffer_size_) {
+      return;
+    }
+    length = std::min(length, buffer_size_ - start);
+    const uint32_t sp_first = start >> kSubpageSizeLog2;
+    const uint32_t sp_last = (start + length - 1) >> kSubpageSizeLog2;
+    const uint32_t hp_first = sp_first >> subpages_per_host_page_log2_;
+    const uint32_t hp_last = sp_last >> subpages_per_host_page_log2_;
+
+    uint32_t run_start = UINT32_MAX;
+    for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
+      const uint8_t req_mask = SubpageMaskForHostPage(hp, sp_first, sp_last);
+      const uint8_t dirty_mask = uint8_t(req_mask & ~valid_mask_[hp]);
+      if (dirty_mask == 0) {
+        if (run_start != UINT32_MAX) {
+          const uint32_t run_end = hp << subpages_per_host_page_log2_;
+          out_ranges.emplace_back(run_start, run_end - run_start);
+          run_start = UINT32_MAX;
+        }
+        continue;
+      }
+      const uint32_t page_sp_base = hp << subpages_per_host_page_log2_;
+      const uint32_t local_first =
+          (sp_first > page_sp_base) ? (sp_first - page_sp_base) : 0u;
+      const uint32_t local_last =
+          (sp_last < page_sp_base + subpages_per_host_page_ - 1)
+              ? (sp_last - page_sp_base)
+              : (subpages_per_host_page_ - 1);
+      for (uint32_t local = local_first; local <= local_last; ++local) {
+        const uint32_t sp = page_sp_base + local;
+        if (dirty_mask & uint8_t(uint32_t(1) << local)) {
+          if (run_start == UINT32_MAX) {
+            run_start = sp;
+          }
+        } else if (run_start != UINT32_MAX) {
+          out_ranges.emplace_back(run_start, sp - run_start);
+          run_start = UINT32_MAX;
+        }
+      }
+    }
+    if (run_start != UINT32_MAX) {
+      out_ranges.emplace_back(run_start, sp_last + 1 - run_start);
+    }
+  }
+
+  template <typename HashFn>
+  void FilterUnchangedDirtySubpages(
+      const std::vector<std::pair<uint32_t, uint32_t>>& dirty_ranges,
+      HashFn&& try_hash_subpage,
+      std::vector<std::pair<uint32_t, uint32_t>>& out_upload_ranges,
+      std::vector<uint32_t>& out_newly_full_host_pages) {
+    out_upload_ranges.clear();
+    out_newly_full_host_pages.clear();
+    if (!active_) {
+      return;
+    }
+    uint32_t run_start = UINT32_MAX;
+    uint32_t run_end = 0;
+    auto flush_run = [&]() {
+      if (run_start != UINT32_MAX) {
+        out_upload_ranges.emplace_back(run_start, run_end - run_start);
+        run_start = UINT32_MAX;
+        run_end = 0;
+      }
+    };
+
+    for (const auto& range : dirty_ranges) {
+      const uint32_t sp_end = range.first + range.second;
+      for (uint32_t sp = range.first; sp < sp_end; ++sp) {
+        const uint32_t hp = sp >> subpages_per_host_page_log2_;
+        const uint32_t local = sp & (subpages_per_host_page_ - 1);
+        const uint8_t bit = uint8_t(uint32_t(1) << local);
+        bool unchanged = false;
+        if ((hash_valid_mask_[hp] & bit) && !(gpu_written_mask_[hp] & bit)) {
+          uint64_t current_hash = 0;
+          if (try_hash_subpage(sp, current_hash) &&
+              current_hash == upload_hash_[sp]) {
+            unchanged = true;
+          }
+        }
+        if (unchanged) {
+          flush_run();
+          const bool was_full = valid_mask_[hp] == full_host_page_mask_;
+          valid_mask_[hp] |= bit;
+          if (!was_full && valid_mask_[hp] == full_host_page_mask_) {
+            out_newly_full_host_pages.push_back(hp);
+          }
+        } else {
+          if (run_start == UINT32_MAX) {
+            run_start = sp;
+            run_end = sp + 1;
+          } else if (sp == run_end) {
+            ++run_end;
+          } else {
+            flush_run();
+            run_start = sp;
+            run_end = sp + 1;
+          }
+        }
+      }
+      flush_run();
+    }
+  }
+
+  bool AnySubpageRangeInvalidatedSinceSubmissionOpen(
+      const std::pair<uint32_t, uint32_t>* subpage_ranges,
+      uint32_t count) const {
+    if (!active_) {
+      return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      if (!subpage_ranges[i].second) {
+        continue;
+      }
+      const uint32_t sp_first = subpage_ranges[i].first;
+      const uint32_t sp_last = sp_first + subpage_ranges[i].second - 1;
+      const uint32_t hp_first = sp_first >> subpages_per_host_page_log2_;
+      const uint32_t hp_last =
+          std::min(sp_last >> subpages_per_host_page_log2_, host_page_count_ - 1);
+      for (uint32_t hp = hp_first; hp <= hp_last; ++hp) {
+        const uint8_t mask = SubpageMaskForHostPage(hp, sp_first, sp_last);
+        if (invalidated_in_submission_mask_[hp] & mask) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  uint64_t upload_hash(uint32_t subpage) const {
+    return subpage < subpage_count_ ? upload_hash_[subpage] : 0;
+  }
+
+ private:
+  bool active_ = false;
+  uint32_t buffer_size_ = 0;
+  uint32_t host_page_size_log2_ = 0;
+  uint32_t subpages_per_host_page_log2_ = 0;
+  uint32_t subpages_per_host_page_ = 0;
+  uint8_t full_host_page_mask_ = 0;
+  uint32_t host_page_count_ = 0;
+  uint32_t subpage_count_ = 0;
+
+  std::vector<uint8_t> valid_mask_;
+  std::vector<uint8_t> gpu_written_mask_;
+  std::vector<uint8_t> hash_valid_mask_;
+  std::vector<uint8_t> invalidated_in_submission_mask_;
+  std::vector<uint64_t> upload_hash_;
+};
+
+}  // namespace gpu
+}  // namespace xe
+
+#ifndef XENIA_GPU_SHARED_MEMORY_PURE_LOGIC_ONLY
+
 #include "xenia/memory.h"
 
 namespace xe {
@@ -209,6 +630,11 @@ class SharedMemory {
   // [page_first, page_first + page_count) before copying guest RAM.
   void SetPageUploadHashes(uint32_t page_first, uint32_t page_count,
                            const uint8_t* source);
+  // Records 4 KB subpage XXH3 hashes for [byte_offset, byte_offset + byte_size)
+  // when 4 KB subpage tracking is active on >4 KB host pages.
+  void SetSubpageUploadHashes(uint32_t byte_offset, uint32_t byte_size,
+                              const uint8_t* source);
+  bool subpage_tracking_active() const { return subpage_tracker_.active(); }
   void SetUnwatchSkipVerify(bool skip) { unwatch_skip_verify_ = skip; }
 
   // Whether any page in the ranges lost validity since the current GPU
@@ -217,6 +643,9 @@ class SharedMemory {
   // command, so their upload may be reordered to the submission start.
   bool AnyPageInvalidatedSinceSubmissionOpen(
       const std::pair<uint32_t, uint32_t>* page_ranges, uint32_t count) const;
+  bool AnyRangeInvalidatedSinceSubmissionOpen(
+      const std::pair<uint32_t, uint32_t>* ranges, uint32_t count,
+      uint32_t unit_size_log2) const;
 
   // Uploads a range of host pages - only called if host GPU sparse memory
   // allocation succeeded if needed. While uploading, MakeRangeValid must be
@@ -229,6 +658,19 @@ class SharedMemory {
   virtual bool UploadRanges(
       const std::pair<uint32_t, uint32_t>* upload_page_ranges,
       uint32_t num_upload_ranges) = 0;
+
+  // Optional 4 KB subpage upload hook for backends supporting logical subpage
+  // tracking on >4 KB host kernels (e.g. 16 KB Android).
+  virtual bool SupportsSubpageUpload() const { return false; }
+  virtual bool UploadSubpageRanges(
+      const std::pair<uint32_t, uint32_t>* upload_subpage_ranges,
+      uint32_t num_upload_ranges) {
+    return false;
+  }
+
+  // Notification that GPU commands in the current submission may read or write
+  // the byte range [start, start + length) in the shared-memory buffer.
+  virtual void NoteByteRangeUsedByGpu(uint32_t start, uint32_t length) {}
 
   const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
     return trace_download_ranges_;
@@ -337,12 +779,18 @@ class SharedMemory {
   void OnFrameEndUnwatch();
   void EnableWatchesExceptDynamic(uint32_t page_first, uint32_t page_last);
   void VerifyUnwatchedPages(uint32_t page_first, uint32_t page_last);
+  void VerifyUnwatchedSubpages(uint32_t start, uint32_t length);
   void RewatchPages(uint32_t block, uint64_t mask);
   bool UnwatchedPageMatchesUpload(uint32_t page);
   void MarkRangeUsedInSubmission(uint32_t start, uint32_t length);
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackImpl(
       uint32_t physical_address_start, uint32_t length, bool exact_range,
       bool from_unwatch_verify);
+
+  SubpageTracker subpage_tracker_;
+  std::vector<std::pair<uint32_t, uint32_t>> dirty_subpage_ranges_;
+  std::vector<std::pair<uint32_t, uint32_t>> filtered_subpage_ranges_;
+  std::vector<uint32_t> newly_full_host_pages_;
 
   // Set when GPU-written flags change, so an unchanged frame skips the copy.
   bool gpu_written_data_dirty_ = false;
@@ -425,5 +873,7 @@ class SharedMemory {
 
 }  // namespace gpu
 }  // namespace xe
+
+#endif  // XENIA_GPU_SHARED_MEMORY_PURE_LOGIC_ONLY
 
 #endif  // XENIA_GPU_SHARED_MEMORY_H_

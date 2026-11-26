@@ -10,13 +10,16 @@
 #include "xenia/gpu/command_processor.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <set>
 
 #if defined(__ANDROID__)
 #include <dlfcn.h>
+#include <sys/resource.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 #endif
@@ -131,6 +134,13 @@ DEFINE_bool(
     "interval minus its waits for ring writes and WAIT_REG_MEM) against the "
     "average frame interval as the target, so the platform can raise the "
     "thread's clock when a frame runs late. Takes effect at startup.",
+    "GPU");
+
+DEFINE_int32(
+    gpu_commands_thread_nice, 0,
+    "Android: POSIX nice value for the GPU Commands thread in [-20, 19]. "
+    "0 leaves the thread priority unchanged; e.g. -12 breaks the prio=110 "
+    "tie with Guest CPU 2 on the Prime core during A/B testing.",
     "GPU");
 
 DEFINE_bool(
@@ -873,6 +883,59 @@ void CommandProcessor::FrameStatsEndSwap(uint64_t begin_ns) {
 }
 
 namespace {
+#if defined(__ANDROID__)
+void PollGpuThreadNiceProperty() {
+  char value[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.xendroid.gpu_thread_nice", value) > 0 &&
+      ((value[0] == '-' && value[1] >= '0' && value[1] <= '9') ||
+       (value[0] >= '0' && value[0] <= '9'))) {
+    const int32_t nice_val = std::atoi(value);
+    if (cvars::gpu_commands_thread_nice != nice_val) {
+      cvars::gpu_commands_thread_nice = nice_val;
+      XELOGI("debug.xendroid.gpu_thread_nice: gpu_commands_thread_nice = {}",
+             nice_val);
+    }
+  }
+}
+
+void ApplyGpuCommandsThreadNice(int32_t& last_logged_nice) {
+  const int32_t desired = cvars::gpu_commands_thread_nice;
+  if (desired == 0) {
+    last_logged_nice = 0;
+    return;
+  }
+  if (desired < -20 || desired > 19) {
+    if (last_logged_nice != desired) {
+      last_logged_nice = desired;
+      XELOGW(
+          "GPU Commands: ignoring out-of-range gpu_commands_thread_nice={} "
+          "(valid range [-20, 19])",
+          desired);
+    }
+    return;
+  }
+  errno = 0;
+  const int current = getpriority(PRIO_PROCESS, 0);
+  if (errno == 0 && current == desired && last_logged_nice == desired) {
+    return;
+  }
+  errno = 0;
+  if (setpriority(PRIO_PROCESS, 0, desired) != 0) {
+    if (last_logged_nice != desired) {
+      last_logged_nice = desired;
+      XELOGW("GPU Commands: setpriority({}) failed: errno {} ({})", desired,
+             errno, std::strerror(errno));
+    }
+    return;
+  }
+  const int applied = getpriority(PRIO_PROCESS, 0);
+  if (last_logged_nice != desired) {
+    last_logged_nice = desired;
+    XELOGI("GPU Commands: nice set to {} (requested {})", applied, desired);
+  }
+}
+#endif
+
 void BinTraceCount(std::vector<std::pair<uint64_t, uint32_t>>& counts,
                    uint64_t key) {
   for (auto& entry : counts) {
@@ -895,6 +958,7 @@ void CommandProcessor::BinTracePoll() {
   }
   t.frames_since_poll = 0;
   char value[PROP_VALUE_MAX] = {};
+  PollGpuThreadNiceProperty();
   // Read by the spin_park_guest_functions wait helper at run time.
   if (__system_property_get("debug.xendroid.spin_park", value) > 0 &&
       value[0] >= '0' && value[0] <= '2') {
@@ -1547,7 +1611,23 @@ void CommandProcessor::WorkerThreadMain() {
     return;
   }
 
+#if defined(__ANDROID__)
+  int32_t last_logged_nice = 0;
+  PollGpuThreadNiceProperty();
+  ApplyGpuCommandsThreadNice(last_logged_nice);
+  auto nice_reapply_last = std::chrono::steady_clock::now();
+#endif
+
   while (worker_running_) {
+#if defined(__ANDROID__)
+    if (cvars::gpu_commands_thread_nice != 0) {
+      const auto nice_now = std::chrono::steady_clock::now();
+      if (nice_now - nice_reapply_last >= std::chrono::seconds(1)) {
+        nice_reapply_last = nice_now;
+        ApplyGpuCommandsThreadNice(last_logged_nice);
+      }
+    }
+#endif
     while (has_pending_fns_.load(std::memory_order_acquire)) {
       std::function<void()> fn;
       {

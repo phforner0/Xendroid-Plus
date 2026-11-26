@@ -176,6 +176,46 @@ struct AudioAdpfOps {
   void* user = nullptr;
 };
 
+struct CallbackTimeBreakdown {
+  uint64_t wall_us = 0;
+  uint64_t cpu_us = 0;
+  uint64_t run_queue_wait_us = 0;
+  uint64_t blocked_sleep_us = 0;
+};
+
+// Separates guest callback wall time into on-CPU execution, OS run-queue wait,
+// and blocked/sleeping time (waiting on guest events, locks, or XMA kicks).
+inline CallbackTimeBreakdown ComputeCallbackTimeBreakdown(
+    uint64_t wall_us, uint64_t cpu_us, uint64_t run_queue_wait_us) {
+  CallbackTimeBreakdown out;
+  out.wall_us = wall_us;
+  out.cpu_us = cpu_us;
+  out.run_queue_wait_us = run_queue_wait_us;
+  const uint64_t accounted = cpu_us + run_queue_wait_us;
+  const uint64_t capped =
+      (accounted < cpu_us) ? wall_us : std::min(wall_us, accounted);
+  out.blocked_sleep_us = wall_us - capped;
+  return out;
+}
+
+// Active work duration to report to ADPF: cpu_us + run_queue_wait_us, strictly
+// excluding blocked_sleep_us so waiting on guest locks/events/XMA never
+// inflates ADPF reports and causes WALT scheduler stalls.
+inline uint64_t ComputeAdpfActiveWorkUs(
+    const CallbackTimeBreakdown& breakdown) {
+  const uint64_t active = breakdown.cpu_us + breakdown.run_queue_wait_us;
+  if (active < breakdown.cpu_us) {
+    return breakdown.wall_us;
+  }
+  return std::min(breakdown.wall_us, active);
+}
+
+inline uint64_t ComputeAdpfActiveWorkUs(uint64_t wall_us, uint64_t cpu_us,
+                                        uint64_t run_queue_wait_us) {
+  return ComputeAdpfActiveWorkUs(
+      ComputeCallbackTimeBreakdown(wall_us, cpu_us, run_queue_wait_us));
+}
+
 // RAII ADPF session manager for the audio deadline (5333 us).
 // Handles dynamic setThreads updates when XMA Decoder starts/restarts after
 // Audio Worker, dead-TID filtering, recreate fallback, and RAII closeSession.
@@ -297,6 +337,12 @@ class AudioAdpfSession {
     }
   }
 
+  void SyncAndReportBreakdown(bool enabled,
+                              const CallbackTimeBreakdown& breakdown,
+                              const AudioAdpfThreadRegistry& registry) {
+    SyncAndReport(enabled, ComputeAdpfActiveWorkUs(breakdown), registry);
+  }
+
   bool active() const { return session_ != nullptr; }
   bool permanently_failed() const { return permanently_failed_; }
   int64_t target_ns() const { return target_ns_; }
@@ -310,28 +356,6 @@ class AudioAdpfSession {
   uint64_t last_generation_ = 0;
   bool permanently_failed_ = false;
 };
-
-struct CallbackTimeBreakdown {
-  uint64_t wall_us = 0;
-  uint64_t cpu_us = 0;
-  uint64_t run_queue_wait_us = 0;
-  uint64_t blocked_sleep_us = 0;
-};
-
-// Separates guest callback wall time into on-CPU execution, OS run-queue wait,
-// and blocked/sleeping time (waiting on guest events, locks, or XMA kicks).
-inline CallbackTimeBreakdown ComputeCallbackTimeBreakdown(
-    uint64_t wall_us, uint64_t cpu_us, uint64_t run_queue_wait_us) {
-  CallbackTimeBreakdown out;
-  out.wall_us = wall_us;
-  out.cpu_us = cpu_us;
-  out.run_queue_wait_us = run_queue_wait_us;
-  const uint64_t accounted = cpu_us + run_queue_wait_us;
-  const uint64_t capped =
-      (accounted < cpu_us) ? wall_us : std::min(wall_us, accounted);
-  out.blocked_sleep_us = wall_us - capped;
-  return out;
-}
 
 inline bool IsAudioFrameSamplesSilent(const float* samples,
                                       size_t sample_count) {

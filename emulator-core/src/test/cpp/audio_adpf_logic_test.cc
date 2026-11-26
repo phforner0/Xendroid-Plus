@@ -302,6 +302,36 @@ void TestContentionBreakdownAndHelpers() {
       500, UINT64_MAX, 100);
   ADPF_CHECK(overflow.blocked_sleep_us == 0);
 
+  // Active work reported to ADPF must be cpu_us + run_queue_wait_us, NEVER
+  // blocked_sleep_us (which inflated ADPF reports and caused 98-103ms WALT
+  // stalls on GPU Commands).
+  ADPF_CHECK(xendroid::ComputeAdpfActiveWorkUs(bd) == 404u + 475u);
+  ADPF_CHECK(xendroid::ComputeAdpfActiveWorkUs(28468, 404, 475) == 879u);
+  // Pure blocked sleep -> 0 us active (clamped to 1000 ns at ADPF report).
+  ADPF_CHECK(xendroid::ComputeAdpfActiveWorkUs(20000, 0, 0) == 0u);
+  // Pure active CPU work with no sleep.
+  ADPF_CHECK(xendroid::ComputeAdpfActiveWorkUs(1200, 1150, 50) == 1200u);
+  // Clock skew and overflow guards: clamped to wall_us, never wrap.
+  ADPF_CHECK(xendroid::ComputeAdpfActiveWorkUs(skewed) == 100u);
+  ADPF_CHECK(xendroid::ComputeAdpfActiveWorkUs(overflow) == 500u);
+
+  // SyncAndReportBreakdown passes only active duration to ADPF.
+  xendroid::AudioAdpfThreadRegistry reg;
+  reg.SetAudioWorkerTid(5001);
+  FakeAdpfState fake;
+  {
+    xendroid::AudioAdpfSession session(5333 * 1000LL, fake.AudioOps());
+    session.SyncAndReportBreakdown(true, bd, reg);
+    ADPF_CHECK(fake.report_calls == 1);
+    ADPF_CHECK(fake.last_report_ns == int64_t((404u + 475u) * 1000u));
+
+    const auto pure_sleep =
+        xendroid::ComputeCallbackTimeBreakdown(25000, 0, 0);
+    session.SyncAndReportBreakdown(true, pure_sleep, reg);
+    ADPF_CHECK(fake.report_calls == 2);
+    ADPF_CHECK(fake.last_report_ns == 1000LL);
+  }
+
   // Audio silence scan helper.
   float samples[16] = {};
   ADPF_CHECK(xendroid::IsAudioFrameSamplesSilent(samples, 16));
@@ -398,6 +428,21 @@ void TestSourceContracts(const fs::path& cpp_dir) {
   ADPF_CHECK(audio_cc.find("ComputeCallbackTimeBreakdown") != std::string::npos);
   ADPF_CHECK(audio_cc.find("blocked_sleep") != std::string::npos);
   ADPF_CHECK(audio_cc.find("IsAudioFrameSamplesSilent") != std::string::npos);
+  // Onda 1.1 (#55): default off (reversible via TOML without UPDATE_from_*),
+  // and ReportPump must report active duration (cpu_us + run_queue_wait_us),
+  // never wall time containing blocked_sleep.
+  ADPF_CHECK(audio_cc.find("apu_performance_hint, false,") !=
+             std::string::npos);
+  ADPF_CHECK(audio_cc.find("UPDATE_from_bool(apu_performance_hint") ==
+             std::string::npos);
+  ADPF_CHECK(audio_cc.find("ComputeAdpfActiveWorkUs") != std::string::npos ||
+             audio_cc.find("SyncAndReportBreakdown") != std::string::npos);
+  ADPF_CHECK(audio_cc.find("audio_perf_hint.ReportPump(exec_us)") ==
+             std::string::npos);
+  ADPF_CHECK(audio_cc.find("cvars::apu_aaudio_log_stats || cvars::apu_performance_hint") !=
+             std::string::npos ||
+             audio_cc.find("log_stats || cvars::apu_performance_hint") !=
+             std::string::npos);
 
   const std::string xma_cc =
       ReadSourceText(cpp_dir / "xenia/src/xenia/apu/xma_decoder.cc");

@@ -84,7 +84,7 @@ DEFINE_bool(
     "debug.xendroid.apu_adaptive_queue switches it at run time on Android.",
     "APU");
 DEFINE_bool(
-    apu_performance_hint, true,
+    apu_performance_hint, false,
     "Register an ADPF performance hint session over the audio worker and XMA "
     "decoder threads so the power HAL holds clocks for the audio deadline.",
     "APU");
@@ -166,9 +166,9 @@ class AudioPerformanceHint {
       : session_(AudioSystem::kAudioPumpInterval * int64_t(1000),
                  BuildAndroidOps()) {}
 
-  void ReportPump(uint64_t actual_us) {
-    session_.SyncAndReport(cvars::apu_performance_hint, actual_us,
-                           xendroid::GlobalAudioAdpfThreadRegistry());
+  void ReportPump(const xendroid::CallbackTimeBreakdown& breakdown) {
+    session_.SyncAndReportBreakdown(cvars::apu_performance_hint, breakdown,
+                                    xendroid::GlobalAudioAdpfThreadRegistry());
   }
 
  private:
@@ -597,16 +597,21 @@ void AudioSystem::WorkerThreadMain() {
       // statistics only (system calls and a read of procfs), the thread's CPU
       // time - less than the wall time when the callback waits or the thread
       // is preempted -, its wait for a core and the core it ran on.
-      auto run_callback = [&]() {
+      auto run_callback = [&]() -> xendroid::CallbackTimeBreakdown {
 #if XE_PLATFORM_xendroid
-        const bool timed = cvars::apu_aaudio_log_stats;
+        const bool log_stats = cvars::apu_aaudio_log_stats;
+        const bool measure_active = log_stats || cvars::apu_performance_hint;
         timespec cpu_begin = {};
+        bool cpu_begin_ok = false;
         int cpu = -1;
         uint64_t run_wait_begin_us = 0;
-        if (timed) {
-          clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_begin);
-          cpu = sched_getcpu();
+        if (measure_active) {
+          cpu_begin_ok =
+              clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_begin) == 0;
           run_wait_begin_us = run_queue_wait.TotalUs();
+        }
+        if (log_stats) {
+          cpu = sched_getcpu();
         }
 #endif
         const auto begin = std::chrono::steady_clock::now();
@@ -618,44 +623,55 @@ void AudioSystem::WorkerThreadMain() {
                 .count());
         ++pump_stats.pumps;
         pump_stats.callback_us_sum += us;
+        xendroid::CallbackTimeBreakdown breakdown;
+        breakdown.wall_us = us;
+        breakdown.blocked_sleep_us = us;
 #if XE_PLATFORM_xendroid
-        if (timed) {
-          timespec cpu_end;
-          clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end);
-          const int64_t cpu_delta_us =
-              (int64_t(cpu_end.tv_sec) - int64_t(cpu_begin.tv_sec)) * 1000000 +
-              (int64_t(cpu_end.tv_nsec) - int64_t(cpu_begin.tv_nsec)) / 1000;
-          const uint64_t cpu_us =
-              cpu_delta_us > 0 ? static_cast<uint64_t>(cpu_delta_us) : 0;
-          pump_stats.callback_cpu_us_sum += cpu_us;
+        if (measure_active) {
+          timespec cpu_end = {};
+          uint64_t cpu_us = 0;
+          if (cpu_begin_ok &&
+              clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0) {
+            const int64_t cpu_delta_us =
+                (int64_t(cpu_end.tv_sec) - int64_t(cpu_begin.tv_sec)) *
+                    1000000 +
+                (int64_t(cpu_end.tv_nsec) - int64_t(cpu_begin.tv_nsec)) / 1000;
+            cpu_us =
+                cpu_delta_us > 0 ? static_cast<uint64_t>(cpu_delta_us) : 0;
+          }
           const uint64_t run_wait_us =
               counted_since(run_queue_wait.TotalUs(), run_wait_begin_us);
-          const auto breakdown =
+          breakdown =
               xendroid::ComputeCallbackTimeBreakdown(us, cpu_us, run_wait_us);
-          pump_stats.callback_run_wait_us_sum += breakdown.run_queue_wait_us;
-          pump_stats.callback_run_wait_us_max = std::max(
-              pump_stats.callback_run_wait_us_max, breakdown.run_queue_wait_us);
-          pump_stats.callback_blocked_us_sum += breakdown.blocked_sleep_us;
-          pump_stats.callback_blocked_us_max = std::max(
-              pump_stats.callback_blocked_us_max, breakdown.blocked_sleep_us);
-          if (us >= pump_stats.callback_us_max) {
-            pump_stats.slowest_callback_cpu_us = cpu_us;
-            pump_stats.slowest_callback_run_wait_us =
-                breakdown.run_queue_wait_us;
-            pump_stats.slowest_callback_blocked_us =
-                breakdown.blocked_sleep_us;
-          }
-          if (cpu >= 0 && cpu < int(xe::countof(pump_stats.pumps_on_cpu))) {
-            ++pump_stats.pumps_on_cpu[cpu];
+          if (log_stats) {
+            pump_stats.callback_cpu_us_sum += breakdown.cpu_us;
+            pump_stats.callback_run_wait_us_sum += breakdown.run_queue_wait_us;
+            pump_stats.callback_run_wait_us_max = std::max(
+                pump_stats.callback_run_wait_us_max,
+                breakdown.run_queue_wait_us);
+            pump_stats.callback_blocked_us_sum += breakdown.blocked_sleep_us;
+            pump_stats.callback_blocked_us_max = std::max(
+                pump_stats.callback_blocked_us_max, breakdown.blocked_sleep_us);
+            if (us >= pump_stats.callback_us_max) {
+              pump_stats.slowest_callback_cpu_us = breakdown.cpu_us;
+              pump_stats.slowest_callback_run_wait_us =
+                  breakdown.run_queue_wait_us;
+              pump_stats.slowest_callback_blocked_us =
+                  breakdown.blocked_sleep_us;
+            }
+            if (cpu >= 0 && cpu < int(xe::countof(pump_stats.pumps_on_cpu))) {
+              ++pump_stats.pumps_on_cpu[cpu];
+            }
           }
         }
 #endif
         pump_stats.callback_us_max = std::max(pump_stats.callback_us_max, us);
-        return us;
+        return breakdown;
       };
-      const uint64_t exec_us = run_callback();
+      const auto cb_breakdown = run_callback();
+      const uint64_t exec_us = cb_breakdown.wall_us;
 #if XE_PLATFORM_xendroid
-      audio_perf_hint.ReportPump(exec_us);
+      audio_perf_hint.ReportPump(cb_breakdown);
 #endif
       bool submitted =
           clients_[client_index].frames_submitted.load() != submitted_before;
@@ -717,7 +733,7 @@ void AudioSystem::WorkerThreadMain() {
           xe::threading::Wait(client_semaphores_[client_index].get(), false,
                               std::chrono::milliseconds(0)) ==
               xe::threading::WaitResult::kSuccess) {
-        const uint64_t topup_us = run_callback();
+        const uint64_t topup_us = run_callback().wall_us;
         ++pump_stats.topups;
         if (xendroid::ShouldRunEmergencySecondAudioTopup(
                 driver->ReportsQueuedFrameCount(),
