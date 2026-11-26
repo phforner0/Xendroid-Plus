@@ -85,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
     sm.add_argument("--pad-script", type=pathlib.Path, default=None)
     sm.add_argument("--vlm-cmd", default=None, help="External OCR/VLM command receiving PNG path.")
     sm.add_argument("--uncapped", action="store_true")
+    sm.add_argument(
+        "--breakdown-passes",
+        action="store_true",
+        help="Enable log_gpu_frame_time_breakdown_passes for isolated resolve/pass diagnostics.",
+    )
     sm.add_argument("--analyze-log", type=pathlib.Path, default=None, help="Offline dry-run: parse an existing xe.log.")
     sm.add_argument("--analyze-frames", type=pathlib.Path, nargs="*", default=[], help="Offline dry-run: PNG screenshots.")
     sm.add_argument("--headless-plan", action="store_true", help="Print Lavapipe/Cuttlefish headless CI config.")
@@ -326,6 +331,7 @@ def main(argv: list[str] | None = None) -> int:
             pad_script_path=args.pad_script,
             vlm_cmd=args.vlm_cmd,
             uncapped=args.uncapped,
+            breakdown_passes=args.breakdown_passes,
         )
         report = make_report(
             command="smoke",

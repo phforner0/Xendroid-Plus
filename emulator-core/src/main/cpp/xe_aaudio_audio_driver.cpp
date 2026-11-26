@@ -385,8 +385,11 @@ aaudio_data_callback_result_t AAudioAudioDriver::AudioCallback(
   if (releases == 0 && result.gaps) {
     releases = 1;
   }
-  for (uint32_t i = 0; i < releases; ++i) {
-    driver->semaphore_->Release(1, nullptr);
+  if (releases > 0 &&
+      !driver->semaphore_->Release(static_cast<int>(releases), nullptr)) {
+    for (uint32_t i = 0; i < releases; ++i) {
+      driver->semaphore_->Release(1, nullptr);
+    }
   }
 
   const uint32_t callback_us = static_cast<uint32_t>(

@@ -96,7 +96,8 @@ foreach ($Pair in @(
   @("wave1_native_port_opts_test", $Cpp),
   @("wave2_native_port_opts_test", $Cpp),
   @("wave3_jit_hle_logic_test", $Cpp),
-  @("wave5_universal_perf_test", $Cpp)
+  @("wave5_universal_perf_test", $Cpp),
+  @("audio_adpf_logic_test", $Cpp)
 )) {
   $TName = $Pair[0]
   $TArg = $Pair[1]

@@ -336,6 +336,272 @@ class CpuPerformanceHintSession {
   std::vector<int32_t> active_tids_;
 };
 
+// Reusable helper for APerformanceHint_setPreferPowerEfficiency (Android API 35+
+// via dlsym). Returns false on host, API < 35, null session, or call failure.
+using AdpfPreferPowerEfficiencyFn = int (*)(void*, bool);
+using AdpfPowerEfficiencyCallbackFn = int (*)(void* user, void* session,
+                                            bool enabled);
+
+inline AdpfPreferPowerEfficiencyFn ResolveAdpfPreferPowerEfficiency() {
+#if defined(__ANDROID__) && !defined(XE_DISABLE_ANDROID_DLOPEN)
+  static AdpfPreferPowerEfficiencyFn fn = []() -> AdpfPreferPowerEfficiencyFn {
+    void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!lib) {
+      lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!lib) {
+      return nullptr;
+    }
+    return reinterpret_cast<AdpfPreferPowerEfficiencyFn>(
+        dlsym(lib, "APerformanceHint_setPreferPowerEfficiency"));
+  }();
+  return fn;
+#else
+  return nullptr;
+#endif
+}
+
+inline bool SetAdpfPreferPowerEfficiency(void* session, bool enabled,
+                                         AdpfPowerEfficiencyCallbackFn fn,
+                                         void* user) {
+  if (!session || !fn) {
+    return false;
+  }
+  return fn(user, session, enabled) == 0;
+}
+
+inline bool SetAdpfPreferPowerEfficiency(void* session, bool enabled) {
+  if (!session) {
+    return false;
+  }
+  const auto fn = ResolveAdpfPreferPowerEfficiency();
+  if (!fn) {
+    return false;
+  }
+  return fn(session, enabled) == 0;
+}
+
+// ADPF session configured with PreferPowerEfficiency (API 35+) for background
+// threads such as Guest I/O*. Never opens a boost session on API < 35.
+class BackgroundPowerHintSession {
+ public:
+  struct Ops {
+    void* (*create_session)(void* user, const int32_t* tids, size_t count,
+                            int64_t target_ns) = nullptr;
+    int (*set_threads)(void* user, void* session, const int32_t* tids,
+                       size_t count) = nullptr;
+    int (*set_prefer_power_efficiency)(void* user, void* session,
+                                       bool enabled) = nullptr;
+    void (*close_session)(void* user, void* session) = nullptr;
+    bool (*is_tid_alive)(void* user, int32_t tid) = nullptr;
+    void* user = nullptr;
+  };
+
+  BackgroundPowerHintSession() : ops_(DefaultAndroidOps()) {}
+  explicit BackgroundPowerHintSession(Ops ops) : ops_(ops) {}
+  ~BackgroundPowerHintSession() { Shutdown(); }
+
+  BackgroundPowerHintSession(const BackgroundPowerHintSession&) = delete;
+  BackgroundPowerHintSession& operator=(const BackgroundPowerHintSession&) =
+      delete;
+
+  void SyncThreads(bool enabled, const GuestCpuTidRegistry& registry) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!enabled) {
+      ShutdownLocked();
+      failed_ = false;
+      return;
+    }
+    if (failed_) {
+      return;
+    }
+    if (!ops_.create_session || !ops_.set_prefer_power_efficiency ||
+        !ops_.close_session) {
+      failed_ = true;
+      return;
+    }
+
+    auto is_alive = [this](int32_t tid) -> bool {
+      return ops_.is_tid_alive ? ops_.is_tid_alive(ops_.user, tid)
+                               : IsProcSelfTaskAlive(tid);
+    };
+
+    const uint64_t gen = registry.generation();
+    if (!session_) {
+      std::vector<int32_t> live_tids = registry.SnapshotLiveTids(is_alive);
+      if (live_tids.empty()) {
+        return;
+      }
+      if (!CreatePowerEfficientSessionLocked(live_tids, is_alive, registry)) {
+        failed_ = true;
+        return;
+      }
+      active_tids_ = std::move(live_tids);
+      last_generation_ = gen;
+      return;
+    }
+
+    if (gen != last_generation_) {
+      std::vector<int32_t> live_tids = registry.SnapshotLiveTids(is_alive);
+      if (live_tids.empty()) {
+        CloseSessionOnlyLocked();
+        last_generation_ = gen;
+        return;
+      }
+      if (live_tids != active_tids_) {
+        bool updated = false;
+        if (ops_.set_threads) {
+          if (ops_.set_threads(ops_.user, session_, live_tids.data(),
+                               live_tids.size()) == 0) {
+            updated = true;
+          } else {
+            std::vector<int32_t> retried =
+                registry.SnapshotLiveTids(is_alive);
+            if (!retried.empty() && retried != live_tids &&
+                ops_.set_threads(ops_.user, session_, retried.data(),
+                                 retried.size()) == 0) {
+              live_tids.swap(retried);
+              updated = true;
+            }
+          }
+        }
+        if (!updated) {
+          CloseSessionOnlyLocked();
+          live_tids = registry.SnapshotLiveTids(is_alive);
+          if (live_tids.empty()) {
+            last_generation_ = gen;
+            return;
+          }
+          if (!CreatePowerEfficientSessionLocked(live_tids, is_alive,
+                                                 registry)) {
+            failed_ = true;
+            return;
+          }
+        }
+        active_tids_ = std::move(live_tids);
+      }
+      last_generation_ = gen;
+    }
+  }
+
+  void Shutdown() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ShutdownLocked();
+    failed_ = false;
+  }
+
+  bool active() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return session_ != nullptr;
+  }
+
+ private:
+  static constexpr int64_t kBackgroundTargetNs = 16'666'667;
+
+  template <typename Pred>
+  bool CreatePowerEfficientSessionLocked(std::vector<int32_t>& live_tids,
+                                         Pred&& is_alive,
+                                         const GuestCpuTidRegistry& registry) {
+    session_ = ops_.create_session(ops_.user, live_tids.data(),
+                                   live_tids.size(), kBackgroundTargetNs);
+    if (!session_) {
+      std::vector<int32_t> retried = registry.SnapshotLiveTids(is_alive);
+      if (!retried.empty() && retried != live_tids) {
+        live_tids.swap(retried);
+        session_ = ops_.create_session(ops_.user, live_tids.data(),
+                                       live_tids.size(), kBackgroundTargetNs);
+      }
+    }
+    if (!session_) {
+      return false;
+    }
+    if (ops_.set_prefer_power_efficiency(ops_.user, session_, true) != 0) {
+      CloseSessionOnlyLocked();
+      return false;
+    }
+    return true;
+  }
+
+  void CloseSessionOnlyLocked() {
+    if (session_ && ops_.close_session) {
+      ops_.close_session(ops_.user, session_);
+    }
+    session_ = nullptr;
+    active_tids_.clear();
+  }
+
+  void ShutdownLocked() {
+    CloseSessionOnlyLocked();
+    last_generation_ = 0;
+  }
+
+  static Ops DefaultAndroidOps() {
+    Ops ops;
+#if defined(__ANDROID__) && !defined(XE_DISABLE_ANDROID_DLOPEN)
+    struct AndroidApi {
+      void* manager = nullptr;
+      void* (*create)(void*, const int32_t*, size_t, int64_t) = nullptr;
+      int (*set_threads)(void*, const int32_t*, size_t) = nullptr;
+      AdpfPreferPowerEfficiencyFn set_power_eff = nullptr;
+      void (*close)(void*) = nullptr;
+    };
+    static AndroidApi api = []() -> AndroidApi {
+      AndroidApi a;
+      void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
+      if (!lib) {
+        lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+      }
+      if (!lib) {
+        return a;
+      }
+      auto get_manager = reinterpret_cast<void* (*)()>(
+          dlsym(lib, "APerformanceHint_getManager"));
+      a.create = reinterpret_cast<decltype(a.create)>(
+          dlsym(lib, "APerformanceHint_createSession"));
+      a.set_threads = reinterpret_cast<decltype(a.set_threads)>(
+          dlsym(lib, "APerformanceHint_setThreads"));
+      a.set_power_eff = ResolveAdpfPreferPowerEfficiency();
+      a.close = reinterpret_cast<decltype(a.close)>(
+          dlsym(lib, "APerformanceHint_closeSession"));
+      a.manager = get_manager ? get_manager() : nullptr;
+      return a;
+    }();
+    if (api.manager && api.create && api.set_power_eff && api.close) {
+      ops.user = &api;
+      ops.create_session = [](void* u, const int32_t* tids, size_t count,
+                              int64_t target_ns) -> void* {
+        auto* a = static_cast<AndroidApi*>(u);
+        return a->create(a->manager, tids, count, target_ns);
+      };
+      if (api.set_threads) {
+        ops.set_threads = [](void* u, void* session, const int32_t* tids,
+                             size_t count) -> int {
+          auto* a = static_cast<AndroidApi*>(u);
+          return a->set_threads(session, tids, count);
+        };
+      }
+      ops.set_prefer_power_efficiency = [](void* u, void* session,
+                                           bool enabled) -> int {
+        auto* a = static_cast<AndroidApi*>(u);
+        return a->set_power_eff(session, enabled);
+      };
+      ops.close_session = [](void* u, void* session) {
+        auto* a = static_cast<AndroidApi*>(u);
+        a->close(session);
+      };
+    }
+#endif
+    return ops;
+  }
+
+  Ops ops_{};
+  mutable std::mutex mutex_;
+  void* session_ = nullptr;
+  bool failed_ = false;
+  uint64_t last_generation_ = 0;
+  std::vector<int32_t> active_tids_;
+};
+
 }  // namespace kernel
 }  // namespace xe
 

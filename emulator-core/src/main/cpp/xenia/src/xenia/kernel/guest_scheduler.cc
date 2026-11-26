@@ -17,7 +17,9 @@
 #include <vector>
 
 #if XE_PLATFORM_LINUX
+#include <sys/resource.h>
 #include <unistd.h>
+#include <cerrno>
 #endif
 
 #include "xenia/base/assert.h"
@@ -82,6 +84,77 @@ static thread_local int t_current_cpu = -1;
 // Set while a shared I/O worker is inside a queued call, so code reached from
 // it can tell it is not on a guest thread.
 static thread_local bool t_in_blocking_call = false;
+
+namespace {
+
+// Keeps background Guest I/O* threads at nice +10 and marks them
+// PreferPowerEfficiency (Android API 35+) so they do not compete with audio
+// or guest simulation threads for big cores.
+class GuestIoPowerHintManager {
+ public:
+  static GuestIoPowerHintManager& Instance() {
+    static GuestIoPowerHintManager mgr;
+    return mgr;
+  }
+
+  void RegisterTid(int32_t tid) {
+    registry_.RegisterTid(tid);
+    session_.SyncThreads(true, registry_);
+  }
+
+  void UnregisterTid(int32_t tid) {
+    registry_.UnregisterTid(tid);
+    session_.SyncThreads(true, registry_);
+  }
+
+  void Shutdown() {
+    session_.Shutdown();
+    registry_.Clear();
+  }
+
+ private:
+  GuestCpuTidRegistry registry_;
+  BackgroundPowerHintSession session_;
+};
+
+struct ScopedGuestIoThread {
+  explicit ScopedGuestIoThread(int32_t tid) : tid_(tid) {
+    GuestIoPowerHintManager::Instance().RegisterTid(tid_);
+  }
+  ~ScopedGuestIoThread() {
+    GuestIoPowerHintManager::Instance().UnregisterTid(tid_);
+  }
+  ScopedGuestIoThread(const ScopedGuestIoThread&) = delete;
+  ScopedGuestIoThread& operator=(const ScopedGuestIoThread&) = delete;
+
+ private:
+  int32_t tid_;
+};
+
+void ApplyBackgroundIoPriority(const char* what) {
+#if XE_PLATFORM_LINUX
+  static constexpr int kIoNice = 10;
+  errno = 0;
+  if (setpriority(PRIO_PROCESS, 0, kIoNice) != 0) {
+    static std::atomic<bool> failed_once{false};
+    bool expected = false;
+    if (failed_once.compare_exchange_strong(expected, true)) {
+      XELOGW("{}: setpriority({}) failed: errno {} ({})", what, kIoNice, errno,
+             std::strerror(errno));
+    }
+    return;
+  }
+  static std::atomic<bool> logged_once{false};
+  bool expected = false;
+  if (logged_once.compare_exchange_strong(expected, true)) {
+    XELOGI("{}: nice set to {}", what, getpriority(PRIO_PROCESS, 0));
+  }
+#else
+  (void)what;
+#endif
+}
+
+}  // namespace
 
 // Raises |target| to |value| if larger. A racing stats reset drops one sample.
 static void AccumulateMax(std::atomic<uint64_t>& target, uint64_t value) {
@@ -498,6 +571,7 @@ void GuestScheduler::Shutdown() {
     xe::threading::Wait(thread.get(), false);
   }
   io_pool_threads_.clear();
+  GuestIoPowerHintManager::Instance().Shutdown();
   // Free calls no worker is left to run.
   auto drop_queued = [](std::mutex& queue_lock,
                         std::queue<BlockingCall*>& queue) {
@@ -1319,8 +1393,10 @@ void GuestScheduler::RunBlockingCall(BlockingCall* call) {
 }
 
 void GuestScheduler::IoWorkerLoop() {
-  io_thread_tid_.store(xe::threading::current_thread_system_id(),
-                       std::memory_order_relaxed);
+  const uint32_t tid = xe::threading::current_thread_system_id();
+  io_thread_tid_.store(tid, std::memory_order_relaxed);
+  ApplyBackgroundIoPriority("Guest I/O");
+  const ScopedGuestIoThread io_power_guard(static_cast<int32_t>(tid));
   while (!shutting_down_.load()) {
     BlockingCall* call = nullptr;
     {
@@ -1371,8 +1447,10 @@ bool GuestScheduler::EnqueuePoolCall(BlockingCall* call) {
 }
 
 void GuestScheduler::IoPoolWorkerLoop(size_t index) {
-  io_pool_tids_[index].store(xe::threading::current_thread_system_id(),
-                             std::memory_order_relaxed);
+  const uint32_t tid = xe::threading::current_thread_system_id();
+  io_pool_tids_[index].store(tid, std::memory_order_relaxed);
+  ApplyBackgroundIoPriority("Guest I/O pool");
+  const ScopedGuestIoThread io_power_guard(static_cast<int32_t>(tid));
   std::unique_lock<std::mutex> lock(io_pool_lock_);
   while (!shutting_down_.load()) {
     if (io_pool_queue_.empty()) {
