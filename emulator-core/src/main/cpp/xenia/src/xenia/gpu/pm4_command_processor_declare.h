@@ -4,6 +4,10 @@
 #define PM4_OVERRIDE
 #endif
 void ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) XE_RESTRICT;
+bool TryExecuteCachedIndirectBuffer(uint32_t ptr, const uint32_t* host_ptr,
+                                    uint32_t count) XE_RESTRICT;
+void ReplayCompiledIndirectBuffer(
+    const xe::gpu::pm4_ib::CompiledIndirectBuffer& compiled) XE_RESTRICT;
 virtual uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index)
     XE_RESTRICT PM4_OVERRIDE;
 virtual bool ExecutePacket() PM4_OVERRIDE;

@@ -25,9 +25,12 @@
 #include <array>
 #include <vector>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/guest_gpu_progress.h"
 #include "xenia/base/math.h"
 #include "xenia/base/ring_buffer.h"
+#include "xenia/gpu/pm4_ib_cache.h"
+#include "xenia/gpu/pm4_noop_filter.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
@@ -36,6 +39,9 @@
 #include "xenia/memory.h"
 #include "xenia/ui/presentation_runtime.h"
 #include "xenia/ui/presenter.h"
+
+DECLARE_bool(vulkan_pm4_noop_reg_filter_4wide);
+DECLARE_bool(pm4_indirect_buffer_cache);
 
 namespace xe {
 
@@ -533,6 +539,23 @@ class CommandProcessor {
   XE_FORCEINLINE
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                      uint32_t num_registers);
+
+  // Host-endian (pre-swapped) register range write used by PM4 IB cache replay.
+  // Applies the 4-wide NEON/scalar no-op filter when
+  // vulkan_pm4_noop_reg_filter_4wide is enabled without pre-mutating
+  // register_file_->values[] before WriteRegister().
+  virtual void WriteRegistersHostEndian(uint32_t start_index,
+                                        const uint32_t* host_values,
+                                        uint32_t num_registers);
+
+  static std::pair<uint32_t, uint32_t> Pm4IbWatchInvalidationThunk(
+      void* context_ptr, uint32_t physical_address_start, uint32_t length,
+      bool exact_range);
+  void EnsurePm4IbWatchRegistered();
+  void ShutdownPm4IbCache();
+  void InvalidatePm4IbCache();
+  void OnPm4IbMemoryInvalidated(uint32_t physical_address, uint32_t length);
+  void OnPm4IbCacheEndFrame();
 
   XE_FORCEINLINE
   virtual void WriteRegisterRangeFromRing(xe::RingBuffer* ring, uint32_t base,
@@ -1094,6 +1117,10 @@ class CommandProcessor {
   };
   VblankProbe vblank_probe_;
   std::atomic<uint64_t> vblank_probe_last_vblank_ns_{0};
+
+  pm4_ib::Pm4IndirectBufferCache pm4_ib_cache_;
+  void* pm4_ib_watch_callback_handle_ = nullptr;
+  bool pm4_ib_cache_was_enabled_ = false;
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

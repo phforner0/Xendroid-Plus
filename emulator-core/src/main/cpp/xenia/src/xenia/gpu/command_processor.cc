@@ -256,8 +256,81 @@ DEFINE_bool(
     "Vulkan, SV_Barycentrics on Direct3D 12).",
     "GPU");
 
+DEFINE_bool(
+    vulkan_pm4_noop_reg_filter_4wide, false,
+    "Filter no-op (new == old) GPU register writes 4-wide using AArch64 NEON "
+    "or scalar 4-wide comparison before dirtying downstream state trackers, "
+    "preserving all changed stores in RegisterFile and all mandatory "
+    "side-effect registers (SCRATCH_REG0..7, COHER_STATUS_HOST, DC_LUT_*). "
+    "Read per write (debug.xendroid.pm4_noop_reg_filter on Android).",
+    "GPU");
+
+DEFINE_bool(
+    pm4_indirect_buffer_cache, false,
+    "Cache pre-decoded host-endian PM4_INDIRECT_BUFFER command streams "
+    "validated by lock-free atomic-epoch physical memory write-watches with "
+    "2-hit hysteresis and 64-frame invalidation cooldown. Read per IB "
+    "(debug.xendroid.pm4_ib_cache on Android).",
+    "GPU");
+
 namespace xe {
 namespace gpu {
+
+static_assert(pm4_noop::kRegScratchReg0 == XE_GPU_REG_SCRATCH_REG0);
+static_assert(pm4_noop::kRegScratchReg7 == XE_GPU_REG_SCRATCH_REG7);
+static_assert(pm4_noop::kRegCoherStatusHost == XE_GPU_REG_COHER_STATUS_HOST);
+static_assert(pm4_noop::kRegDcLutRwIndex == XE_GPU_REG_DC_LUT_RW_INDEX);
+static_assert(pm4_noop::kRegDcLutSeqColor == XE_GPU_REG_DC_LUT_SEQ_COLOR);
+static_assert(pm4_noop::kRegDcLutPwlData == XE_GPU_REG_DC_LUT_PWL_DATA);
+static_assert(pm4_noop::kRegDcLut30Color == XE_GPU_REG_DC_LUT_30_COLOR);
+static_assert(pm4_noop::kRegVgtMaxVtxIndx == XE_GPU_REG_VGT_MAX_VTX_INDX);
+static_assert(pm4_noop::kRegVgtMinVtxIndx == XE_GPU_REG_VGT_MIN_VTX_INDX);
+static_assert(pm4_noop::kRegVgtIndxOffset == XE_GPU_REG_VGT_INDX_OFFSET);
+static_assert(pm4_noop::kRegVgtDmaSize == XE_GPU_REG_VGT_DMA_SIZE);
+static_assert(pm4_noop::kRegPaClClipCntl == XE_GPU_REG_PA_CL_CLIP_CNTL);
+static_assert(pm4_noop::kRegVgtHosMaxTessLevel ==
+              XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL);
+static_assert(pm4_noop::kRegVgtHosMinTessLevel ==
+              XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL);
+static_assert(pm4_noop::kRegPaClUcp0X == XE_GPU_REG_PA_CL_UCP_0_X);
+static_assert(pm4_noop::kRegPaClUcp5W == XE_GPU_REG_PA_CL_UCP_5_W);
+
+static_assert(pm4_ib::opcode::kNop == xenos::PM4_NOP);
+static_assert(pm4_ib::opcode::kRegRmw == xenos::PM4_REG_RMW);
+static_assert(pm4_ib::opcode::kDrawIndx == xenos::PM4_DRAW_INDX);
+static_assert(pm4_ib::opcode::kVizQuery == xenos::PM4_VIZ_QUERY);
+static_assert(pm4_ib::opcode::kWaitForIdle == xenos::PM4_WAIT_FOR_IDLE);
+static_assert(pm4_ib::opcode::kImLoad == xenos::PM4_IM_LOAD);
+static_assert(pm4_ib::opcode::kImLoadImmediate == xenos::PM4_IM_LOAD_IMMEDIATE);
+static_assert(pm4_ib::opcode::kSetConstant == xenos::PM4_SET_CONSTANT);
+static_assert(pm4_ib::opcode::kLoadAluConstant == xenos::PM4_LOAD_ALU_CONSTANT);
+static_assert(pm4_ib::opcode::kDrawIndx2 == xenos::PM4_DRAW_INDX_2);
+static_assert(pm4_ib::opcode::kIndirectBufferPfd ==
+              xenos::PM4_INDIRECT_BUFFER_PFD);
+static_assert(pm4_ib::opcode::kInvalidateState == xenos::PM4_INVALIDATE_STATE);
+static_assert(pm4_ib::opcode::kWaitRegMem == xenos::PM4_WAIT_REG_MEM);
+static_assert(pm4_ib::opcode::kMemWrite == xenos::PM4_MEM_WRITE);
+static_assert(pm4_ib::opcode::kRegToMem == xenos::PM4_REG_TO_MEM);
+static_assert(pm4_ib::opcode::kIndirectBuffer == xenos::PM4_INDIRECT_BUFFER);
+static_assert(pm4_ib::opcode::kCondWrite == xenos::PM4_COND_WRITE);
+static_assert(pm4_ib::opcode::kEventWrite == xenos::PM4_EVENT_WRITE);
+static_assert(pm4_ib::opcode::kMeInit == xenos::PM4_ME_INIT);
+static_assert(pm4_ib::opcode::kSetBinMask == xenos::PM4_SET_BIN_MASK);
+static_assert(pm4_ib::opcode::kSetBinSelect == xenos::PM4_SET_BIN_SELECT);
+static_assert(pm4_ib::opcode::kInterrupt == xenos::PM4_INTERRUPT);
+static_assert(pm4_ib::opcode::kSetConstant2 == xenos::PM4_SET_CONSTANT2);
+static_assert(pm4_ib::opcode::kSetShaderConstants ==
+              xenos::PM4_SET_SHADER_CONSTANTS);
+static_assert(pm4_ib::opcode::kEventWriteShd == xenos::PM4_EVENT_WRITE_SHD);
+static_assert(pm4_ib::opcode::kEventWriteCfl == xenos::PM4_EVENT_WRITE_CFL);
+static_assert(pm4_ib::opcode::kEventWriteExt == xenos::PM4_EVENT_WRITE_EXT);
+static_assert(pm4_ib::opcode::kEventWriteZpd == xenos::PM4_EVENT_WRITE_ZPD);
+static_assert(pm4_ib::opcode::kContextUpdate == xenos::PM4_CONTEXT_UPDATE);
+static_assert(pm4_ib::opcode::kSetBinMaskLo == xenos::PM4_SET_BIN_MASK_LO);
+static_assert(pm4_ib::opcode::kSetBinMaskHi == xenos::PM4_SET_BIN_MASK_HI);
+static_assert(pm4_ib::opcode::kSetBinSelectLo == xenos::PM4_SET_BIN_SELECT_LO);
+static_assert(pm4_ib::opcode::kSetBinSelectHi == xenos::PM4_SET_BIN_SELECT_HI);
+static_assert(pm4_ib::opcode::kXeSwap == xenos::PM4_XE_SWAP);
 
 // This should be written completely differently with support for different
 // types.
@@ -457,6 +530,8 @@ void CommandProcessor::Shutdown() {
     wrm_writer_callback_handle_ = nullptr;
   }
 
+  ShutdownPm4IbCache();
+
   cpu_hint_last_swap_ns_.store(0, std::memory_order_relaxed);
   if (kernel_state_ && kernel_state_->guest_scheduler()) {
     kernel_state_->guest_scheduler()->TickAdpfHint(false, 0);
@@ -559,9 +634,9 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
   }
 }
 
-void CommandProcessor::ClearCaches() {}
+void CommandProcessor::ClearCaches() { InvalidatePm4IbCache(); }
 
-void CommandProcessor::InvalidateGpuMemory() {}
+void CommandProcessor::InvalidateGpuMemory() { InvalidatePm4IbCache(); }
 
 void CommandProcessor::ClearReadbackBuffers() {}
 
@@ -885,6 +960,30 @@ void CommandProcessor::FrameStatsEndSwap(uint64_t begin_ns) {
 
 namespace {
 #if defined(__ANDROID__)
+void PollPm4OptimizationProperties() {
+  char value[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.xendroid.pm4_noop_reg_filter", value) > 0 &&
+      (value[0] == '0' || value[0] == '1')) {
+    const bool enabled = value[0] == '1';
+    if (cvars::vulkan_pm4_noop_reg_filter_4wide != enabled) {
+      cvars::vulkan_pm4_noop_reg_filter_4wide = enabled;
+      XELOGI(
+          "debug.xendroid.pm4_noop_reg_filter: "
+          "vulkan_pm4_noop_reg_filter_4wide = {}",
+          enabled);
+    }
+  }
+  if (__system_property_get("debug.xendroid.pm4_ib_cache", value) > 0 &&
+      (value[0] == '0' || value[0] == '1')) {
+    const bool enabled = value[0] == '1';
+    if (cvars::pm4_indirect_buffer_cache != enabled) {
+      cvars::pm4_indirect_buffer_cache = enabled;
+      XELOGI("debug.xendroid.pm4_ib_cache: pm4_indirect_buffer_cache = {}",
+             enabled);
+    }
+  }
+}
+
 void PollGpuThreadNiceProperty() {
   char value[PROP_VALUE_MAX] = {};
   if (__system_property_get("debug.xendroid.gpu_thread_nice", value) > 0 &&
@@ -960,6 +1059,7 @@ void CommandProcessor::BinTracePoll() {
   t.frames_since_poll = 0;
   char value[PROP_VALUE_MAX] = {};
   PollGpuThreadNiceProperty();
+  PollPm4OptimizationProperties();
   // Read by the spin_park_guest_functions wait helper at run time.
   if (__system_property_get("debug.xendroid.spin_park", value) > 0 &&
       value[0] >= '0' && value[0] <= '2') {
@@ -1615,6 +1715,7 @@ void CommandProcessor::WorkerThreadMain() {
 #if defined(__ANDROID__)
   int32_t last_logged_nice = 0;
   PollGpuThreadNiceProperty();
+  PollPm4OptimizationProperties();
   ApplyGpuCommandsThreadNice(last_logged_nice);
   auto nice_reapply_last = std::chrono::steady_clock::now();
 #endif
@@ -1757,6 +1858,7 @@ bool CommandProcessor::Restore(ByteStream* stream) {
   read_ptr_update_freq_ = stream->Read<uint32_t>();
   read_ptr_writeback_ptr_ = stream->Read<uint32_t>();
   write_ptr_index_.store(stream->Read<uint32_t>());
+  InvalidatePm4IbCache();
 
   return true;
 }
@@ -1768,6 +1870,7 @@ bool CommandProcessor::SetupContext() {
 }
 
 void CommandProcessor::ShutdownContext() {
+  ShutdownPm4IbCache();
   ResetVIZState();
   ResetZPDState();
 }
@@ -2165,6 +2268,81 @@ void CommandProcessor::WriteRegistersFromMem(uint32_t start_index,
   for (uint32_t i = 0; i < num_registers; ++i) {
     uint32_t data = xe::load_and_swap<uint32_t>(base + i);
     this->WriteRegister(start_index + i, data);
+  }
+}
+
+void CommandProcessor::WriteRegistersHostEndian(uint32_t start_index,
+                                                const uint32_t* host_values,
+                                                uint32_t num_registers) {
+  if (!num_registers) {
+    return;
+  }
+  if (start_index >= RegisterFile::kRegisterCount ||
+      num_registers > RegisterFile::kRegisterCount - start_index) {
+    XELOGW(
+        "CommandProcessor::WriteRegistersHostEndian out-of-bounds range "
+        "[{:04X}, {:04X}) clamped",
+        start_index, start_index + num_registers);
+    if (start_index >= RegisterFile::kRegisterCount) {
+      return;
+    }
+    num_registers = uint32_t(RegisterFile::kRegisterCount) - start_index;
+  }
+  if (cvars::vulkan_pm4_noop_reg_filter_4wide) {
+    pm4_noop::DispatchChangedRegisters4WideHostEndian(
+        register_file_->values, start_index, host_values, num_registers,
+        [this](uint32_t reg_index, uint32_t value) {
+          this->WriteRegister(reg_index, value);
+        });
+    return;
+  }
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    this->WriteRegister(start_index + i, host_values[i]);
+  }
+}
+
+std::pair<uint32_t, uint32_t> CommandProcessor::Pm4IbWatchInvalidationThunk(
+    void* context_ptr, uint32_t physical_address_start, uint32_t length,
+    bool exact_range) {
+  auto* self = static_cast<CommandProcessor*>(context_ptr);
+  return self->pm4_ib_cache_.OnMemoryInvalidatedForUnwatch(
+      physical_address_start, length, exact_range);
+}
+
+void CommandProcessor::EnsurePm4IbWatchRegistered() {
+  if (!pm4_ib_watch_callback_handle_ && memory_) {
+    pm4_ib_watch_callback_handle_ =
+        memory_->RegisterPhysicalMemoryInvalidationCallback(
+            Pm4IbWatchInvalidationThunk, this);
+  }
+}
+
+void CommandProcessor::ShutdownPm4IbCache() {
+  if (pm4_ib_watch_callback_handle_) {
+    if (memory_) {
+      memory_->UnregisterPhysicalMemoryInvalidationCallback(
+          pm4_ib_watch_callback_handle_);
+    }
+    pm4_ib_watch_callback_handle_ = nullptr;
+  }
+  pm4_ib_cache_.InvalidateAll();
+  pm4_ib_cache_was_enabled_ = false;
+}
+
+void CommandProcessor::InvalidatePm4IbCache() {
+  pm4_ib_cache_.InvalidateAll();
+  pm4_ib_cache_was_enabled_ = false;
+}
+
+void CommandProcessor::OnPm4IbMemoryInvalidated(uint32_t physical_address,
+                                                uint32_t length) {
+  pm4_ib_cache_.OnMemoryInvalidated(physical_address, length);
+}
+
+void CommandProcessor::OnPm4IbCacheEndFrame() {
+  pm4_ib_cache_.AdvanceFrame();
+  if (!cvars::pm4_indirect_buffer_cache && pm4_ib_cache_was_enabled_) {
+    InvalidatePm4IbCache();
   }
 }
 
