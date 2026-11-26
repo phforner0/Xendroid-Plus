@@ -45,6 +45,7 @@
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/gpu_live_options.h"
 #include "xenia/gpu/packet_disassembler.h"
+#include "xenia/gpu/pm4_noop_filter.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/shader.h"
 #include "xenia/gpu/spirv_fsi_system_constants.h"
@@ -1185,6 +1186,7 @@ void VulkanCommandProcessor::WaitUntilGpuIdleForBench() {
 }
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
+  CommandProcessor::InvalidateGpuMemory();
   shared_memory_->InvalidateAllPages();
   small_readback_ring_.InvalidatePending();
   sysconst_dirty_tracker_.InvalidateAll();
@@ -1203,6 +1205,7 @@ void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
                                                       uint32_t length) {
   shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
   primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
+  OnPm4IbMemoryInvalidated(base_ptr, length);
   if (pipeline_cache_) {
     pipeline_cache_->OnShaderMemoryInvalidated(base_ptr, length);
   }
@@ -3217,6 +3220,21 @@ void VulkanCommandProcessor::WriteFetchFromMem(uint32_t start_index,
 
 void VulkanCommandProcessor::WritePossiblySpecialRegistersFromMem(
     uint32_t start_index, uint32_t* base, uint32_t num_registers) {
+  if (cvars::vulkan_pm4_noop_reg_filter_4wide) {
+    auto res = pm4_noop::FilterWritePossiblySpecialRegistersBigEndian(
+        register_file_->values, start_index, base, num_registers,
+        [this](uint32_t reg, uint32_t val) {
+          HandleSpecialRegisterWrite(reg, val);
+        },
+        [this](uint32_t reg) {
+          sysconst_dirty_tracker_.NoteRegisterWrite(reg);
+        });
+    if (res.system_constants_dirty) {
+      current_constant_buffers_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
+    }
+    return;
+  }
   sysconst_dirty_tracker_.NoteRegisterRangeWrite(start_index, num_registers);
   uint32_t end = start_index + num_registers;
   for (uint32_t index = start_index; index < end; ++index, ++base) {
@@ -3286,6 +3304,18 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index,
     return current_index >= end;
   };
   auto regular = [this](uint32_t index, uint32_t* src, uint32_t count) {
+    if (cvars::vulkan_pm4_noop_reg_filter_4wide) {
+      auto res = pm4_noop::FilterWriteRegisters4WideBigEndian(
+          register_file_->values, index, src, count,
+          [this](uint32_t reg) {
+            sysconst_dirty_tracker_.NoteRegisterWrite(reg);
+          });
+      if (res.system_constants_dirty) {
+        current_constant_buffers_up_to_date_ &=
+            ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
+      }
+      return;
+    }
     sysconst_dirty_tracker_.NoteRegisterRangeWrite(index, count);
     xe::copy_and_swap_32_unaligned(&register_file_->values[index], src, count);
   };

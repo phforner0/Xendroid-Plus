@@ -1079,6 +1079,65 @@ void TestSourceInvariants(const fs::path& cpp_root) {
                export_call != std::string::npos &&
                second_lock != std::string::npos);
   PM4_IB_CHECK(first_lock < export_call && export_call < second_lock);
+
+  // 7) VulkanCommandProcessor post-merge 3B hooks:
+  //    - #include "xenia/gpu/pm4_noop_filter.h"
+  //    - 4-wide no-op filter in WritePossiblySpecialRegistersFromMem and
+  //      WriteRegistersFromMem (`regular`) gated by
+  //      cvars::vulkan_pm4_noop_reg_filter_4wide
+  //    - CommandProcessor::InvalidateGpuMemory() inside
+  //      VulkanCommandProcessor::InvalidateGpuMemory()
+  //    - OnPm4IbMemoryInvalidated(base_ptr, length) inside
+  //      VulkanCommandProcessor::TracePlaybackWroteMemory()
+  const std::string vk_cp_cc =
+      ReadSourceText(gpu_dir / "vulkan" / "vulkan_command_processor.cc");
+  PM4_IB_CHECK(vk_cp_cc.find("#include \"xenia/gpu/pm4_noop_filter.h\"") !=
+               std::string::npos);
+
+  const size_t vk_inv_pos =
+      vk_cp_cc.find("void VulkanCommandProcessor::InvalidateGpuMemory()");
+  const size_t vk_trace_pos =
+      vk_cp_cc.find("void VulkanCommandProcessor::TracePlaybackWroteMemory(");
+  const size_t vk_init_sh_pos =
+      vk_cp_cc.find("void VulkanCommandProcessor::InitializeShaderStorage(");
+  PM4_IB_CHECK(vk_inv_pos != std::string::npos &&
+               vk_trace_pos != std::string::npos &&
+               vk_init_sh_pos != std::string::npos &&
+               vk_inv_pos < vk_trace_pos && vk_trace_pos < vk_init_sh_pos);
+  const std::string vk_inv_body =
+      vk_cp_cc.substr(vk_inv_pos, vk_trace_pos - vk_inv_pos);
+  PM4_IB_CHECK(vk_inv_body.find("CommandProcessor::InvalidateGpuMemory();") !=
+               std::string::npos);
+  const std::string vk_trace_body =
+      vk_cp_cc.substr(vk_trace_pos, vk_init_sh_pos - vk_trace_pos);
+  PM4_IB_CHECK(
+      vk_trace_body.find("OnPm4IbMemoryInvalidated(base_ptr, length);") !=
+      std::string::npos);
+
+  const size_t vk_spec_pos = vk_cp_cc.find(
+      "void VulkanCommandProcessor::WritePossiblySpecialRegistersFromMem(");
+  const size_t vk_mem_pos =
+      vk_cp_cc.find("void VulkanCommandProcessor::WriteRegistersFromMem(");
+  const size_t vk_ring_pos = vk_cp_cc.find(
+      "void VulkanCommandProcessor::WriteRegisterRangeFromRing(");
+  PM4_IB_CHECK(vk_spec_pos != std::string::npos &&
+               vk_mem_pos != std::string::npos &&
+               vk_ring_pos != std::string::npos &&
+               vk_spec_pos < vk_mem_pos && vk_mem_pos < vk_ring_pos);
+  const std::string vk_spec_body =
+      vk_cp_cc.substr(vk_spec_pos, vk_mem_pos - vk_spec_pos);
+  PM4_IB_CHECK(vk_spec_body.find("cvars::vulkan_pm4_noop_reg_filter_4wide") !=
+               std::string::npos);
+  PM4_IB_CHECK(
+      vk_spec_body.find("pm4_noop::FilterWritePossiblySpecialRegistersBigEndian(") !=
+      std::string::npos);
+  const std::string vk_mem_body =
+      vk_cp_cc.substr(vk_mem_pos, vk_ring_pos - vk_mem_pos);
+  PM4_IB_CHECK(vk_mem_body.find("cvars::vulkan_pm4_noop_reg_filter_4wide") !=
+               std::string::npos);
+  PM4_IB_CHECK(
+      vk_mem_body.find("pm4_noop::FilterWriteRegisters4WideBigEndian(") !=
+      std::string::npos);
 }
 
 }  // namespace
