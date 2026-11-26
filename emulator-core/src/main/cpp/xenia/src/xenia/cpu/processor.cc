@@ -785,6 +785,57 @@ void Processor::EnableDynamicCode() {
     dynamic_code_module_ = std::make_unique<DynamicCodeModule>(this);
   }
   dynamic_code_enabled_.store(true, std::memory_order_relaxed);
+  vscr_sat_observable_.store(true, std::memory_order_release);
+}
+
+void Processor::BeginVscrSatCensus() {
+  vscr_sat_observable_.store(true, std::memory_order_release);
+}
+
+void Processor::FinishVscrSatCensus() {
+  auto global_lock = global_critical_region_.Acquire();
+  bool observable = dynamic_code_enabled_.load(std::memory_order_acquire);
+  bool saw_xex = false;
+  if (!observable) {
+    constexpr std::string_view kTrampolineSuffix = "_trampoline";
+    for (const auto& module : modules_) {
+      if (module.get() == builtin_module_) {
+        continue;
+      }
+      if (auto* xex = dynamic_cast<XexModule*>(module.get())) {
+        if (xex->is_patch()) {
+          continue;
+        }
+        saw_xex = true;
+        if (xex->ReadsVscr()) {
+          observable = true;
+          break;
+        }
+        continue;
+      }
+      // KernelModule registers non-executable "*_trampoline" RawModules that
+      // only emit `sc; blr` import stubs and never execute guest mfvscr.
+      // Any other non-XEX module (e.g. ElfModule or executable RawModule)
+      // remains conservative.
+      const std::string& mod_name = module->name();
+      const bool is_kernel_trampoline =
+          !module->is_executable() &&
+          mod_name.size() >= kTrampolineSuffix.size() &&
+          mod_name.compare(mod_name.size() - kTrampolineSuffix.size(),
+                           kTrampolineSuffix.size(), kTrampolineSuffix) == 0;
+      if (is_kernel_trampoline) {
+        continue;
+      }
+      observable = true;
+      break;
+    }
+    if (!saw_xex) {
+      observable = true;
+    }
+  }
+  vscr_sat_observable_.store(observable, std::memory_order_release);
+  XELOGI("Processor: VSCR[SAT] census complete (observable={})",
+         observable ? "true" : "false");
 }
 
 Function* Processor::LookupFunction(uint32_t address) {

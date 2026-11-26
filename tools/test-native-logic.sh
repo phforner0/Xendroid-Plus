@@ -80,6 +80,8 @@ done
 "$build/wave5_universal_perf_test" "$cpp"
 "${cxx[@]}" "${flags[@]}" -pthread "$test/gpu_pipeline_async_test.cc" -o "$build/gpu_pipeline_async_test"
 "$build/gpu_pipeline_async_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" "$test/wave6_cpu_kernel_edge_test.cc" -o "$build/wave6_cpu_kernel_edge_test"
+"$build/wave6_cpu_kernel_edge_test" "$cpp"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then

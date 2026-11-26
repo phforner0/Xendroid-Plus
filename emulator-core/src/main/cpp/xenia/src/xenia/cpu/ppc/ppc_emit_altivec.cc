@@ -348,7 +348,9 @@ int InstrEmit_vaddfp128(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vaddsbs(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT8_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -356,7 +358,9 @@ int InstrEmit_vaddsbs(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vaddshs(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT16_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -364,7 +368,9 @@ int InstrEmit_vaddshs(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vaddsws(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT32_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -379,7 +385,9 @@ int InstrEmit_vaddubm(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vaddubs(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT8_TYPE,
                          ARITHMETIC_UNSIGNED | ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -394,7 +402,9 @@ int InstrEmit_vadduhm(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vadduhs(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT16_TYPE,
                          ARITHMETIC_UNSIGNED | ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -409,7 +419,9 @@ int InstrEmit_vadduwm(PPCHIRBuilder& f, const InstrData& i) {
 int InstrEmit_vadduws(PPCHIRBuilder& f, const InstrData& i) {
   Value* v = f.VectorAdd(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT32_TYPE,
                          ARITHMETIC_UNSIGNED | ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -529,7 +541,9 @@ int InstrEmit_vctsxs_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb,
   Value* v =
       f.Mul(f.LoadVR(vb), f.Splat(f.LoadConstantFloat32(fuimm), VEC128_TYPE));
   v = f.VectorConvertF2I(v);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(vd, v);
   return 0;
 }
@@ -547,7 +561,9 @@ int InstrEmit_vctuxs_(PPCHIRBuilder& f, uint32_t vd, uint32_t vb,
   Value* v =
       f.Mul(f.LoadVR(vb), f.Splat(f.LoadConstantFloat32(fuimm), VEC128_TYPE));
   v = f.VectorConvertF2I(v, ARITHMETIC_UNSIGNED);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1788,7 +1804,9 @@ int InstrEmit_vsubsbs(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTS(VA) + ¬EXTS(VB) + 1, -128, 127)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT8_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1797,7 +1815,9 @@ int InstrEmit_vsubshs(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTS(VA) + ¬EXTS(VB) + 1, -2^15, 2^15-1)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT16_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1806,7 +1826,9 @@ int InstrEmit_vsubsws(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTS(VA) + ¬EXTS(VB) + 1, -2^31, 2^31-1)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT32_TYPE,
                          ARITHMETIC_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1839,7 +1861,9 @@ int InstrEmit_vsububs(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTZ(VA) + ¬EXTZ(VB) + 1, 0, 256)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT8_TYPE,
                          ARITHMETIC_SATURATE | ARITHMETIC_UNSIGNED);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1848,7 +1872,9 @@ int InstrEmit_vsubuhs(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTZ(VA) + ¬EXTZ(VB) + 1, 0, 2^16-1)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT16_TYPE,
                          ARITHMETIC_SATURATE | ARITHMETIC_UNSIGNED);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1857,7 +1883,9 @@ int InstrEmit_vsubuws(PPCHIRBuilder& f, const InstrData& i) {
   // (VD) <- clamp(EXTZ(VA) + ¬EXTZ(VB) + 1, 0, 2^32-1)
   Value* v = f.VectorSub(f.LoadVR(i.VX.VA), f.LoadVR(i.VX.VB), INT32_TYPE,
                          ARITHMETIC_SATURATE | ARITHMETIC_UNSIGNED);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(i.VX.VD, v);
   return 0;
 }
@@ -1977,7 +2005,9 @@ int InstrEmit_vpkshss_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_8_IN_16 | PACK_TYPE_IN_SIGNED |
                         PACK_TYPE_OUT_SIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(vd, v);
   return 0;
 }
@@ -1999,7 +2029,9 @@ int InstrEmit_vpkswss_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_16_IN_32 | PACK_TYPE_IN_SIGNED |
                         PACK_TYPE_OUT_SIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(vd, v);
   return 0;
 }
@@ -2021,7 +2053,9 @@ int InstrEmit_vpkswus_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_16_IN_32 | PACK_TYPE_IN_SIGNED |
                         PACK_TYPE_OUT_UNSIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(vd, v);
   return 0;
 }
@@ -2063,7 +2097,9 @@ int InstrEmit_vpkuhus_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_8_IN_16 | PACK_TYPE_IN_UNSIGNED |
                         PACK_TYPE_OUT_UNSIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(vd, v);
   return 0;
 }
@@ -2085,7 +2121,9 @@ int InstrEmit_vpkshus_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_8_IN_16 | PACK_TYPE_IN_SIGNED |
                         PACK_TYPE_OUT_UNSIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(vd, v);
   return 0;
 }
@@ -2127,7 +2165,9 @@ int InstrEmit_vpkuwus_(PPCHIRBuilder& f, uint32_t vd, uint32_t va,
   Value* v = f.Pack(f.LoadVR(va), f.LoadVR(vb),
                     PACK_TYPE_16_IN_32 | PACK_TYPE_IN_UNSIGNED |
                         PACK_TYPE_OUT_UNSIGNED | PACK_TYPE_OUT_SATURATE);
-  f.StoreSAT(f.DidSaturate(v));
+  if (f.vscr_sat_observable()) {
+    f.StoreSAT(f.DidSaturate(v));
+  }
   f.StoreVR(vd, v);
   return 0;
 }

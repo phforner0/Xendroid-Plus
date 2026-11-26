@@ -2091,20 +2091,29 @@ struct STVL_V128 : Sequence<STVL_V128, I<OPCODE_STVL, VoidOp, I64Op, V128Op>> {
     // the head of the byte-swapped source. That is 16 - offset bytes ending at
     // the block boundary, so it is one contiguous copy.
     int s = SrcVReg(e, i.src2, 0);
-
-    // Stash rev32(src) so its bytes can be addressed individually.
     e.rev32(VReg(0).b16, VReg(s).b16);
-    e.str(QReg(0),
-          ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
 
     // STVL is an X-form vector access; keep skip_physical_skew=false.
     auto addr = ComputeMemoryAddress(e, i.src1, /*skip_physical_skew=*/false);
     e.add(e.x0, e.GetMembaseReg(), addr);
+
+    auto& unaligned = e.NewCachedLabel();
+    auto& done = e.NewCachedLabel();
+    e.tst(e.x0, 0xF);
+    e.b(Xbyak_aarch64::NE, unaligned);
+    e.str(QReg(0), ptr(e.x0));
+    e.b(done);
+
+    e.L(unaligned);
+    // Stash rev32(src) so its bytes can be addressed individually.
+    e.str(QReg(0),
+          ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
     e.and_(e.w2, e.w0, 0xF);
     e.mov(e.w1, 16);
     e.sub(e.w2, e.w1, e.w2);
     e.add(e.x1, e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH));
     EmitPartialVectorStore(e, e.x0, e.x1, e.w2);
+    e.L(done);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_STVL, STVL_V128);
@@ -2117,20 +2126,24 @@ struct STVR_V128 : Sequence<STVR_V128, I<OPCODE_STVR, VoidOp, I64Op, V128Op>> {
     // Store bytes 0..offset-1 of the block from the tail of the byte-swapped
     // source, again contiguous. offset == 0 stores nothing, which matters:
     // memcpy tails use stvrx on an address that can sit one past a valid page.
-    int s = SrcVReg(e, i.src2, 0);
-
-    e.rev32(VReg(0).b16, VReg(s).b16);
-    e.str(QReg(0),
-          ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
-
     // STVR is an X-form vector access; keep skip_physical_skew=false.
     auto addr = ComputeMemoryAddress(e, i.src1, /*skip_physical_skew=*/false);
     e.add(e.x0, e.GetMembaseReg(), addr);
+
+    auto& done = e.NewCachedLabel();
+    e.tst(e.x0, 0xF);
+    e.b(Xbyak_aarch64::EQ, done);
+
+    int s = SrcVReg(e, i.src2, 0);
+    e.rev32(VReg(0).b16, VReg(s).b16);
+    e.str(QReg(0),
+          ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
     e.and_(e.w2, e.w0, 0xF);
     e.and_(e.x0, e.x0, ~0xFull);
     e.add(e.x1, e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH) + 16);
     e.sub(e.x1, e.x1, e.x2);
     EmitPartialVectorStore(e, e.x0, e.x1, e.w2);
+    e.L(done);
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_STVR, STVR_V128);

@@ -76,6 +76,7 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   void StoreCA(Value* value);
   Value* LoadSAT();
   void StoreSAT(Value* value);
+  bool vscr_sat_observable() const { return vscr_sat_observable_; }
 
   Value* LoadGPR(uint32_t reg);
   void StoreGPR(uint32_t reg, Value* value);
@@ -99,6 +100,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
 
   // Reset each Emit:
   bool with_debug_info_;
+  bool track_fpscr_status_ = false;
+  bool vscr_sat_observable_ = true;
   GuestFunction* function_;
   uint64_t start_address_;
   uint64_t instr_count_;

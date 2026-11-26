@@ -198,6 +198,166 @@ void pulse_event_releases_only_current_waiters() {
   }
 }
 
+// SignalAndWaitOn (enqueue-before-signal): under auto-reset handoff, the waiter
+// must already be queued on `wait_on` before `to_signal` wakes the peer, so the
+// peer's immediate Set/Pulse cannot race ahead and get lost or stolen.
+void signal_and_wait_handoff_enqueue_before_signal() {
+  using xe::threading::Event;
+  using xe::threading::WaitResult;
+
+  xe::threading::SetAutoResetEventHandoff(true);
+  auto req = Event::CreateAutoResetEvent(false);
+  auto ack = Event::CreateAutoResetEvent(false);
+  auto aux = Event::CreateAutoResetEvent(false);
+  std::atomic<bool> stop{false};
+  std::atomic<int> peer_rounds{0};
+  std::atomic<int> multi_steals{0};
+
+  // Competing WaitAny observer on `ack` + `aux` exercises multi-wait interaction.
+  std::thread multi_observer([&] {
+    while (!stop.load(std::memory_order_acquire)) {
+      auto res = xe::threading::WaitAny({ack.get(), aux.get()}, false, 1ms);
+      if (res.first == WaitResult::kSuccess && res.second == 0) {
+        multi_steals.fetch_add(1, std::memory_order_relaxed);
+        // Hand it back so the main loop does not stall if a race ever occurred.
+        ack->Set();
+      }
+    }
+  });
+
+  // Peer waits on `req` and immediately responds on `ack` (alternating Set and
+  // Pulse to verify ScopedParked + FIFO release).
+  constexpr int kRounds = 400;
+  std::thread peer([&] {
+    for (int i = 0; i < kRounds; ++i) {
+      if (xe::threading::Wait(req.get(), false, 2s) != WaitResult::kSuccess) {
+        return;
+      }
+      if ((i & 3) == 3) {
+        ack->Pulse();
+      } else {
+        ack->Set();
+      }
+      peer_rounds.fetch_add(1, std::memory_order_release);
+    }
+  });
+
+  int main_ok = 0;
+  for (int i = 0; i < kRounds; ++i) {
+    auto res = xe::threading::SignalAndWait(req.get(), ack.get(), false, 2s);
+    if (res == WaitResult::kSuccess) {
+      ++main_ok;
+    } else {
+      break;
+    }
+  }
+
+  stop.store(true, std::memory_order_release);
+  aux->Set();
+  peer.join();
+  multi_observer.join();
+  xe::threading::SetAutoResetEventHandoff(false);
+
+  check(main_ok == kRounds && peer_rounds.load() == kRounds,
+        "SignalAndWait handoff lost a wakeup under enqueue-before-signal");
+  check(multi_steals.load() == 0,
+        "WaitAny stole a token from a SignalAndWait queued waiter");
+}
+
+// SignalAndWaitOn failure & same-object safety: if to_signal->Signal() fails
+// (e.g. semaphore at max count), SignalAndWait must return kFailed and must not
+// drop a pre-existing or concurrently delivered token on the waited event.
+void signal_and_wait_rollback_and_self_signal() {
+  using xe::threading::Event;
+  using xe::threading::Semaphore;
+  using xe::threading::WaitResult;
+
+  for (bool handoff : {false, true}) {
+    xe::threading::SetAutoResetEventHandoff(handoff);
+    auto full_sem = Semaphore::Create(1, 1);
+    auto evt = Event::CreateAutoResetEvent(true);
+    check(xe::threading::SignalAndWait(full_sem.get(), evt.get(), false,
+                                       50ms) == WaitResult::kFailed,
+          "SignalAndWait did not fail when to_signal->Signal() failed");
+    // The pre-existing token on `evt` must remain intact.
+    check(xe::threading::Wait(evt.get(), false, 0ms) == WaitResult::kSuccess,
+          "failed SignalAndWait consumed or lost the event token");
+
+    // Self-signal (same object) must not deadlock.
+    auto self_evt = Event::CreateAutoResetEvent(false);
+    check(xe::threading::SignalAndWait(self_evt.get(), self_evt.get(), false,
+                                       500ms) == WaitResult::kSuccess,
+          "SignalAndWait on the same event failed or deadlocked");
+  }
+  xe::threading::SetAutoResetEventHandoff(false);
+}
+
+// Thread lifetime safety: destroying the Thread handle from inside the start
+// routine just before returning normally (simulating XThread ReleaseHandle ->
+// ~XThread -> thread_.reset()) must not UAF in ThreadStartRoutine, and
+// Thread::Exit() must signal cleanly without leaking or crashing.
+void thread_lifetime_normal_return_and_exit() {
+  using xe::threading::WaitResult;
+  Thread::CreationParameters params = {};
+
+  // 1. Normal return after the owning unique_ptr<Thread> is reset inside the
+  //    worker routine itself (exact UAF trigger of ThreadStartRoutine).
+  for (int i = 0; i < 64; ++i) {
+    std::atomic<bool> ready{false};
+    std::atomic<bool> destroyed{false};
+    std::unique_ptr<Thread> holder;
+    holder = Thread::Create(params, [&] {
+      while (!ready.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      holder.reset();
+      destroyed.store(true, std::memory_order_release);
+    });
+    check(holder != nullptr, "Thread::Create failed in self-destroy test");
+    ready.store(true, std::memory_order_release);
+    for (int spin = 0; spin < 2000 && !destroyed.load(std::memory_order_acquire);
+         ++spin) {
+      std::this_thread::sleep_for(1ms);
+    }
+    check(destroyed.load(std::memory_order_acquire),
+          "self-destroying thread did not run to completion");
+    // Give ThreadStartRoutine time to execute post-start_routine signaling.
+    std::this_thread::sleep_for(2ms);
+  }
+
+  // 2. Explicit Thread::Exit() path (pthread_exit) waited on by caller.
+  for (int i = 0; i < 64; ++i) {
+    auto t = Thread::Create(params, [] { Thread::Exit(0); });
+    check(t != nullptr, "Thread::Create failed in Thread::Exit test");
+    check(xe::threading::Wait(t.get(), false, 2s) == WaitResult::kSuccess,
+          "Thread::Exit thread did not signal completion");
+  }
+
+  // 3. Fire-and-forget parent destruction racing with ThreadStartRoutine
+  //    startup (must not UAF on PosixThread* before or during Thread::Exit).
+  std::atomic<int> detached_done{0};
+  constexpr int kDetachedCount = 64;
+  for (int i = 0; i < kDetachedCount; ++i) {
+    const bool use_exit = (i & 1) != 0;
+    auto t = Thread::Create(params, [&, use_exit] {
+      detached_done.fetch_add(1, std::memory_order_release);
+      if (use_exit) {
+        Thread::Exit(0);
+      }
+    });
+    check(t != nullptr, "Thread::Create failed in fire-and-forget test");
+    t.reset();  // Destroy PosixThread immediately while child is starting.
+  }
+  for (int spin = 0;
+       spin < 5000 && detached_done.load(std::memory_order_acquire) < kDetachedCount;
+       ++spin) {
+    std::this_thread::sleep_for(1ms);
+  }
+  check(detached_done.load(std::memory_order_acquire) == kDetachedCount,
+        "fire-and-forget threads did not all complete cleanly");
+  std::this_thread::sleep_for(10ms);
+}
+
 }  // namespace
 
 int main() {
@@ -205,6 +365,9 @@ int main() {
   concurrent_callbacks_stay_on_their_targets();
   repeated_handle_waits_end();
   pulse_event_releases_only_current_waiters();
+  signal_and_wait_handoff_enqueue_before_signal();
+  signal_and_wait_rollback_and_self_signal();
+  thread_lifetime_normal_return_and_exit();
   if (failures) {
     std::fprintf(stderr, "threading_apc_test: %d failure(s)\n", failures);
     return 1;

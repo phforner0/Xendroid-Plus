@@ -2923,6 +2923,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
         [this]() { on_shader_storage_initialization(false); });
   }
 
+  if (processor_) {
+    processor_->BeginVscrSatCensus();
+  }
   auto main_thread = kernel_state_->LaunchModule(module);
   if (!main_thread) {
     return X_STATUS_UNSUCCESSFUL;
@@ -2939,6 +2942,11 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
       plugin_loader_->LoadTitlePlugins(title_id_.value(),
                                        module->hash().value());
     }
+  }
+
+  // After patches and plugins, before precompilation and .jprof warmup.
+  if (processor_) {
+    processor_->FinishVscrSatCensus();
   }
 
   // After plugins, which patch code in place.

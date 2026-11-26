@@ -18,20 +18,25 @@
 namespace xe {
 
 uint64_t Clock::host_tick_frequency_platform() {
+  static const uint64_t cached_freq = []() -> uint64_t {
 #ifdef __APPLE__
-  mach_timebase_info_data_t info;
-  mach_timebase_info(&info);
-  return (uint64_t)((1000000000ull * (uint64_t)info.denom) /
-                    (uint64_t)info.numer);
+    mach_timebase_info_data_t info;
+    mach_timebase_info(&info);
+    return (uint64_t)((1000000000ull * (uint64_t)info.denom) /
+                      (uint64_t)info.numer);
 #else
-  timespec res;
-  int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
-  assert_zero(error);
-  assert_zero(res.tv_sec);  // Sub second resolution is required.
+    timespec res;
+    int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
+    assert_zero(error);
+    assert_zero(res.tv_sec);  // Sub second resolution is required.
 
-  // Convert nano seconds to hertz. Resolution is 1ns on most systems.
-  return 1000000000ull / res.tv_nsec;
+    // Convert nano seconds to hertz. Resolution is 1ns on most systems.
+    return (error == 0 && res.tv_sec == 0 && res.tv_nsec > 0)
+               ? (1000000000ull / static_cast<uint64_t>(res.tv_nsec))
+               : 1000000000ull;
 #endif
+  }();
+  return cached_freq;
 }
 
 uint64_t Clock::host_tick_count_platform() {
@@ -63,13 +68,18 @@ uint64_t Clock::QueryHostSystemTime() {
       now.tv_usec * 10);
 }
 
-// Split the division: ticks * units overflows uint64 in ~31 min at 100 ns.
+// Avoid 64-bit overflow: ticks * units overflows uint64 in ~31 min at 100 ns.
 static uint64_t TicksTo(uint64_t ticks, uint64_t units) {
   static const uint64_t freq = Clock::host_tick_frequency_platform();
   if (!freq) {
     return 0;
   }
+#if defined(__SIZEOF_INT128__)
+  return static_cast<uint64_t>(
+      (static_cast<unsigned __int128>(ticks) * units) / freq);
+#else
   return (ticks / freq) * units + ((ticks % freq) * units) / freq;
+#endif
 }
 
 uint64_t Clock::QueryHostUptimeMillis() {
