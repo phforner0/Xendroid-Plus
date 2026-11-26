@@ -1010,8 +1010,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       cvars::vulkan_rasterization_order_attachment_access &&
       device_properties.rasterizationOrderColorAttachmentAccess;
   mali_normalize_mixed_load_ops_ =
-      (device_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY ||
-       device_properties.vendorID == 0x13B5) &&
+      IsProprietaryMaliDriver(device_properties.vendorID,
+                              uint32_t(device_properties.driverID)) &&
       (device_properties.maliDriverMajorR <= 0 ||
        device_properties.maliDriverMajorR * 100 +
                device_properties.maliDriverMinorP <

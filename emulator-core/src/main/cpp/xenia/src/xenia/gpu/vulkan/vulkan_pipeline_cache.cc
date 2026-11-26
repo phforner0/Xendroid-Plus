@@ -112,6 +112,15 @@ DEFINE_bool(
     "Vulkan");
 
 DEFINE_bool(
+    vulkan_async_pipeline_bind_on_replay, false,
+    "With asynchronous shader compilation (deferred-bind mode): translate "
+    "shaders eagerly so the real pipeline layout is known, and move cold "
+    "VkPipeline wait/resolution from IssueDraw to DeferredCommandBuffer::Execute "
+    "so creation threads compile a submission's pipelines in parallel instead of "
+    "serializing per draw. Default false for thermal ABBA validation.",
+    "Vulkan");
+
+DEFINE_bool(
     vulkan_placeholder_pipelines, false,
     "Asynchronous shader compilation async model (A/B). Default false: the "
     "fork's deferred-bind model - no placeholder is created, the pipeline slot "
@@ -600,6 +609,9 @@ bool VulkanPipelineCache::Initialize() {
     XELOGW("VulkanPipelineCache: Failed to create pipeline cache");
     vk_pipeline_cache_ = VK_NULL_HANDLE;
   }
+  vk_merge_pipeline_caches_ = reinterpret_cast<PFN_vkMergePipelineCaches>(
+      vulkan_device->vulkan_instance()->functions().vkGetDeviceProcAddr(
+          vulkan_device->device(), "vkMergePipelineCaches"));
 
   uint32_t logical_processor_count = xe::threading::logical_processor_count();
   if (!logical_processor_count) {
@@ -719,6 +731,7 @@ void VulkanPipelineCache::Shutdown() {
     dfn.vkDestroyPipelineCache(device, vk_pipeline_cache_, nullptr);
     vk_pipeline_cache_ = VK_NULL_HANDLE;
   }
+  vk_merge_pipeline_caches_ = nullptr;
 
   // Destroy all internal shaders.
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
@@ -1223,6 +1236,28 @@ bool VulkanPipelineCache::ConfigurePipeline(
     bool use_async =
         cvars::async_shader_compilation && !creation_threads_.empty();
     if (use_async) {
+      if (cvars::vulkan_async_pipeline_bind_on_replay &&
+          !layout_counts_complete) {
+        if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
+          pipeline_pair.second.creation_failed.store(true,
+                                                     std::memory_order_release);
+          return false;
+        }
+        const PipelineLayoutProvider* real_layout =
+            GetGuestGraphicsPipelineLayout(vertex_shader, pixel_shader,
+                                           &layout_counts_complete);
+        if (!real_layout) {
+          pipeline_pair.second.creation_failed.store(true,
+                                                     std::memory_order_release);
+          return false;
+        }
+        pipeline_pair.second.pipeline_layout.store(real_layout,
+                                                   std::memory_order_release);
+        if (layout_counts_complete) {
+          pipeline_pair.second.pipeline_layout_stale.store(
+              false, std::memory_order_release);
+        }
+      }
       // Prioritize pipelines that write to visible render targets so the most
       // noticeable draws come back first.
       if (pixel_shader) {
@@ -1285,7 +1320,7 @@ void VulkanPipelineCache::MaybeSaveVkPipelineCache() {
         now - vk_pipeline_cache_last_save_ms_ >= save_interval_ms) {
       if (vk_pipeline_cache_dirty_.exchange(false, std::memory_order_acq_rel)) {
         vk_pipeline_cache_last_save_ms_ = now;
-        SaveVkPipelineCache();
+        SaveVkPipelineCacheAsync();
       }
     }
   }
@@ -1557,6 +1592,35 @@ bool VulkanPipelineCache::WaitForPipeline(Pipeline* pipeline,
                 creation_queue_.empty());
       });
   return real_pipeline_ready();
+}
+
+VkPipeline VulkanPipelineCache::ResolvePipelineForReplay(
+    Pipeline* pipeline, uint32_t timeout_ms, bool expedite_on_replay) {
+  if (!pipeline) {
+    return VK_NULL_HANDLE;
+  }
+  auto load_real_pipeline = [pipeline]() -> VkPipeline {
+    const VkPipeline current =
+        pipeline->pipeline.load(std::memory_order_acquire);
+    if (current == VK_NULL_HANDLE ||
+        current ==
+            pipeline->placeholder_pipeline.load(std::memory_order_acquire)) {
+      return VK_NULL_HANDLE;
+    }
+    return current;
+  };
+  if (VkPipeline ready = load_real_pipeline(); ready != VK_NULL_HANDLE) {
+    return ready;
+  }
+  if (pipeline->creation_failed.load(std::memory_order_acquire)) {
+    return VK_NULL_HANDLE;
+  }
+  if (expedite_on_replay) {
+    ExpeditePipeline(pipeline);
+  } else if (timeout_ms > 0) {
+    WaitForPipeline(pipeline, timeout_ms);
+  }
+  return load_real_pipeline();
 }
 
 bool VulkanPipelineCache::CanUseShaderObjects(
@@ -3986,7 +4050,7 @@ void VulkanPipelineCache::InitializeShaderStorage(
         startup_loading_ = false;
         if (vk_pipeline_cache_dirty_.exchange(false,
                                               std::memory_order_acq_rel)) {
-          SaveVkPipelineCache();
+          SaveVkPipelineCacheAsync();
         }
         orig();
       };
@@ -3995,7 +4059,7 @@ void VulkanPipelineCache::InitializeShaderStorage(
         startup_loading_ = false;
         if (vk_pipeline_cache_dirty_.exchange(false,
                                               std::memory_order_acq_rel)) {
-          SaveVkPipelineCache();
+          SaveVkPipelineCacheAsync();
         }
       };
     }
@@ -4089,6 +4153,7 @@ void VulkanPipelineCache::InitializeShaderStorage(
               pipeline_cache_file::kUuidSize);
   vk_pipeline_cache_store_ = std::make_unique<pipeline_cache_file::Store>(
       vk_pipeline_cache_path_, pipeline_cache_identity);
+  vk_pipeline_cache_saved_since_init_.store(false, std::memory_order_relaxed);
   std::string pipeline_cache_load_description;
   std::vector<uint8_t> pipeline_cache_data =
       vk_pipeline_cache_store_->LoadForCreate(pipeline_cache_load_description);
@@ -4323,7 +4388,7 @@ void VulkanPipelineCache::InitializeShaderStorage(
         if ((pipelines_created + 1) % kVkPipelineCachePrecreateSaveBatch == 0 &&
             vk_pipeline_cache_dirty_.exchange(false,
                                               std::memory_order_acq_rel)) {
-          SaveVkPipelineCache();
+          SaveVkPipelineCacheAsync();
         }
       }
 
@@ -4333,7 +4398,7 @@ void VulkanPipelineCache::InitializeShaderStorage(
     if (creation_threads_.empty()) {
       if (vk_pipeline_cache_dirty_.exchange(false,
                                             std::memory_order_acq_rel)) {
-        SaveVkPipelineCache();
+        SaveVkPipelineCacheAsync();
       }
     } else {
       if (blocking) {
@@ -4359,13 +4424,13 @@ void VulkanPipelineCache::InitializeShaderStorage(
                  xe::threading::WaitResult::kTimeout) {
             if (vk_pipeline_cache_dirty_.exchange(false,
                                                   std::memory_order_acq_rel)) {
-              SaveVkPipelineCache();
+              SaveVkPipelineCacheAsync();
             }
           }
         }
         if (vk_pipeline_cache_dirty_.exchange(false,
                                               std::memory_order_acq_rel)) {
-          SaveVkPipelineCache();
+          SaveVkPipelineCacheAsync();
         }
       } else {
         // Non-blocking mode: store callback for later invocation.
@@ -4406,9 +4471,10 @@ void VulkanPipelineCache::InitializeShaderStorage(
   }
 }
 
-void VulkanPipelineCache::SaveVkPipelineCache() {
+void VulkanPipelineCache::SaveVkPipelineCacheFromHandle(
+    VkPipelineCache cache_handle) {
   std::lock_guard<std::mutex> save_lock(vk_pipeline_cache_save_mutex_);
-  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty() ||
+  if (cache_handle == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty() ||
       !vk_pipeline_cache_store_) {
     return;
   }
@@ -4418,17 +4484,21 @@ void VulkanPipelineCache::SaveVkPipelineCache() {
   const VkDevice device = vulkan_device->device();
 
   size_t cache_size = 0;
-  if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
-                                 nullptr) == VK_SUCCESS &&
+  if (dfn.vkGetPipelineCacheData(device, cache_handle, &cache_size, nullptr) ==
+          VK_SUCCESS &&
       cache_size > 0) {
     std::vector<uint8_t> cache_data(cache_size);
-    // If creation threads grew the cache between the two calls the driver
-    // returns VK_INCOMPLETE with partial data: skip this save, a later one runs.
-    if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
+    // If cache_handle is the live cache (fallback when vkMergePipelineCaches
+    // failed), creation threads may grow it between calls and return
+    // VK_INCOMPLETE: skip this save and let a later one run. For a private
+    // merged snapshot cache this never races.
+    if (dfn.vkGetPipelineCacheData(device, cache_handle, &cache_size,
                                    cache_data.data()) == VK_SUCCESS) {
       std::string description;
       if (vk_pipeline_cache_store_->Save(cache_data.data(), cache_size,
                                          description)) {
+        vk_pipeline_cache_saved_since_init_.store(true,
+                                                  std::memory_order_release);
         XELOGI("Saved {} bytes of VkPipelineCache data: {}", cache_size,
                description);
       } else {
@@ -4437,23 +4507,82 @@ void VulkanPipelineCache::SaveVkPipelineCache() {
       }
     }
   } else {
-    XELOGW("VkPipelineCache data unavailable for saving (size {})",
-           cache_size);
+    XELOGW("VkPipelineCache data unavailable for saving (size {})", cache_size);
   }
 }
 
+void VulkanPipelineCache::SaveVkPipelineCacheAsync() {
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) {
+    return;
+  }
+  if (!storage_writer_.is_active()) {
+    SaveVkPipelineCacheSync();
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // Snapshot vk_pipeline_cache_ into a private temporary VkPipelineCache via
+  // vkMergePipelineCaches so vkGetPipelineCacheData + disk I/O run off the
+  // command thread on storage_writer_'s low-priority WriteThread without
+  // racing creation threads (VK_INCOMPLETE).
+  VkPipelineCache snapshot_cache = VK_NULL_HANDLE;
+  if (vk_merge_pipeline_caches_ != nullptr) {
+    VkPipelineCacheCreateInfo cache_ci = {};
+    cache_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    if (dfn.vkCreatePipelineCache(device, &cache_ci, nullptr,
+                                  &snapshot_cache) == VK_SUCCESS) {
+      if (vk_merge_pipeline_caches_(device, snapshot_cache, 1,
+                                    &vk_pipeline_cache_) == VK_SUCCESS) {
+        const PFN_vkDestroyPipelineCache destroy_pipeline_cache =
+            dfn.vkDestroyPipelineCache;
+        storage_writer_.QueuePipelineCacheSave(
+            [this, device, destroy_pipeline_cache, snapshot_cache](bool execute) {
+              if (execute) {
+                SaveVkPipelineCacheFromHandle(snapshot_cache);
+              }
+              destroy_pipeline_cache(device, snapshot_cache, nullptr);
+            });
+        return;
+      }
+      dfn.vkDestroyPipelineCache(device, snapshot_cache, nullptr);
+      snapshot_cache = VK_NULL_HANDLE;
+    }
+  }
+
+  // Fallback if creating/merging a snapshot cache failed: still offload
+  // serialization + I/O onto storage_writer_ rather than blocking EndSubmission.
+  storage_writer_.QueuePipelineCacheSave([this](bool execute) {
+    if (execute) {
+      SaveVkPipelineCacheFromHandle(vk_pipeline_cache_);
+    }
+  });
+}
+
+void VulkanPipelineCache::SaveVkPipelineCacheSync() {
+  SaveVkPipelineCacheFromHandle(vk_pipeline_cache_);
+}
+
 void VulkanPipelineCache::ShutdownShaderStorage() {
-  // Save VkPipelineCache to disk before shutting down storage.
-  SaveVkPipelineCache();
+  // Drain any queued/in-flight async VkPipelineCache save and flush storage
+  // files BEFORE tearing down vk_pipeline_cache_store_ or vk_pipeline_cache_.
+  storage_writer_.ShutdownShaderStorage();
+
+  // Persist any final dirty delta (or initial save if none ran yet).
+  if (vk_pipeline_cache_dirty_.exchange(false, std::memory_order_acq_rel) ||
+      !vk_pipeline_cache_saved_since_init_.load(std::memory_order_acquire)) {
+    SaveVkPipelineCacheSync();
+  }
   {
     std::lock_guard<std::mutex> save_lock(vk_pipeline_cache_save_mutex_);
     vk_pipeline_cache_path_.clear();
     vk_pipeline_cache_store_.reset();
     vk_pipeline_cache_dirty_.store(false, std::memory_order_relaxed);
+    vk_pipeline_cache_saved_since_init_.store(false, std::memory_order_relaxed);
   }
 
-  // Shut down the storage writer (closes files, stops write thread).
-  storage_writer_.ShutdownShaderStorage();
   shader_storage_file_flush_needed_ = false;
   pipeline_storage_file_flush_needed_ = false;
   shader_storage_title_id_ = 0;

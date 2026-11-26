@@ -92,6 +92,9 @@ class VulkanSharedMemory : public SharedMemory {
   }
 
   VkBuffer buffer() const { return buffer_; }
+  VkDeviceAddress buffer_device_address() const {
+    return buffer_device_address_;
+  }
 
   // Notes a range written by an in-pass draw without inserting a barrier at
   // the write point - ordering happens at the next Use().
@@ -166,6 +169,7 @@ class VulkanSharedMemory : public SharedMemory {
   void TryInitializeHostBuffer();
 
   VkBuffer buffer_ = VK_NULL_HANDLE;
+  VkDeviceAddress buffer_device_address_ = 0;
   uint32_t buffer_memory_type_;
   // Single for non-sparse, every allocation so far for sparse.
   std::vector<VkDeviceMemory> buffer_memory_;

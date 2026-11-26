@@ -24,6 +24,7 @@
 DECLARE_bool(gpu_allow_invalid_upload_range);
 DECLARE_bool(memexport_enable);
 DECLARE_bool(shared_memory_zero_copy);
+DECLARE_bool(vulkan_shared_memory_bda);
 DECLARE_string(readback_resolve);
 
 DEFINE_bool(vulkan_sparse_shared_memory, true,
@@ -141,6 +142,8 @@ bool VulkanSharedMemory::Initialize() {
         "Shared memory: sparse binding disabled so the buffer can be "
         "host-mapped for resolve/memexport readback");
   }
+  buffer_device_address_ = 0;
+  bool buffer_has_bda = false;
   if (cvars::vulkan_sparse_shared_memory && !needs_host_mapping &&
       vulkan_device->properties().sparseResidencyBuffer) {
     for (int bda_attempt = 0;
@@ -171,6 +174,7 @@ bool VulkanSharedMemory::Initialize() {
                 std::max(allocation_size_log2,
                          std::max(kHostGpuMemoryOptimalSparseAllocationLog2,
                                   kBufferSizeLog2 - uint32_t(10))));
+            buffer_has_bda = try_bda;
           } else {
             // Shouldn't happen on any real platform, but no point allocating
             // the buffer sparsely.
@@ -361,6 +365,7 @@ bool VulkanSharedMemory::Initialize() {
         return false;
       }
       buffer_memory_.push_back(buffer_memory);
+      buffer_has_bda = try_bda;
       break;
     }
 
@@ -381,6 +386,21 @@ bool VulkanSharedMemory::Initialize() {
             "Shared memory: failed to map the host-visible buffer; direct "
             "readback (uma) disabled");
       }
+    }
+  }
+
+  // Cache the static VkDeviceAddress once at initialization when BDA is active
+  // so IssueDraw doesn't query vkGetBufferDeviceAddress every draw.
+  if (buffer_ != VK_NULL_HANDLE && buffer_has_bda &&
+      cvars::vulkan_shared_memory_bda && !zero_copy_) {
+    VkBufferDeviceAddressInfo bda_info = {};
+    bda_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    bda_info.buffer = buffer_;
+    if (dfn.vkGetBufferDeviceAddress) {
+      buffer_device_address_ = dfn.vkGetBufferDeviceAddress(device, &bda_info);
+    } else if (dfn.vkGetBufferDeviceAddressKHR) {
+      buffer_device_address_ =
+          dfn.vkGetBufferDeviceAddressKHR(device, &bda_info);
     }
   }
 
@@ -640,6 +660,7 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   }
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, buffer_);
+  buffer_device_address_ = 0;
   for (VkDeviceMemory memory : buffer_memory_) {
     dfn.vkFreeMemory(device, memory, nullptr);
   }

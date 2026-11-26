@@ -83,6 +83,7 @@ DECLARE_bool(texture_integer_num_format);
 DECLARE_bool(vulkan_direct_host_resolve);
 DECLARE_bool(vulkan_async_skip_draws);
 DECLARE_bool(vulkan_async_wait_persistent_draws);
+DECLARE_bool(vulkan_async_pipeline_bind_on_replay);
 DECLARE_bool(vulkan_depth_clamp_without_depth);
 DECLARE_bool(apu_adaptive_queue);
 DECLARE_bool(merge_tiling_bands);
@@ -135,6 +136,13 @@ DEFINE_bool(
     "Shrink each Vulkan render pass renderArea to the bounding box of its "
     "draws' scissor and viewport intersections, avoiding unnecessary tile "
     "binning and GMEM/tile-buffer loads and stores on mobile tilers.",
+    "Vulkan");
+
+DEFINE_bool(
+    vulkan_tight_render_area_turnip, false,
+    "Allow vulkan_tight_render_area to shrink render passes on Mesa Turnip. "
+    "Off by default because renderArea shrinking was refuted on Turnip "
+    "(see render_area_dirty_extent); toggle for reversible ABBA validation.",
     "Vulkan");
 
 DEFINE_bool(
@@ -826,6 +834,15 @@ void PollDebugPropertyOverrides(CommandProcessor& command_processor) {
   PollDebugPropertyOverride("debug.xendroid.auto_vrs_thermal",
                             "vulkan_auto_vrs_thermal",
                             cvars::vulkan_auto_vrs_thermal);
+  PollDebugPropertyOverride("debug.xendroid.async_bind_on_replay",
+                            "vulkan_async_pipeline_bind_on_replay",
+                            cvars::vulkan_async_pipeline_bind_on_replay);
+  PollDebugPropertyOverride("debug.xendroid.tight_render_area",
+                            "vulkan_tight_render_area",
+                            cvars::vulkan_tight_render_area);
+  PollDebugPropertyOverride("debug.xendroid.tight_render_area_turnip",
+                            "vulkan_tight_render_area_turnip",
+                            cvars::vulkan_tight_render_area_turnip);
   // Draws per mid-frame submission (0 = one submission per frame), read per
   // draw.
   char submit_value[PROP_VALUE_MAX] = {};
@@ -6241,7 +6258,11 @@ void VulkanCommandProcessor::EndRenderPass() {
   // range for its pitch (a 2-tile-wide one is 8192 rows tall), and on a tiler
   // the render area drives tile binning and GMEM load/store - not just
   // clipping - so the unshrunk area costs far more than the draws do.
-  if (cvars::vulkan_tight_render_area || cvars::render_area_dirty_extent) {
+  const bool is_turnip = GetVulkanDevice()->properties().driverID ==
+                         VK_DRIVER_ID_MESA_TURNIP;
+  if (ShouldShrinkRenderArea(cvars::vulkan_tight_render_area,
+                             cvars::vulkan_tight_render_area_turnip,
+                             cvars::render_area_dirty_extent, is_turnip)) {
     // Rounded up to a coarse bin-friendly quantum rather than the exact
     // vkGetRenderAreaGranularity: a non-aligned render area is legal, the
     // alignment only helps the driver's binning, and the win here is 8192 rows
@@ -7091,6 +7112,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // it. Re-reading bindings_ready() later would claim binding counts for a
   // stage whose sampler vector was collected as empty.
   bool stage_bindings_ready[2] = {false, false};
+  const bool bind_on_replay =
+      cvars::vulkan_async_pipeline_bind_on_replay &&
+      !cvars::vulkan_placeholder_pipelines;
   for (uint32_t i = 0; i < 2; ++i) {
     if (!BeginSubmission(true)) {
       return false;
@@ -7205,9 +7229,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                           async_available && !use_interpreter &&
                           !vertex_shader_translation->is_translated();
     // The draw thread translates only for a no-placeholder draw that isn't
-    // being skipped (so it can render via a real-VS placeholder).
+    // being skipped (so it can render via a real-VS placeholder), or when
+    // vulkan_async_pipeline_bind_on_replay is active so the real pipeline
+    // layout and sampler bindings are known before deferring VkPipeline bind
+    // to replay.
     bool translate_here =
-        !async_available || (no_placeholder && !cvars::async_shader_skip_draws);
+        !async_available || bind_on_replay ||
+        (no_placeholder && !cvars::async_shader_skip_draws);
     if (translate_here) {
       if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
                                                     pixel_shader_translation)) {
@@ -7621,6 +7649,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     return issued;
   };
   VkPipeline current_pipeline = VK_NULL_HANDLE;
+  uint32_t replay_wait_ms = 0;
+  bool replay_expedite_pipeline = false;
   bool configured_placeholder_bound = false;
   bool placeholder_writes_no_color = false;
   if (!memexport_only_compute && !using_shader_objects) {
@@ -7637,6 +7667,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           (pixel_shader && !stage_bindings_ready[1])) {
         if (!memexport_ranges_.empty()) {
           pipeline_wait_reason = "memexport";
+        } else if (bind_on_replay) {
+          if (cvars::vulkan_async_wait_persistent_draws &&
+              (render_target_cache_->IsLastUpdateDrawTargetSmall() ||
+               (!draw_target_recurring && !vertex_shader_drawn))) {
+            replay_expedite_pipeline = true;
+          }
         } else if (configured_pipeline == VK_NULL_HANDLE &&
                    !cvars::vulkan_async_skip_draws) {
           pipeline_wait_reason = "async skip draws disabled";
@@ -7684,21 +7720,28 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         current_pipeline ==
             pipeline->placeholder_pipeline.load(std::memory_order_acquire);
     // Bounded wait (default 16 ms, XDroid360 33623e916) on color-writing draws
-    // before dropping or rendering a colorless placeholder.
+    // before dropping or rendering a colorless placeholder. When
+    // vulkan_async_pipeline_bind_on_replay is active, move this wait to replay
+    // (DeferredCommandBuffer::Execute) so creation threads compile a
+    // submission's cold PSOs in parallel instead of serializing per draw.
     if (!issue_draw_pipeline_retry_ &&
         !pipeline->creation_failed.load(std::memory_order_acquire) &&
         cvars::vulkan_async_color_wait_ms > 0 && pixel_shader &&
         normalized_color_mask != 0 &&
         (current_pipeline == VK_NULL_HANDLE || configured_placeholder_bound)) {
-      if (pipeline_cache_->WaitForPipeline(pipeline,
-                                           cvars::vulkan_async_color_wait_ms)) {
-        return issue_draw_again();
+      if (bind_on_replay) {
+        replay_wait_ms = cvars::vulkan_async_color_wait_ms;
+      } else {
+        if (pipeline_cache_->WaitForPipeline(
+                pipeline, cvars::vulkan_async_color_wait_ms)) {
+          return issue_draw_again();
+        }
+        current_pipeline = pipeline->pipeline.load(std::memory_order_acquire);
+        configured_placeholder_bound =
+            current_pipeline != VK_NULL_HANDLE &&
+            current_pipeline ==
+                pipeline->placeholder_pipeline.load(std::memory_order_acquire);
       }
-      current_pipeline = pipeline->pipeline.load(std::memory_order_acquire);
-      configured_placeholder_bound =
-          current_pipeline != VK_NULL_HANDLE &&
-          current_pipeline ==
-              pipeline->placeholder_pipeline.load(std::memory_order_acquire);
     }
     if (!issue_draw_pipeline_retry_ && current_pipeline != VK_NULL_HANDLE &&
         !configured_placeholder_bound &&
@@ -7709,11 +7752,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     placeholder_writes_no_color =
         configured_placeholder_bound &&
         !pipeline->placeholder_writes_color.load(std::memory_order_relaxed);
-    // Both placeholder mode and deferred-bind mode capture current_pipeline by
-    // value (ArgsVkBindPipelineDeferred drops VK_NULL_HANDLE at replay). Skip
-    // unready draws before uploading textures, entering render passes, or
-    // validating descriptor binding counts against an interim (0t/0s) layout.
-    if (current_pipeline == VK_NULL_HANDLE) {
+    // In legacy mode (bind_on_replay == false), capture current_pipeline by
+    // value and skip unready draws before uploading textures or entering passes.
+    // When bind_on_replay is enabled and creation hasn't failed, record the
+    // draw with the real layout so DeferredCommandBuffer::Execute can resolve
+    // (or safely drop) the pipeline at replay time.
+    if (current_pipeline == VK_NULL_HANDLE &&
+        (!bind_on_replay ||
+         pipeline->creation_failed.load(std::memory_order_acquire))) {
       XELOGI("Draw skipped (pipeline not ready yet): VS {:016X}, PS {:016X}",
              vertex_shader->ucode_data_hash(),
              pixel_shader ? pixel_shader->ucode_data_hash() : 0);
@@ -7905,11 +7951,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           static_cast<const PipelineLayout*>(shader_object_config.pipeline_layout));
       return;
     }
+    const bool defer_bind_to_replay =
+        bind_on_replay && current_pipeline == VK_NULL_HANDLE;
     if (current_shader_objects_bound_ ||
         current_guest_graphics_pipeline_ != &pipeline->pipeline ||
-        current_guest_graphics_pipeline_handle_ != current_pipeline) {
+        ((!bind_on_replay ||
+          current_guest_graphics_pipeline_handle_ != VK_NULL_HANDLE) &&
+         current_guest_graphics_pipeline_handle_ != current_pipeline)) {
       deferred_command_buffer_.CmdVkBindPipelineDeferred(
-          VK_PIPELINE_BIND_POINT_GRAPHICS, current_pipeline);
+          VK_PIPELINE_BIND_POINT_GRAPHICS, current_pipeline,
+          defer_bind_to_replay ? pipeline : nullptr,
+          defer_bind_to_replay ? replay_wait_ms : 0,
+          defer_bind_to_replay ? replay_expedite_pipeline : false);
       current_guest_graphics_pipeline_ = &pipeline->pipeline;
       current_guest_graphics_pipeline_handle_ = current_pipeline;
       current_external_graphics_pipeline_ = VK_NULL_HANDLE;
@@ -8041,8 +8094,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       using_shader_objects ? shader_object_config.dynamic_state
                            : (pipeline ? pipeline->dynamic_state
                                        : shader_object_config.dynamic_state);
+  const bool is_turnip =
+      device_properties.driverID == VK_DRIVER_ID_MESA_TURNIP;
   deferred_command_buffer_.SetViewportClipEnabled(
-      cvars::vulkan_tight_render_area &&
+      ShouldShrinkRenderArea(cvars::vulkan_tight_render_area,
+                             cvars::vulkan_tight_render_area_turnip,
+                             cvars::render_area_dirty_extent, is_turnip) &&
       !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable);
   if (!memexport_only_compute) {
     // Update dynamic graphics pipeline state.
@@ -8076,6 +8133,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
 
   bool bound_is_placeholder =
       !memexport_only_compute && !using_shader_objects &&
+      current_pipeline != VK_NULL_HANDLE &&
       current_pipeline ==
           pipeline->placeholder_pipeline.load(std::memory_order_acquire);
   bool interpreter_placeholder =
@@ -8143,27 +8201,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           ~(UINT32_C(1)
             << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram);
     }
-    // Populate VK_KHR_buffer_device_address base pointer for shared memory when
-    // enabled and supported by the device. Force shared_memory_->buffer()
-    // (skipping zero-copy imported memory unless dense/sparse BDA buffer is
-    // active).
+    // Populate VK_KHR_buffer_device_address base pointer for shared memory from
+    // the static address cached at VulkanSharedMemory::Initialize().
     uint64_t bda_addr = 0;
     if (use_shared_memory_bda && !shared_memory_->is_zero_copy()) {
-      VkBuffer active_sm_buf = shared_memory_->buffer();
-      if (active_sm_buf != VK_NULL_HANDLE) {
-        const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
-        VkBufferDeviceAddressInfo bda_info = {};
-        bda_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-        bda_info.buffer = active_sm_buf;
-        const auto& dfn = vulkan_device->functions();
-        if (dfn.vkGetBufferDeviceAddress) {
-          bda_addr = dfn.vkGetBufferDeviceAddress(vulkan_device->device(),
-                                                  &bda_info);
-        } else if (dfn.vkGetBufferDeviceAddressKHR) {
-          bda_addr = dfn.vkGetBufferDeviceAddressKHR(vulkan_device->device(),
-                                                     &bda_info);
-        }
-      }
+      bda_addr = shared_memory_->buffer_device_address();
     }
     const uint32_t bda_lo = uint32_t(bda_addr);
     const uint32_t bda_hi = uint32_t(bda_addr >> 32);
@@ -11361,7 +11403,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
           0, nullptr);
     }
     const uint64_t replay_begin_ns = FrameStatsBegin();
-    deferred_command_buffer_.Execute(command_buffer.buffer);
+    deferred_command_buffer_.Execute(command_buffer.buffer,
+                                     pipeline_cache_.get());
 
     // Record ZPD resolves before submitting.
     if (zpd_host_query_pool_) {

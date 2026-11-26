@@ -275,6 +275,11 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // solid-color / visible-RT draws before dropping or standing in (adapted from
   // XDroid360 33623e916, BSD-3-Clause).
   bool WaitForPipeline(Pipeline* pipeline, uint32_t timeout_ms);
+  // Resolves a deferred pipeline slot at DeferredCommandBuffer::Execute() time.
+  // Returns VK_NULL_HANDLE if creation failed or did not finish within the
+  // bounded wait so replay safely drops the draws.
+  VkPipeline ResolvePipelineForReplay(Pipeline* pipeline, uint32_t timeout_ms,
+                                      bool expedite_on_replay);
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type,
                            const uint32_t* host_address, uint32_t dword_count);
@@ -819,6 +824,7 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
 
   // Vulkan pipeline cache for faster pipeline creation.
   VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
+  PFN_vkMergePipelineCaches vk_merge_pipeline_caches_ = nullptr;
 
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher>
       pipelines_;
@@ -882,13 +888,15 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // Verified, size-bounded, atomically replaced file per driver identity (see
   // vulkan_pipeline_cache_file.h). Set while vk_pipeline_cache_path_ is.
   std::unique_ptr<pipeline_cache_file::Store> vk_pipeline_cache_store_;
-  // Serializes SaveVkPipelineCache() and store teardown across threads.
+  // Serializes SaveVkPipelineCacheFromHandle() and store teardown across threads.
   std::mutex vk_pipeline_cache_save_mutex_;
-  // Saves vk_pipeline_cache_ to vk_pipeline_cache_path_ (no-op if either is
-  // unset). Safe to call concurrently from the GPU thread or creation threads
-  // (vk_pipeline_cache_ is internally synchronized by the driver, and disk
-  // persistence is serialized by vk_pipeline_cache_save_mutex_).
-  void SaveVkPipelineCache();
+  // Non-blocking snapshot save: merges vk_pipeline_cache_ into a temporary
+  // VkPipelineCache and dispatches vkGetPipelineCacheData + disk I/O onto
+  // storage_writer_'s low-priority WriteThread (coalescing superseded saves).
+  void SaveVkPipelineCacheAsync();
+  // Synchronous fallback / final shutdown persist on the caller thread.
+  void SaveVkPipelineCacheSync();
+  void SaveVkPipelineCacheFromHandle(VkPipelineCache cache_handle);
   // Periodically persist vk_pipeline_cache_ on the GPU thread so the cache
   // survives Android process kills (upstream only saves at clean shutdown,
   // which Android frequently skips when terminating the process).
@@ -896,6 +904,7 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   static constexpr uint64_t kVkPipelineCachePrecreateSaveIntervalMs = 5000;
   static constexpr size_t kVkPipelineCachePrecreateSaveBatch = 256;
   std::atomic<bool> vk_pipeline_cache_dirty_{false};
+  std::atomic<bool> vk_pipeline_cache_saved_since_init_{false};
   uint64_t vk_pipeline_cache_last_save_ms_ = 0;
 };
 
