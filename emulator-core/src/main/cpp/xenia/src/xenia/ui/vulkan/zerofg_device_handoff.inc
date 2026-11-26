@@ -1288,30 +1288,58 @@ void ZeroFGDeviceHandoff::AbortLease(uint32_t index, uint64_t generation) {
 }
 
 bool ZeroFGDeviceHandoff::ReleaseLease(uint32_t index, uint64_t generation) {
-  std::lock_guard<std::mutex> lock(mutex_);
 #if (XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid)
-  if (!pool_) {
-    ++aba_failures_;
-    return false;
+  VkSemaphore b_release = VK_NULL_HANDLE;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!pool_ || index >= kSlotCount) {
+      ++aba_failures_;
+      return false;
+    }
+    auto& s = pool_->slots[index];
+    if (s.generation != generation || s.state != Pool::State::kAcquired) {
+      ++aba_failures_;
+      return false;
+    }
+    // Keep the slot in kAcquired while exporting outside mutex_: Reclaim()
+    // never recycles kAcquired slots, Acquire() runs on the same presenter
+    // thread, and DestroyAfterIdle() only runs after B teardown drains all
+    // leases, so b_release has exclusive ownership across the export ioctl.
+    b_release = s.b_release;
   }
-  auto& s = pool_->slots[index];
-  if (s.generation != generation || s.state != Pool::State::kAcquired) {
-    ++aba_failures_;
-    return false;
+  int exported_fd = -1;
+  const uint64_t begin = HandoffNowNs();
+  const VkResult result = HandoffExport(b_, b_release, exported_fd);
+  const uint64_t elapsed_ns = HandoffNowNs() - begin;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_ns_ += elapsed_ns;
+    if (!pool_ || index >= kSlotCount) {
+      HandoffClose(exported_fd);
+      ++aba_failures_;
+      return false;
+    }
+    auto& s = pool_->slots[index];
+    if (s.generation != generation || s.state != Pool::State::kAcquired) {
+      HandoffClose(exported_fd);
+      ++aba_failures_;
+      return false;
+    }
+    if (result != VK_SUCCESS) {
+      HandoffClose(exported_fd);
+      ++release_failures_;
+      s.state = Pool::State::kPoisoned;
+      Fail("B_release_export", result);
+      return false;
+    }
+    HandoffClose(s.release_fd);
+    s.release_fd = exported_fd;
+    s.state = Pool::State::kReleased;
+    ++released_;
+    return true;
   }
-  uint64_t begin = HandoffNowNs();
-  VkResult result = HandoffExport(b_, s.b_release, s.release_fd);
-  release_ns_ += HandoffNowNs() - begin;
-  if (result != VK_SUCCESS) {
-    ++release_failures_;
-    s.state = Pool::State::kPoisoned;
-    Fail("B_release_export", result);
-    return false;
-  }
-  s.state = Pool::State::kReleased;
-  ++released_;
-  return true;
 #else
+  std::lock_guard<std::mutex> lock(mutex_);
   return false;
 #endif
 }

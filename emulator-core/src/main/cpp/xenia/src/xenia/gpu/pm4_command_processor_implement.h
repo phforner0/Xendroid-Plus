@@ -79,6 +79,284 @@ inline const char* GetEventName(uint32_t event) {
       return "UNKNOWN";
   }
 }
+void COMMAND_PROCESSOR::ReplayCompiledIndirectBuffer(
+    const xe::gpu::pm4_ib::CompiledIndirectBuffer& compiled) XE_RESTRICT {
+  using xe::gpu::pm4_ib::DecodedIbOp;
+  using xe::gpu::pm4_ib::IbOpKind;
+  const uint32_t* const swapped = compiled.swapped_dwords.data();
+  for (const DecodedIbOp& op : compiled.ops) {
+    if (op.predicated && !(bin_select_ & bin_mask_)) {
+      continue;
+    }
+    switch (op.kind) {
+      case IbOpKind::kType0WriteRange: {
+        const uint32_t* values = swapped + op.data_offset;
+        if (!op.one_reg_wr) {
+          COMMAND_PROCESSOR::WriteRegistersHostEndian(op.base_reg, values,
+                                                      op.count);
+        } else {
+          for (uint32_t m = 0; m < op.count; ++m) {
+            COMMAND_PROCESSOR::WriteRegister(op.base_reg, values[m]);
+          }
+        }
+        break;
+      }
+      case IbOpKind::kType1WritePair: {
+        const uint32_t* values = swapped + op.data_offset;
+        COMMAND_PROCESSOR::WriteRegister(op.base_reg, values[0]);
+        COMMAND_PROCESSOR::WriteRegister(op.aux_reg, values[1]);
+        break;
+      }
+      case IbOpKind::kSetConstant: {
+        const uint32_t index = op.arg0 & 0x7FFu;
+        const uint32_t type = (op.arg0 >> 16) & 0xFFu;
+        const uint32_t* values = swapped + op.data_offset;
+        uint32_t reg_base = 0;
+        switch (type) {
+          case 0:  // ALU
+            reg_base = index + 0x4000u;
+            break;
+          case 1:  // FETCH
+            reg_base = index + 0x4800u;
+            break;
+          case 2:  // BOOL
+            reg_base = index + 0x4900u;
+            break;
+          case 3:  // LOOP
+            reg_base = index + 0x4908u;
+            break;
+          case 4:  // REGISTERS
+            reg_base = index + 0x2000u;
+            break;
+          default:
+            continue;
+        }
+        COMMAND_PROCESSOR::WriteRegistersHostEndian(reg_base, values, op.count);
+        break;
+      }
+      case IbOpKind::kSetConstant2: {
+        COMMAND_PROCESSOR::WriteRegistersHostEndian(
+            op.base_reg, swapped + op.data_offset, op.count);
+        break;
+      }
+      case IbOpKind::kLoadAluConstant: {
+        const uint32_t address = op.arg0;
+        const uint32_t offset_type = op.arg1;
+        const uint32_t index = offset_type & 0x7FFu;
+        const uint32_t type = (offset_type >> 16) & 0xFFu;
+        const uint32_t size_dwords = op.arg2;
+        auto* xlat_address =
+            reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(address));
+        switch (type) {
+          case 0:
+            COMMAND_PROCESSOR::WriteALURangeFromMem(index, xlat_address,
+                                                    size_dwords);
+            break;
+          case 1:
+            COMMAND_PROCESSOR::WriteFetchRangeFromMem(index, xlat_address,
+                                                      size_dwords);
+            break;
+          case 2:
+            COMMAND_PROCESSOR::WriteBoolRangeFromMem(index, xlat_address,
+                                                     size_dwords);
+            break;
+          case 3:
+            COMMAND_PROCESSOR::WriteLoopRangeFromMem(index, xlat_address,
+                                                     size_dwords);
+            break;
+          case 4:
+            COMMAND_PROCESSOR::WriteREGISTERSRangeFromMem(index, xlat_address,
+                                                          size_dwords);
+            break;
+          default:
+            break;
+        }
+        break;
+      }
+      case IbOpKind::kImLoad: {
+        const auto shader_type = static_cast<xenos::ShaderType>(op.arg0);
+        const uint32_t addr = op.arg1;
+        const uint32_t size_dwords = op.arg2;
+        const uint32_t* host_shader_ptr =
+            memory_->TranslatePhysical<uint32_t*>(addr);
+        Shader* shader = [&]<typename Cp>(Cp* cp) -> Shader* {
+          if constexpr (requires(Cp& c, xenos::ShaderType st,
+                                 uint32_t guest_addr, const uint32_t* host_ptr,
+                                 uint32_t dwords) {
+                          c.LoadShaderFromGuestAddress(st, guest_addr, host_ptr,
+                                                       dwords);
+                        }) {
+            return cp->LoadShaderFromGuestAddress(shader_type, addr,
+                                                  host_shader_ptr, size_dwords);
+          } else {
+            return cp->LoadShader(shader_type, host_shader_ptr, size_dwords);
+          }
+        }(this);
+        if (shader_type == xenos::ShaderType::kVertex) {
+          active_vertex_shader_ = shader;
+          active_vertex_shader_ucode_address_ = addr;
+        } else if (shader_type == xenos::ShaderType::kPixel) {
+          active_pixel_shader_ = shader;
+        }
+        break;
+      }
+      case IbOpKind::kDrawIndx:
+      case IbOpKind::kDrawIndx2: {
+        reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+        vgt_draw_initiator.value = op.arg1;
+        register_file_->values[XE_GPU_REG_VGT_DRAW_INITIATOR] =
+            vgt_draw_initiator.value;
+        const bool is_indexed = (op.flags & 1u) != 0u;
+        IndexBufferInfo index_buffer_info;
+        if (is_indexed) {
+          const uint32_t vgt_dma_base = op.arg2;
+          register_file_->values[XE_GPU_REG_VGT_DMA_BASE] = vgt_dma_base;
+          reg::VGT_DMA_SIZE vgt_dma_size;
+          vgt_dma_size.value = op.arg3;
+          register_file_->values[XE_GPU_REG_VGT_DMA_SIZE] = vgt_dma_size.value;
+          const uint32_t index_size_bytes =
+              vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16
+                  ? sizeof(uint16_t)
+                  : sizeof(uint32_t);
+          index_buffer_info.guest_base = vgt_dma_base & ~(index_size_bytes - 1);
+          index_buffer_info.endianness = vgt_dma_size.swap_mode;
+          index_buffer_info.format = vgt_draw_initiator.index_size;
+          index_buffer_info.length = vgt_dma_size.num_words * index_size_bytes;
+          index_buffer_info.count = vgt_draw_initiator.num_indices;
+        } else {
+          index_buffer_info.guest_base = 0;
+          index_buffer_info.length = 0;
+        }
+        // Keep reader_ positioned right past the draw packet so
+        // PrepareTilingBandDraw() -> GuestReadPtrOffset() produces the exact
+        // same key as the uncached PM4 decoder.
+        reader_.set_read_offset(op.post_packet_byte_offset);
+        if (XE_UNLIKELY(tiling_band_ >= 0) &&
+            !COMMAND_PROCESSOR::PrepareTilingBandDraw()) {
+          ++guest_sync_count_;
+          break;
+        }
+        if (!COMMAND_PROCESSOR::PrepareVIZDraw(op.arg0)) {
+          ++guest_sync_count_;
+          break;
+        }
+        auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+        if (viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z &&
+            !cvars::occlusion_query_viz) {
+          ++guest_sync_count_;
+        } else {
+          const uint64_t fs_draw_begin = COMMAND_PROCESSOR::FrameStatsBegin();
+          const bool draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
+              vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+              is_indexed ? &index_buffer_info : nullptr,
+              xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
+                                         vgt_draw_initiator.prim_type));
+          COMMAND_PROCESSOR::FrameStatsEndDraw(fs_draw_begin);
+          if (!draw_succeeded) {
+            XELOGE("{}({}, {}, {}): Failed in backend",
+                   op.kind == IbOpKind::kDrawIndx ? "PM4_DRAW_INDX"
+                                                  : "PM4_DRAW_INDX_2",
+                   vgt_draw_initiator.num_indices,
+                   uint32_t(vgt_draw_initiator.prim_type),
+                   uint32_t(vgt_draw_initiator.source_select));
+          }
+        }
+        break;
+      }
+      case IbOpKind::kBinMaskLo:
+        bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | op.arg0;
+        break;
+      case IbOpKind::kBinMaskHi:
+        bin_mask_ =
+            (bin_mask_ & 0xFFFFFFFFull) | (static_cast<uint64_t>(op.arg0) << 32);
+        break;
+      case IbOpKind::kBinSelectLo:
+        bin_select_ = (bin_select_ & 0xFFFFFFFF00000000ull) | op.arg0;
+        COMMAND_PROCESSOR::OnBinSelectWritten();
+        break;
+      case IbOpKind::kBinSelectHi:
+        bin_select_ = (bin_select_ & 0xFFFFFFFFull) |
+                      (static_cast<uint64_t>(op.arg0) << 32);
+        break;
+      case IbOpKind::kBinMask:
+        bin_mask_ = (static_cast<uint64_t>(op.arg0) << 32) | op.arg1;
+        break;
+      case IbOpKind::kBinSelect:
+        bin_select_ = (static_cast<uint64_t>(op.arg0) << 32) | op.arg1;
+        break;
+      case IbOpKind::kNestedIb: {
+        // NEVER inline nested IBs: position reader_ right past the
+        // INDIRECT_BUFFER packet so ExecuteIndirectBuffer() records the exact
+        // ib_call_sites_[ib_call_depth_] and invalidating the child never
+        // requires cross-IB dependency tracking in the parent.
+        reader_.set_read_offset(op.post_packet_byte_offset);
+        const uint32_t list_ptr = CpuToGpu(op.arg0);
+        COMMAND_PROCESSOR::ExecuteIndirectBuffer(GpuToCpu(list_ptr), op.arg1);
+        break;
+      }
+    }
+  }
+}
+
+bool COMMAND_PROCESSOR::TryExecuteCachedIndirectBuffer(
+    uint32_t ptr, const uint32_t* host_ptr, uint32_t count) XE_RESTRICT {
+  using namespace xe::gpu::pm4_ib;
+  if (!memory_ || !host_ptr) {
+    return false;
+  }
+  COMMAND_PROCESSOR::EnsurePm4IbWatchRegistered();
+  if (!pm4_ib_cache_was_enabled_) {
+    pm4_ib_cache_.InvalidateAll();
+    pm4_ib_cache_was_enabled_ = true;
+  }
+
+  if (auto compiled = pm4_ib_cache_.Lookup(ptr, count)) {
+    COMMAND_PROCESSOR::ReplayCompiledIndirectBuffer(*compiled);
+    return true;
+  }
+
+  const CandidateDecision decision =
+      pm4_ib_cache_.ObserveMiss(ptr, host_ptr, count);
+  if (decision != CandidateDecision::kReadyToCompile) {
+    return false;
+  }
+
+  const DecodeStatus precheck = PrecheckCacheableIndirectBuffer(host_ptr, count);
+  if (precheck != DecodeStatus::kOk) {
+    if (precheck == DecodeStatus::kBailout) {
+      pm4_ib_cache_.MarkCandidateNonCacheable(ptr, count);
+    }
+    return false;
+  }
+
+  IbWatchSnapshot snapshot{};
+  if (!pm4_ib_cache_.BeginArmAndSnapshot(ptr, count, snapshot)) {
+    return false;
+  }
+  // Arm physical write-watch BEFORE decoding payload dwords so any concurrent
+  // guest CPU write bumps the page epoch and CommitIfUnchanged rejects caching.
+  memory_->EnablePhysicalMemoryAccessCallbacks(snapshot.phys_address,
+                                               snapshot.byte_length, true,
+                                               false);
+
+  auto built = std::make_shared<CompiledIndirectBuffer>();
+  const DecodeStatus decode_status =
+      DecodeIndirectBuffer(snapshot.phys_address, host_ptr, count, *built);
+  if (decode_status != DecodeStatus::kOk) {
+    if (decode_status == DecodeStatus::kBailout) {
+      pm4_ib_cache_.MarkCandidateNonCacheable(ptr, count);
+    }
+    return false;
+  }
+
+  if (!pm4_ib_cache_.CommitIfUnchanged(ptr, count, snapshot, built)) {
+    return false;
+  }
+
+  COMMAND_PROCESSOR::ReplayCompiledIndirectBuffer(*built);
+  return true;
+}
+
 void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
                                               uint32_t count) XE_RESTRICT {
   SCOPE_profile_cpu_f("gpu");
@@ -94,10 +372,26 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
     ib_call_depth_ = call_depth + 1;
     RingBuffer old_reader = reader_;
 
+    uint8_t* host_ib_ptr = memory_->TranslatePhysical(ptr);
     // Execute commands!
-    new (&reader_)
-        RingBuffer(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+    new (&reader_) RingBuffer(host_ib_ptr, count * sizeof(uint32_t));
     reader_.set_write_offset(count * sizeof(uint32_t));
+
+    const bool ib_cache_enabled = cvars::pm4_indirect_buffer_cache;
+    if (XE_UNLIKELY(!ib_cache_enabled && pm4_ib_cache_was_enabled_)) {
+      COMMAND_PROCESSOR::InvalidatePm4IbCache();
+    }
+    if (ib_cache_enabled && count <= xe::gpu::pm4_ib::kIbCacheMaxDwords &&
+        !trace_writer_.is_open() && !bin_trace_.frames_left &&
+        !cvars::disassemble_pm4 && !COMMAND_PROCESSOR::debug_markers_enabled() &&
+        COMMAND_PROCESSOR::TryExecuteCachedIndirectBuffer(
+            ptr, reinterpret_cast<const uint32_t*>(host_ib_ptr), count)) {
+      trace_writer_.WriteIndirectBufferEnd();
+      reader_ = old_reader;
+      ib_call_depth_ = call_depth;
+      return;
+    }
+
     // prefetch the wraparound range
     // it likely is already in L3 cache, but in a zen system it may be another
     // chiplets l3
@@ -889,6 +1183,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
   COMMAND_PROCESSOR::FrameStatsEndSwap(fs_swap_begin);
   COMMAND_PROCESSOR::FrameHintEndFrame();
   COMMAND_PROCESSOR::BinTraceEndFrame();
+  COMMAND_PROCESSOR::OnPm4IbCacheEndFrame();
 
   // Advance the present-frame counter shown in the log prefix.
   logging::IncrementFrameNumber();
