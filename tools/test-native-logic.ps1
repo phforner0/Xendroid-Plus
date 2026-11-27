@@ -106,7 +106,9 @@ foreach ($Pair in @(
   @("gpu_submit_worker_test", $Cpp),
   @("gpu_pm4_ib_cache_test", $Cpp),
   @("wave6_onda4a_rt_quirks_test", $Cpp),
-  @("wave6_onda4b_wx_a64_test", $Cpp)
+  @("wave6_onda4b_wx_a64_test", $Cpp),
+  @("wave7_onda1a_gpu_p0_test", $Cpp),
+  @("wave7_onda1b_cpu_wx_test", $Cpp)
 )) {
   $TName = $Pair[0]
   $TArg = $Pair[1]
@@ -129,6 +131,18 @@ if (Test-Path $Onda4cSrc) {
   if ($LASTEXITCODE -ne 0) { throw "Compile failed for wave6_onda4c_platform_test" }
   & $Onda4cExe $Cpp
   if ($LASTEXITCODE -ne 0) { throw "Test failed: wave6_onda4c_platform_test" }
+  $Passed++
+}
+
+# Wave 7 Onda 1C (Android 17 BTI linker-ns + VK_EXT_present_timing 6 risks + CVar parity)
+$Onda1cSrc = Join-Path $TestDir "wave7_onda1c_platform_present_test.cc"
+if (Test-Path $Onda1cSrc) {
+  $Onda1cExe = Join-Path $BuildDir "wave7_onda1c_platform_present_test.exe"
+  $VulkanHeadersInc = Join-Path $Xenia "third_party\Vulkan-Headers\include"
+  & $Compiler @CommonFlags "-I" $VulkanHeadersInc "-DXE_DISABLE_ANDROID_DLOPEN=1" $Onda1cSrc -o $Onda1cExe
+  if ($LASTEXITCODE -ne 0) { throw "Compile failed for wave7_onda1c_platform_present_test" }
+  & $Onda1cExe $Root
+  if ($LASTEXITCODE -ne 0) { throw "Test failed: wave7_onda1c_platform_present_test" }
   $Passed++
 }
 

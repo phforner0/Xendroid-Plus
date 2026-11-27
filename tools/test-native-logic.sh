@@ -100,6 +100,13 @@ done
 "$build/wave6_onda4b_wx_a64_test" "$cpp"
 "${cxx[@]}" "${flags[@]}" -I "$cpp/xenia/third_party/Vulkan-Headers/include" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/wave6_onda4c_platform_test.cc" -o "$build/wave6_onda4c_platform_test"
 "$build/wave6_onda4c_platform_test" "$cpp"
+# Wave 7 Onda 1 (1A GPU P0 hardening, 1B CPU/W^X/POSIX P0, 1C platform/present_timing P0).
+"${cxx[@]}" "${flags[@]}" -pthread "$test/wave7_onda1a_gpu_p0_test.cc" -o "$build/wave7_onda1a_gpu_p0_test"
+"$build/wave7_onda1a_gpu_p0_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -pthread "$test/wave7_onda1b_cpu_wx_test.cc" -o "$build/wave7_onda1b_cpu_wx_test"
+"$build/wave7_onda1b_cpu_wx_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -I "$cpp/xenia/third_party/Vulkan-Headers/include" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/wave7_onda1c_platform_present_test.cc" -o "$build/wave7_onda1c_platform_present_test"
+"$build/wave7_onda1c_platform_present_test" "$root"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then
