@@ -767,6 +767,8 @@ void TestSourceContracts(const fs::path& cpp_root) {
       ReadSourceText(xenia / "cpu/backend/a64/a64_emitter.cc");
   const std::string a64_seq_mem =
       ReadSourceText(xenia / "cpu/backend/a64/a64_seq_memory.cc");
+  const std::string mmio_handler =
+      ReadSourceText(xenia / "cpu/mmio_handler.cc");
   const std::string cmake = ReadSourceText(cpp_root / "CMakeLists.txt");
 
   // 6a. All 5 new CVars MUST default to false, ZERO new UPDATE_from_*,
@@ -805,6 +807,26 @@ void TestSourceContracts(const fs::path& cpp_root) {
   WAVE6_4B_CHECK(mem_posix.find("kDualMappingWxProbeSentinel") !=
                  std::string::npos);
   WAVE6_4B_CHECK(mem_posix.find("std::once_flag") != std::string::npos);
+  // Regression (#121 P1): CreateFileMappingHandle MUST require
+  // !IsWritableExecutableMemoryPreferred() before probing/using memfd_create
+  // so default a64_wx_dual_mapping=false stays 100% on ASharedMemory_create.
+  const std::string create_fmh = ExtractFunctionBody(
+      mem_posix, "FileMappingHandle CreateFileMappingHandle(");
+  {
+    size_t pos = 0;
+    size_t guarded_memfd_checks = 0;
+    while ((pos = create_fmh.find("ProbeDualMappingWxSupport()", pos)) !=
+           std::string::npos) {
+      const size_t window_start = (pos > 96) ? (pos - 96) : 0;
+      const std::string prefix =
+          create_fmh.substr(window_start, pos - window_start);
+      WAVE6_4B_CHECK(prefix.find("!IsWritableExecutableMemoryPreferred()") !=
+                     std::string::npos);
+      ++guarded_memfd_checks;
+      pos += 27;
+    }
+    WAVE6_4B_CHECK(guarded_memfd_checks == 2);
+  }
 
   // 6c. W^X 4 blockers + EnsureCommitted.
   // Blocker 1: guest_trampoline dual-mapping + FlushCodeRange.
@@ -869,6 +891,42 @@ void TestSourceContracts(const fs::path& cpp_root) {
   WAVE6_4B_CHECK(a64_seq_mem.find("ldaprb(") != std::string::npos);
   WAVE6_4B_CHECK(a64_seq_mem.find("ldaprh(") != std::string::npos);
   WAVE6_4B_CHECK(a64_seq_mem.find("ldapr(") != std::string::npos);
+
+  // Regression (#121 P0): MMIOHandler::TryDecodeLoadStore on ARM64 MUST decode
+  // 32-bit LDAPR Wt, [Xn|SP] (0xB8BFC000 / mask 0xFFFFFC00) before
+  // kArm64LoadStoreAnyFMask, preserving WZR -> constant 0.
+  {
+    const std::string try_decode = ExtractFunctionBody(
+        mmio_handler, "bool MMIOHandler::TryDecodeLoadStore(");
+    const size_t ldapr_pos = try_decode.find("0xB8BFC000u");
+    const size_t any_mask_pos = try_decode.find("kArm64LoadStoreAnyFMask");
+    WAVE6_4B_CHECK(ldapr_pos != std::string::npos);
+    WAVE6_4B_CHECK(any_mask_pos != std::string::npos);
+    WAVE6_4B_CHECK(ldapr_pos < any_mask_pos);
+    WAVE6_4B_CHECK(try_decode.find("0xFFFFFC00u") != std::string::npos);
+    WAVE6_4B_CHECK(try_decode.find("DecodedLoadStore::kArm64ValueRegZero") !=
+                   std::string::npos);
+    // Bit-level encoding verification for LDAPR Wt, [Xn|SP]:
+    auto is_ldapr_w = [](uint32_t insn) {
+      return (insn & 0xFFFFFC00u) == 0xB8BFC000u;
+    };
+    const uint32_t ldapr_w5_x16 = 0xB8BFC000u | (16u << 5) | 5u;
+    const uint32_t ldapr_wzr_x16 = 0xB8BFC000u | (16u << 5) | 31u;
+    const uint32_t ldapr_w0_sp = 0xB8BFC000u | (31u << 5) | 0u;
+    const uint32_t ldaprb_w5_x16 = 0x38BFC000u | (16u << 5) | 5u;
+    const uint32_t ldaprh_w5_x16 = 0x78BFC000u | (16u << 5) | 5u;
+    const uint32_t ldapr_x5_x16 = 0xF8BFC000u | (16u << 5) | 5u;
+    const uint32_t ldr_w5_x16 = 0xB9400000u | (16u << 5) | 5u;
+    WAVE6_4B_CHECK(is_ldapr_w(ldapr_w5_x16));
+    WAVE6_4B_CHECK((ldapr_w5_x16 & 31u) == 5u && ((ldapr_w5_x16 >> 5) & 31u) == 16u);
+    WAVE6_4B_CHECK(is_ldapr_w(ldapr_wzr_x16));
+    WAVE6_4B_CHECK((ldapr_wzr_x16 & 31u) == 31u);
+    WAVE6_4B_CHECK(is_ldapr_w(ldapr_w0_sp));
+    WAVE6_4B_CHECK(!is_ldapr_w(ldaprb_w5_x16));
+    WAVE6_4B_CHECK(!is_ldapr_w(ldaprh_w5_x16));
+    WAVE6_4B_CHECK(!is_ldapr_w(ldapr_x5_x16));
+    WAVE6_4B_CHECK(!is_ldapr_w(ldr_w5_x16));
+  }
 
   // 6f. Forbidden items MUST NOT be introduced.
   WAVE6_4B_CHECK(a64_em_cc.find("TryInlineGprlrSaverest") == std::string::npos);

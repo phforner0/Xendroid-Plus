@@ -656,7 +656,7 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
 #if XE_PLATFORM_xendroid
   const bool executable_mapping = (access == PageAccess::kExecuteReadWrite ||
                                    access == PageAccess::kExecuteReadOnly);
-  if (executable_mapping &&
+  if (executable_mapping && !IsWritableExecutableMemoryPreferred() &&
       ProbeDualMappingWxSupport() == DualMappingWxBackend::kMemfd) {
     std::string memfd_name = path.filename().string();
     if (memfd_name.empty()) {
@@ -675,7 +675,7 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
 #elif XE_PLATFORM_ANDROID
   const bool executable_mapping = (access == PageAccess::kExecuteReadWrite ||
                                    access == PageAccess::kExecuteReadOnly);
-  if (executable_mapping &&
+  if (executable_mapping && !IsWritableExecutableMemoryPreferred() &&
       ProbeDualMappingWxSupport() == DualMappingWxBackend::kMemfd) {
     std::string memfd_name = path.filename().string();
     if (memfd_name.empty()) {
