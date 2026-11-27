@@ -53,14 +53,16 @@ class SettingsSchemaTest {
         i("APU|volume", 100, 0, 100)
         i("Kernel|stack_size_multiplier_hack", 1, 1, 8)
         listOf("GPU|async_shader_vs_interpreter", "GPU|async_shader_skip_draws", "GPU|pipeline_storage_precreate",
-            "Kernel|precise_guest_delays", "APU|apu_performance_hint", "HID|vibration", "HID|guide_button",
+            "Kernel|precise_guest_delays", "HID|vibration", "HID|guide_button",
             "GPU|readback_resolve_sync", "GPU|precise_interpolation", "Vulkan|vulkan_allow_reverse_z",
             "Vulkan|vulkan_dynamic_rendering", "Vulkan|vulkan_avoid_geometry_shaders", "Vulkan|vulkan_depth_unorm24",
-            "General|guest_crash_is_fatal").forEach { b(it, true) }
-        listOf("GPU|depth_bias_shader_offset", "GPU|memexport_enable", "UI|achievement_notification_position_by_game",
-            "Storage|mount_memory_unit", "Vulkan|vulkan_in_pass_resolve",
-            "Vulkan|vulkan_allow_present_mode_immediate",
+            "General|guest_crash_is_fatal", "Memory|writable_executable_memory").forEach { b(it, true) }
+        listOf("APU|apu_performance_hint", "GPU|depth_bias_shader_offset", "GPU|memexport_enable",
+            "UI|achievement_notification_position_by_game", "Storage|mount_memory_unit",
+            "Vulkan|vulkan_in_pass_resolve", "Vulkan|vulkan_allow_present_mode_immediate",
             "Vulkan|vulkan_allow_present_mode_mailbox").forEach { b(it, false) }
+        assertNull("Memory|a64_wx_dual_mapping stays TOML-only (default true in C++ and default_config.toml)",
+            SettingsSchema.byKey["Memory|a64_wx_dual_mapping"])
         assertEquals("0", (SettingsSchema.byKey["GPU|draw_resolution_scale_threshold"] as Setting.ListChoice).default)
         assertEquals("-1", (SettingsSchema.byKey["Kernel|console_type"] as Setting.ListChoice).default)
         val gamma = SettingsSchema.byKey["Kernel|kernel_display_gamma_power"] as Setting.ListChoice

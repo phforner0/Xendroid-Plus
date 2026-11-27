@@ -25,6 +25,8 @@ class SystemHeadroomReader(
     private var getGpuHeadroomMethod: Method? = null
     private var cpuDefaultParams: Any? = null
     private var gpuDefaultParams: Any? = null
+    private var cpuParamsResolved = false
+    private var gpuParamsResolved = false
     private var cpuMinIntervalMs: Long = 0L
     private var gpuMinIntervalMs: Long = 0L
 
@@ -67,8 +69,19 @@ class SystemHeadroomReader(
         val cls = mgr.javaClass
         getCpuHeadroomMethod = findHeadroomMethod(cls, "getCpuHeadroom")
         getGpuHeadroomMethod = findHeadroomMethod(cls, "getGpuHeadroom")
+        cpuDefaultParams = resolveDefaultParamsOnce(getCpuHeadroomMethod)
+        cpuParamsResolved = true
+        gpuDefaultParams = resolveDefaultParamsOnce(getGpuHeadroomMethod)
+        gpuParamsResolved = true
         cpuMinIntervalMs = invokeIntervalMethod(mgr, cls, "getCpuHeadroomMinIntervalMillis")
         gpuMinIntervalMs = invokeIntervalMethod(mgr, cls, "getGpuHeadroomMinIntervalMillis")
+    }
+
+    private fun resolveDefaultParamsOnce(method: Method?): Any? {
+        if (method == null || method.parameterCount != 1) return null
+        val paramType = method.parameterTypes[0]
+        if (paramType == Any::class.java || paramType.isPrimitive) return null
+        return buildDefaultParams(paramType)
     }
 
     private fun findHeadroomMethod(cls: Class<*>, name: String): Method? {
@@ -88,20 +101,24 @@ class SystemHeadroomReader(
             val raw = runCatching { (method.invoke(mgr) as? Number)?.toFloat() }.getOrNull()
             return sanitizeHeadroom(raw)
         }
-        val cachedParams = if (isCpu) cpuDefaultParams else gpuDefaultParams
-        val firstAttempt = runCatching { (method.invoke(mgr, cachedParams) as? Number)?.toFloat() }
-        if (firstAttempt.isSuccess) {
-            return sanitizeHeadroom(firstAttempt.getOrNull())
-        }
-        if (cachedParams == null) {
-            val built = buildDefaultParams(method.parameterTypes[0])
-            if (built != null) {
-                if (isCpu) cpuDefaultParams = built else gpuDefaultParams = built
-                val retry = runCatching { (method.invoke(mgr, built) as? Number)?.toFloat() }.getOrNull()
-                return sanitizeHeadroom(retry)
+        val params = if (isCpu) {
+            if (!cpuParamsResolved) {
+                cpuDefaultParams = resolveDefaultParamsOnce(method)
+                cpuParamsResolved = true
             }
+            cpuDefaultParams
+        } else {
+            if (!gpuParamsResolved) {
+                gpuDefaultParams = resolveDefaultParamsOnce(method)
+                gpuParamsResolved = true
+            }
+            gpuDefaultParams
         }
-        return null
+        if (params == null && method.parameterTypes[0].isPrimitive) {
+            return null
+        }
+        val raw = runCatching { (method.invoke(mgr, params) as? Number)?.toFloat() }.getOrNull()
+        return sanitizeHeadroom(raw)
     }
 
     private fun buildDefaultParams(paramClass: Class<*>): Any? = runCatching {

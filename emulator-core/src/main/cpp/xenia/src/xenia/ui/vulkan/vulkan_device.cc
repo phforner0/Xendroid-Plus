@@ -79,14 +79,25 @@ namespace vulkan {
 namespace {
 
 bool IsPresentTimingExtRequested() {
-  bool enabled = cvars::vulkan_present_timing_ext;
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
-  char prop[PROP_VALUE_MAX] = {};
-  if (__system_property_get("debug.xendroid.present_timing_ext", prop) > 0) {
-    ParseStrictBoolProperty(prop, enabled);
+  static std::once_flag prop_once;
+  static bool has_prop_override = false;
+  static bool prop_override_value = false;
+  std::call_once(prop_once, []() {
+    char prop[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.present_timing_ext", prop) > 0) {
+      bool parsed = false;
+      if (ParseStrictBoolProperty(prop, parsed)) {
+        has_prop_override = true;
+        prop_override_value = parsed;
+      }
+    }
+  });
+  if (has_prop_override) {
+    return prop_override_value;
   }
 #endif
-  return enabled;
+  return cvars::vulkan_present_timing_ext;
 }
 
 bool ReadBoolCvarOrDefault(const char* name, bool default_value) {
@@ -1113,18 +1124,23 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
 #ifdef VK_EXT_present_timing
     if (device->extensions_.ext_EXT_present_timing) {
-      features_EXT_present_timing.Link(supported_features_2,
-                                       device_create_info);
+      // Query support only first; link .enabled into device_create_info.pNext
+      // only after feature checks succeed so pruned extensions never leave
+      // dangling feature structs in VkDeviceCreateInfo::pNext.
+      features_EXT_present_timing.supported.pNext = supported_features_2.pNext;
+      supported_features_2.pNext = &features_EXT_present_timing.supported;
     }
 #endif
 #ifdef VK_KHR_present_id2
     if (device->extensions_.ext_KHR_present_id2) {
-      features_KHR_present_id2.Link(supported_features_2, device_create_info);
+      features_KHR_present_id2.supported.pNext = supported_features_2.pNext;
+      supported_features_2.pNext = &features_KHR_present_id2.supported;
     }
 #endif
 #ifdef VK_KHR_present_id
     if (device->extensions_.ext_KHR_present_id) {
-      features_KHR_present_id.Link(supported_features_2, device_create_info);
+      features_KHR_present_id.supported.pNext = supported_features_2.pNext;
+      supported_features_2.pNext = &features_KHR_present_id.supported;
     }
 #endif
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
@@ -1186,16 +1202,18 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     features_EXT_device_fault.enabled.deviceFault =
         features_EXT_device_fault.supported.deviceFault;
-    [[maybe_unused]] const bool ext_present_id2_enabled =
-        device->extensions_.ext_KHR_present_id2;
 #ifdef VK_KHR_present_id2
     if (device->extensions_.ext_KHR_present_id2) {
       features_KHR_present_id2.enabled.presentId2 =
           features_KHR_present_id2.supported.presentId2;
       device->properties_.presentId2 =
           features_KHR_present_id2.enabled.presentId2 != VK_FALSE;
-      if (!device->properties_.presentId2) {
+      if (device->properties_.presentId2) {
+        features_KHR_present_id2.enabled.pNext = device_create_info.pNext;
+        device_create_info.pNext = &features_KHR_present_id2.enabled;
+      } else {
         device->extensions_.ext_KHR_present_id2 = false;
+        erase_enabled_extension(VK_KHR_PRESENT_ID_2_EXTENSION_NAME);
       }
     }
 #endif
@@ -1205,24 +1223,30 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
           features_KHR_present_id.supported.presentId;
       device->properties_.presentId =
           features_KHR_present_id.enabled.presentId != VK_FALSE;
-      if (!device->properties_.presentId) {
+      if (device->properties_.presentId) {
+        features_KHR_present_id.enabled.pNext = device_create_info.pNext;
+        device_create_info.pNext = &features_KHR_present_id.enabled;
+      } else {
         device->extensions_.ext_KHR_present_id = false;
+        erase_enabled_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
       }
     }
 #endif
 #ifdef VK_EXT_present_timing
     if (device->extensions_.ext_EXT_present_timing) {
-      if (CanEnablePresentTimingExtOnDevice(
+      if (CanEnablePresentTimingExtOnDeviceV3(
               device->extensions_.ext_EXT_present_timing,
               device->extensions_.ext_KHR_calibrated_timestamps,
-              ext_present_id2_enabled,
+              device->extensions_.ext_KHR_present_id2,
               features_EXT_present_timing.supported.presentTiming != VK_FALSE,
-              device->properties_.presentId2, device->properties_.presentId)) {
+              device->properties_.presentId2)) {
         features_EXT_present_timing.enabled.presentTiming = VK_TRUE;
         features_EXT_present_timing.enabled.presentAtAbsoluteTime =
             features_EXT_present_timing.supported.presentAtAbsoluteTime;
         features_EXT_present_timing.enabled.presentAtRelativeTime =
             features_EXT_present_timing.supported.presentAtRelativeTime;
+        features_EXT_present_timing.enabled.pNext = device_create_info.pNext;
+        device_create_info.pNext = &features_EXT_present_timing.enabled;
         device->properties_.presentTiming = true;
         device->properties_.presentAtAbsoluteTime =
             features_EXT_present_timing.enabled.presentAtAbsoluteTime !=
@@ -1235,9 +1259,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         device->properties_.presentTiming = false;
         device->properties_.presentAtAbsoluteTime = false;
         device->properties_.presentAtRelativeTime = false;
+        erase_enabled_extension(VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
+#ifdef VK_KHR_calibrated_timestamps
+        if (device->extensions_.ext_KHR_calibrated_timestamps) {
+          device->extensions_.ext_KHR_calibrated_timestamps = false;
+          erase_enabled_extension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        }
+#endif
       }
     }
 #endif
+    device_create_info.enabledExtensionCount =
+        uint32_t(enabled_extensions.size());
+    device_create_info.ppEnabledExtensionNames = enabled_extensions.data();
   }
 
   uint32_t queue_family_count = 0;

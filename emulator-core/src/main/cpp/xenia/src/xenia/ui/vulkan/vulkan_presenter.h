@@ -629,7 +629,7 @@ class VulkanPresenter final : public Presenter {
   // present ID, and the panel's timing for it gives the game's IssueSwap to
   // the frame's actual display. Paint thread only.
   struct NativeLatencyRecord {
-    uint32_t present_id = 0;
+    uint64_t present_id = 0;
     uint64_t source_id = 0;
     uint64_t issue_ns = 0;
   };
@@ -639,7 +639,7 @@ class VulkanPresenter final : public Presenter {
   std::array<NativeLatencyRecord, kNativeLatencyRecordCount>
       native_latency_records_ = {};
   size_t native_latency_record_next_ = 0;
-  uint32_t native_latency_present_id_ = 0;
+  uint64_t native_latency_present_id_ = 0;
   uint64_t native_latency_last_source_id_ = 0;
   std::vector<uint64_t> native_latency_samples_ns_;
   uint64_t native_latency_window_begin_ns_ = 0;

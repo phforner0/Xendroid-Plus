@@ -158,7 +158,10 @@ object SettingsSchema {
             b("Memory", "shm_coalesce_writewatch_pages", "Coalesce 64 KB writewatch page faults", true),
             b("Memory", "scribble_heap", "Scribble heap", false),
             b("Memory", "protect_zero", "Protect zero page", true),
-            b("Memory", "writable_executable_memory", "Writable executable memory", true),
+            // W^X contract: Memory|a64_wx_dual_mapping = true (TOML-only default) uses
+            // r-xs + rw-s dual-mapping after live SELinux probe; writable_executable_memory = true
+            // permits RWX fallback when W^X dual-mapping is disabled or fails the probe.
+            b("Memory", "writable_executable_memory", "Writable executable memory (RWX fallback)", true),
             b("Memory", "protect_on_release", "Protect on release", false),
             b("Memory", "ignore_offset_for_ranged_allocations", "Ignore offset for ranged allocations", false),
         )),
@@ -339,7 +342,7 @@ object SettingsSchema {
         SettingsCategory("APU", listOf(
             b("APU", "apu_pump_topup", "Audio pump top-up", true),
             i("APU", "volume", "Volume", 100, 0, 100),
-            b("APU", "apu_performance_hint", "Audio performance hint (ADPF)", true),
+            b("APU", "apu_performance_hint", "Audio performance hint (ADPF)", false),
             i("Console", "xmp_default_volume", "XMP default volume", 70, 0, 100),
             b("APU", "ffmpeg_verbose", "FFmpeg verbose", false),
             i("APU", "apu_max_queued_frames", "Max queued frames", 12, 4, 64),

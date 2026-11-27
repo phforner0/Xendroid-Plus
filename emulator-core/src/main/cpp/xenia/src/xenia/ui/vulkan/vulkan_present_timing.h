@@ -49,7 +49,13 @@ struct SelectedTimeDomain {
   bool valid = false;
   uint32_t time_domain = 0;
   uint64_t time_domain_id = 0;
+  // True for either CLOCK_MONOTONIC or CLOCK_MONOTONIC_RAW.
   bool is_monotonic_clock = false;
+  // True strictly for CLOCK_MONOTONIC (matches std::chrono::steady_clock on
+  // Linux/Android; never mixes CLOCK_MONOTONIC_RAW with steady_clock).
+  bool is_clock_monotonic = false;
+  // True strictly for CLOCK_MONOTONIC_RAW.
+  bool is_clock_monotonic_raw = false;
 };
 
 struct PresentStageSample {
@@ -64,6 +70,7 @@ struct UnifiedPastPresentationTiming {
   uint64_t earliest_present_time_ns = 0;
   uint64_t refresh_duration_ns = 0;
   uint32_t chosen_stage = 0;
+  uint32_t time_domain = 0;
   bool report_complete = false;
   bool valid = false;
 };
@@ -117,6 +124,54 @@ inline bool CanEnablePresentTimingExtOnDevice(
          (feature_present_id2 || feature_present_id);
 }
 
+// Strict Vulkan 1.4.350 spec v3 device gate: requires VK_KHR_present_id2
+// extension AND presentId2 feature (v1 VK_KHR_present_id without
+// VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR is rejected).
+inline bool CanEnablePresentTimingExtOnDeviceV3(
+    bool ext_present_timing_advertised, bool ext_calibrated_timestamps,
+    bool ext_present_id2, bool feature_present_timing,
+    bool feature_present_id2) {
+  return CanEnablePresentTimingExtOnDevice(
+      ext_present_timing_advertised, ext_calibrated_timestamps, ext_present_id2,
+      feature_present_timing, feature_present_id2, false);
+}
+
+// True only when the selected swapchain time domain matches
+// std::chrono::steady_clock (CLOCK_MONOTONIC on Linux/Android). Distinct from
+// CLOCK_MONOTONIC_RAW so the two clock domains are never mixed.
+inline bool TimeDomainMatchesSteadyClock(const SelectedTimeDomain& domain) {
+  return domain.valid && domain.is_clock_monotonic &&
+         domain.time_domain == kTimeDomainClockMonotonic;
+}
+
+// Pre-swapchain gate for ZeroFG egress: ZeroFG pacing requires absolute target
+// scheduling (presentAtAbsoluteTime) plus presentId2 and stage queries; without
+// them, fall back to VK_GOOGLE_display_timing before creating the swapchain.
+inline bool CanUseExtPresentTimingForZeroFG(bool ext_enabled_cvar,
+                                            bool ext_device_feature,
+                                            bool ext_surface_supported,
+                                            bool ext_pfns_ready,
+                                            bool ext_present_at_absolute_time,
+                                            bool ext_present_id2_ready,
+                                            uint32_t stage_query_mask) {
+  return ext_enabled_cvar && ext_device_feature && ext_surface_supported &&
+         ext_pfns_ready && ext_present_at_absolute_time &&
+         ext_present_id2_ready && stage_query_mask != 0u;
+}
+
+// Pre-swapchain gate for native VulkanPresenter: requires presentId2 and at
+// least one supported stage query before creating a PRESENT_TIMING_BIT_EXT
+// swapchain.
+inline bool CanUseExtPresentTimingForPresenter(bool ext_enabled_cvar,
+                                               bool ext_device_feature,
+                                               bool ext_surface_supported,
+                                               bool ext_pfns_ready,
+                                               bool ext_present_id2_ready,
+                                               uint32_t stage_query_mask) {
+  return ext_enabled_cvar && ext_device_feature && ext_surface_supported &&
+         ext_pfns_ready && ext_present_id2_ready && stage_query_mask != 0u;
+}
+
 // Enforces mutual exclusion on VkPresentInfoKHR::pNext: never chain both
 // VkPresentTimingsInfoEXT and VkPresentTimesInfoGOOGLE simultaneously.
 inline PresentInfoTimingChain SelectPresentInfoTimingChain(
@@ -164,9 +219,11 @@ inline SelectedTimeDomain SelectPreferredTimeDomain(
       best.valid = true;
       best.time_domain = time_domains[i];
       best.time_domain_id = time_domain_ids[i];
+      best.is_clock_monotonic = (time_domains[i] == kTimeDomainClockMonotonic);
+      best.is_clock_monotonic_raw =
+          (time_domains[i] == kTimeDomainClockMonotonicRaw);
       best.is_monotonic_clock =
-          (time_domains[i] == kTimeDomainClockMonotonic ||
-           time_domains[i] == kTimeDomainClockMonotonicRaw);
+          best.is_clock_monotonic || best.is_clock_monotonic_raw;
       best_rank = rank;
     }
   }
@@ -294,8 +351,10 @@ inline SelectedTimeDomain SelectPreferredVkTimeDomain(
       best.valid = true;
       best.time_domain = dom;
       best.time_domain_id = time_domain_ids[i];
-      best.is_monotonic_clock = (dom == kTimeDomainClockMonotonic ||
-                                 dom == kTimeDomainClockMonotonicRaw);
+      best.is_clock_monotonic = (dom == kTimeDomainClockMonotonic);
+      best.is_clock_monotonic_raw = (dom == kTimeDomainClockMonotonicRaw);
+      best.is_monotonic_clock =
+          best.is_clock_monotonic || best.is_clock_monotonic_raw;
       best_rank = rank;
     }
   }
@@ -313,11 +372,76 @@ inline UnifiedPastPresentationTiming ConvertVkPastPresentationTimingEXT(
     stage_buf[i].stage = static_cast<uint32_t>(timing.pPresentStages[i].stage);
     stage_buf[i].time_ns = timing.pPresentStages[i].time;
   }
-  return ConvertPastPresentationTiming(
+  UnifiedPastPresentationTiming out = ConvertPastPresentationTiming(
       timing.presentId, timing.targetTime, stage_buf, n,
       timing.reportComplete != VK_FALSE, refresh_duration_ns);
+  out.time_domain = static_cast<uint32_t>(timing.timeDomain);
+  return out;
 }
 #endif
+
+// Rejects incomplete reports (report_complete == false) so partial stage
+// timestamps are never consumed as completed presentation samples.
+inline bool IsCompletePastPresentationTiming(
+    const UnifiedPastPresentationTiming& timing) {
+  return timing.valid && timing.report_complete &&
+         timing.actual_present_time_ns != 0u;
+}
+
+// Requires both report_complete == true and strict CLOCK_MONOTONIC domain
+// alignment with std::chrono::steady_clock.
+inline bool IsCompleteMonotonicPastPresentationTiming(
+    const UnifiedPastPresentationTiming& timing,
+    const SelectedTimeDomain& swapchain_domain) {
+  return IsCompletePastPresentationTiming(timing) &&
+         TimeDomainMatchesSteadyClock(swapchain_domain) &&
+         timing.time_domain == kTimeDomainClockMonotonic;
+}
+
+// Resolves the actual targetTime / desiredPresentTime passed to Vulkan on the
+// native presenter path. Keeps the scheduled target when late-swap pacing is
+// active and the frame is early (provided FIFO + absolute target support), and
+// emits 0 (immediate) for overdue frames or when late-swap is bypassed.
+inline uint64_t ResolveNativePresentTargetTimeNs(
+    const LateSwapDecision& decision, bool is_fifo,
+    bool can_use_absolute_target) {
+  if (!is_fifo || !can_use_absolute_target) {
+    return 0ull;
+  }
+  if (decision.action == LateSwapAction::kKeepScheduledTarget) {
+    return decision.effective_target_ns;
+  }
+  return 0ull;
+}
+
+// Timing records must only be enqueued when the present succeeded AND timing
+// metadata remained attached to VkPresentInfoKHR::pNext (never after a
+// QUEUE_FULL_EXT retry that stripped pNext).
+inline bool ShouldEnqueueTimingRecord(PresentInfoTimingChain timing_chain,
+                                      bool presented,
+                                      bool retried_without_pnext) {
+  return presented && timing_chain != PresentInfoTimingChain::kNone &&
+         !retried_without_pnext;
+}
+
+// Wrap-safe comparison for overtaken timing records: uses full 64-bit signed
+// distance for VK_KHR_present_id2 / VK_EXT_present_timing and 32-bit signed
+// distance for VK_GOOGLE_display_timing.
+inline bool IsOlderPresentId(uint64_t candidate_id, uint64_t reference_id,
+                             bool is_64bit_id) {
+  if (is_64bit_id) {
+    return static_cast<int64_t>(candidate_id - reference_id) < 0;
+  }
+  return static_cast<int32_t>(static_cast<uint32_t>(candidate_id) -
+                              static_cast<uint32_t>(reference_id)) < 0;
+}
+
+// Maps a monotonically increasing 64-bit sequence ID to a non-zero 32-bit
+// presentID for VK_GOOGLE_display_timing.
+inline uint32_t NormalizeGooglePresentId32(uint64_t sequence_id) {
+  const uint32_t id = static_cast<uint32_t>(sequence_id);
+  return id != 0u ? id : 1u;
+}
 
 // Late-swap policy for native presentation.
 // Safety invariant: explicitly disabled whenever ZeroFG is active so

@@ -166,7 +166,7 @@
     <string name="st_t_kernel_precise_guest_delays">Precise game waits</string>
     <string name="st_d_kernel_precise_guest_delays">Serves the game\'s waits with sub-millisecond accuracy. A plain system sleep overshoots and lengthens every frame.</string>
     <string name="st_t_apu_apu_performance_hint">Audio performance hint (ADPF)</string>
-    <string name="st_d_apu_apu_performance_hint">Registers an ADPF performance hint session over the dispatch and audio threads so the system holds clocks for the audio deadline.</string>
+    <string name="st_d_apu_apu_performance_hint">Registers an ADPF performance hint session over the audio worker and XMA decoder threads so the system holds clocks for the audio deadline.</string>
     <string name="st_t_vulkan_adrenotools_force_max_clocks">Force maximum GPU clocks</string>
     <string name="st_d_vulkan_adrenotools_force_max_clocks">Force the GPU to its maximum clocks via the custom driver; more speed, more heat and battery drain.</string>
     <string name="st_t_vulkan_adrenotools_turbo_reassert_seconds">Request maximum clocks again every</string>
