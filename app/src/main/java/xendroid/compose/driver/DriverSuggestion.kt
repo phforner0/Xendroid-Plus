@@ -30,14 +30,22 @@ object DriverSuggestion {
 
     private val FAMILY = Regex("(?i)(?<![a-z0-9])a?([5-9])xx(?![a-z0-9])")
     private val MODEL = Regex("(?i)(?:(?<![a-z0-9])a|adreno[ _-]?)(\\d{3})(?!\\d)")
-    private val MALI_DRIVER = Regex("(?i)(panvk|panfrost|mali|immortalis|valhall)")
+    private val MALI_DRIVER = Regex("(?i)(malisx2|panvk|panfrost|mali|immortalis|valhall)")
     private val XCLIPSE_DRIVER = Regex("(?i)(xclipse|exynos)")
-    private val ADRENO_ONLY_DRIVER = Regex("(?i)(turnip|freedreno|adreno|qualcomm)")
+    private val ADRENO_ONLY_DRIVER = Regex("(?i)(armsx2|turnip|freedreno|adreno|qualcomm)")
+    private val ARMSX2_DRIVER = Regex("(?i)armsx2")
+    private val MALISX2_DRIVER = Regex("(?i)malisx2")
+
+    fun isArmsx2Turnip(driver: DriverInfo): Boolean =
+        ARMSX2_DRIVER.containsMatchIn("${driver.name} ${driver.version} ${driver.source}")
+
+    fun isMalisx2(driver: DriverInfo): Boolean =
+        MALISX2_DRIVER.containsMatchIn("${driver.name} ${driver.version} ${driver.source}")
 
     fun fit(driver: DriverInfo, model: Int): Fit {
         val text = driver.name + " " + driver.version
-        if ((MALI_DRIVER.containsMatchIn(text) || XCLIPSE_DRIVER.containsMatchIn(text)) &&
-            !ADRENO_ONLY_DRIVER.containsMatchIn(text)
+        if ((MALI_DRIVER.containsMatchIn(text) || isMalisx2(driver) || XCLIPSE_DRIVER.containsMatchIn(text)) &&
+            !ADRENO_ONLY_DRIVER.containsMatchIn(text) && !isArmsx2Turnip(driver)
         ) {
             return Fit.OTHER_FAMILY
         }
@@ -45,6 +53,7 @@ object DriverSuggestion {
         val families = FAMILY.findAll(text).map { it.groupValues[1].toInt() }.toSet()
         return when {
             family(model) in families -> Fit.FAMILY
+            families.isEmpty() && family(model) in 7..8 && isArmsx2Turnip(driver) -> Fit.FAMILY
             families.isEmpty() -> Fit.ANY
             else -> Fit.OTHER_FAMILY
         }
@@ -54,18 +63,20 @@ object DriverSuggestion {
     fun suggest(drivers: List<DriverInfo>, gpu: String?): DriverInfo? {
         val adreno = adrenoModel(gpu)
         if (adreno != null) {
+            val preferArmsx2 = family(adreno) in 7..8
             return drivers.withIndex()
                 .map { (index, driver) -> Triple(driver, fit(driver, adreno), index) }
                 .filter { it.second != Fit.OTHER_FAMILY }
                 .sortedWith(compareBy<Triple<DriverInfo, Fit, Int>> { it.second.ordinal }
                     .thenByDescending { it.first.publishedAt }
+                    .thenByDescending { preferArmsx2 && isArmsx2Turnip(it.first) }
                     .thenBy { it.third })
                 .firstOrNull()?.first
         }
         val mali = maliModel(gpu)
         if (mali != null) {
             return drivers.withIndex()
-                .filter { (_, d) -> MALI_DRIVER.containsMatchIn("${d.name} ${d.version}") }
+                .filter { (_, d) -> MALI_DRIVER.containsMatchIn("${d.name} ${d.version}") || isMalisx2(d) }
                 .sortedWith(compareByDescending<IndexedValue<DriverInfo>> {
                     "${it.value.name} ${it.value.version}".contains(mali, ignoreCase = true)
                 }.thenByDescending { it.value.publishedAt }.thenBy { it.index })

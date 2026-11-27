@@ -445,6 +445,7 @@ DECLARE_bool(vulkan_normalize_dontcare_keys);
 DECLARE_bool(vulkan_msaa_4x_as_2x2);
 DECLARE_bool(vulkan_msaa_single_sample_storage);
 DECLARE_bool(vulkan_rasterization_order_attachment_access);
+DECLARE_bool(vulkan_rt_rows_on_demand);
 
 namespace xe {
 namespace gpu {
@@ -799,6 +800,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t GetMaxRenderTargetHeight() const override;
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
+  bool EnsureRenderTargetHeight(RenderTarget* render_target,
+                                uint32_t needed_guest_height) override;
 
   bool IsHostDepthEncodingDifferent(
       xenos::DepthRenderTargetFormat format) const override;
@@ -1106,7 +1109,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                        VkImageView view_depth_color,
                        VkImageView view_depth_stencil, VkImageView view_stencil,
                        VkImageView view_color_transfer_separate,
-                       size_t descriptor_set_index_transfer_source)
+                       size_t descriptor_set_index_transfer_source,
+                       uint32_t allocated_guest_height,
+                       uint32_t max_guest_height)
         : RenderTarget(key),
           render_target_cache_(render_target_cache),
           image_(image),
@@ -1116,13 +1121,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
           view_stencil_(view_stencil),
           view_color_transfer_separate_(view_color_transfer_separate),
           descriptor_set_index_transfer_source_(
-              descriptor_set_index_transfer_source) {}
+              descriptor_set_index_transfer_source),
+          allocated_guest_height_(allocated_guest_height),
+          max_guest_height_(max_guest_height) {}
     ~VulkanRenderTarget();
 
+    uint32_t allocated_guest_height() const { return allocated_guest_height_; }
+    uint32_t max_guest_height() const { return max_guest_height_; }
+
     VkImage image() const { return image_; }
+    VkDeviceMemory memory() const { return memory_; }
 
     VkImageView view_depth_color() const { return view_depth_color_; }
     VkImageView view_depth_stencil() const { return view_depth_stencil_; }
+    VkImageView view_stencil() const { return view_stencil_; }
     VkImageView view_color_transfer_separate() const {
       return view_color_transfer_separate_;
     }
@@ -1131,8 +1143,34 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                  ? view_color_transfer_separate_
                  : view_depth_color_;
     }
+    size_t descriptor_set_index_transfer_source() const {
+      return descriptor_set_index_transfer_source_;
+    }
+    size_t descriptor_set_index_input_attachment() const {
+      return descriptor_set_index_input_attachment_;
+    }
     void SetDescriptorSetIndexInputAttachment(size_t index) {
       descriptor_set_index_input_attachment_ = index;
+    }
+    void ReplaceBackingResources(VkImage image, VkDeviceMemory memory,
+                                 VkImageView view_depth_color,
+                                 VkImageView view_depth_stencil,
+                                 VkImageView view_stencil,
+                                 VkImageView view_color_transfer_separate,
+                                 size_t descriptor_set_index_transfer_source,
+                                 size_t descriptor_set_index_input_attachment,
+                                 uint32_t new_allocated_guest_height) {
+      image_ = image;
+      memory_ = memory;
+      view_depth_color_ = view_depth_color;
+      view_depth_stencil_ = view_depth_stencil;
+      view_stencil_ = view_stencil;
+      view_color_transfer_separate_ = view_color_transfer_separate;
+      descriptor_set_index_transfer_source_ =
+          descriptor_set_index_transfer_source;
+      descriptor_set_index_input_attachment_ =
+          descriptor_set_index_input_attachment;
+      allocated_guest_height_ = new_allocated_guest_height;
     }
     VkDescriptorSet GetDescriptorSetInputAttachment() const {
       return render_target_cache_.descriptor_set_pool_input_attachment_->Get(
@@ -1224,6 +1262,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // 2 sampled images for depth / stencil, 1 sampled image for color.
     size_t descriptor_set_index_transfer_source_;
+
+    // Allocated vs maximum EDRAM-wrap height in guest pixels (row-on-demand).
+    uint32_t allocated_guest_height_;
+    uint32_t max_guest_height_;
 
     VkPipelineStageFlags current_stage_mask_ = 0;
     VkAccessFlags current_access_mask_ = 0;
@@ -1822,6 +1864,41 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   std::unordered_map<FramebufferKey, Framebuffer, FramebufferKey::Hasher>
       framebuffers_;
+
+  // Backing resources created for a VulkanRenderTarget (initial or grown).
+  struct RenderTargetBackingResources {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view_depth_color = VK_NULL_HANDLE;
+    VkImageView view_depth_stencil = VK_NULL_HANDLE;
+    VkImageView view_stencil = VK_NULL_HANDLE;
+    VkImageView view_color_transfer_separate = VK_NULL_HANDLE;
+    size_t descriptor_set_index_transfer_source = SIZE_MAX;
+    size_t descriptor_set_index_input_attachment = SIZE_MAX;
+  };
+  bool CreateRenderTargetBackingResources(RenderTargetKey key,
+                                          uint32_t guest_height,
+                                          RenderTargetBackingResources& out);
+  bool GrowRenderTarget(VulkanRenderTarget* render_target,
+                        uint32_t needed_guest_height);
+
+  // Retired VulkanRenderTarget images/views/descriptors/framebuffers from
+  // row-on-demand growth, destroyed once entry.submission <= completed.
+  struct DeferredRtDestruction {
+    uint64_t submission = 0;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view_depth_color = VK_NULL_HANDLE;
+    VkImageView view_depth_stencil = VK_NULL_HANDLE;
+    VkImageView view_stencil = VK_NULL_HANDLE;
+    VkImageView view_color_transfer_separate = VK_NULL_HANDLE;
+    bool is_depth = false;
+    size_t descriptor_set_index_transfer_source = SIZE_MAX;
+    size_t descriptor_set_index_input_attachment = SIZE_MAX;
+    std::vector<VkFramebuffer> framebuffers;
+  };
+  std::vector<DeferredRtDestruction> deferred_rt_destructions_;
+  void DestroyDeferredRtDestructions(uint64_t completed_submission);
 
   // Set 0 - EDRAM storage buffer, set 1 - source depth sampled image (and
   // unused stencil from the transfer descriptor set), HostDepthStoreConstants

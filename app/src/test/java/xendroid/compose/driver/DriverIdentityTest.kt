@@ -103,4 +103,49 @@ class DriverIdentityTest {
         assertNull(minimal.driverId)
         assertEquals("driver 0x7", minimal.copy(driverVersion = "0x7").label)
     }
+
+    @Test fun classifiesMalisx2PanvkArmsx2TurnipAndProprietaryFamiliesWithoutChangingKey() {
+        val turnip = DriverIdentity.parse(line)!!
+        assertFalse(turnip.isPanvk)
+        assertFalse(turnip.isMalisx2)
+        assertFalse(turnip.isArmsx2Turnip)
+        assertEquals(DriverIdentity.DriverFamily.TURNIP, turnip.driverFamily)
+
+        val armsx2 = turnip.copy(driverInfo = "Mesa 25.3.0-armsx2 (git-1234)")
+        assertTrue(armsx2.isArmsx2Turnip)
+        assertFalse(armsx2.isPanvk)
+        assertEquals(DriverIdentity.DriverFamily.ARMSX2_TURNIP, armsx2.driverFamily)
+        // Derived properties must never alter key stability.
+        assertEquals(turnip.key, armsx2.key)
+
+        val malisx2Id20 = DriverIdentity.parse(
+            "vendor=0x13B5;device=0xB8A2;driverVersion=0x1903000;api=1.3.296;driverId=20;" +
+                "driverName=panvk;driverInfo=Mesa 25.3.0 malisx2;gpu=Mali-G715;uuid=${"1".repeat(32)}",
+        )!!
+        assertTrue(malisx2Id20.isPanvk)
+        assertTrue(malisx2Id20.isMalisx2)
+        assertFalse(malisx2Id20.isArmsx2Turnip)
+        assertEquals(DriverIdentity.DriverFamily.MALISX2, malisx2Id20.driverFamily)
+
+        // PanVK-on-kbase wrapper reporting driverId=0 must still classify as MALISX2, not MALI_PROPRIETARY.
+        val malisx2Id0 = malisx2Id20.copy(driverId = 0, driverName = "PanVK", driverInfo = "kbase wrapper")
+        assertTrue(malisx2Id0.isPanvk)
+        assertTrue(malisx2Id0.isMalisx2)
+        assertEquals(DriverIdentity.DriverFamily.MALISX2, malisx2Id0.driverFamily)
+
+        val maliProp = DriverIdentity.parse(
+            "vendor=0x13B5;device=0xB8A2;driverVersion=0x2800000;api=1.3.264;driverId=9;" +
+                "driverName=ARM;driverInfo=r40p0-00rel0;gpu=Mali-G715;uuid=${"2".repeat(32)}",
+        )!!
+        assertFalse(maliProp.isPanvk)
+        assertFalse(maliProp.isMalisx2)
+        assertEquals(DriverIdentity.DriverFamily.MALI_PROPRIETARY, maliProp.driverFamily)
+
+        val qcomProp = DriverIdentity.parse(
+            "vendor=0x5143;device=0x44050A00;driverVersion=0x802FA000;api=1.3.284;driverId=8;" +
+                "driverName=Qualcomm;driverInfo=512.762.0;gpu=Adreno (TM) 740;uuid=${"3".repeat(32)}",
+        )!!
+        assertFalse(qcomProp.isArmsx2Turnip)
+        assertEquals(DriverIdentity.DriverFamily.QUALCOMM_PROPRIETARY, qcomProp.driverFamily)
+    }
 }

@@ -50,6 +50,27 @@ class CustomDriversAndProbeTest {
         assertEquals(xclipse940, DriverSuggestion.suggest(catalog, "Samsung Xclipse 940"))
         assertNull(DriverSuggestion.suggest(listOf(turnip7xx), "Mali-G715"))
         assertNull(DriverSuggestion.suggest(listOf(panvk), "Samsung Xclipse 940"))
+
+        val malisx2 = DriverInfo(
+            "malisx2_valhall.zip",
+            "malisx2 25.3",
+            "https://example/malisx2.zip",
+            source = DriverSources.MALISX2,
+            publishedAt = "2026-10-12",
+        )
+        val armsx2 = DriverInfo(
+            "armsx2-turnip.zip",
+            "armsx2 25.3",
+            "https://example/armsx2.zip",
+            source = DriverSources.ARMSX2_TURNIP,
+            publishedAt = "2026-10-12",
+        )
+        val extendedCatalog = listOf(panvk, malisx2, xclipse940, turnip7xx, armsx2)
+        assertEquals(malisx2, DriverSuggestion.suggest(extendedCatalog, "Immortalis-G720"))
+        assertEquals(armsx2, DriverSuggestion.suggest(extendedCatalog, "Adreno (TM) 825"))
+        assertEquals(xclipse940, DriverSuggestion.suggest(extendedCatalog, "Samsung Xclipse 940"))
+        assertNull(DriverSuggestion.suggest(listOf(malisx2), "Adreno (TM) 825"))
+        assertNull(DriverSuggestion.suggest(listOf(armsx2), "Mali-G715"))
     }
 
     @Test fun probeAllowsOnlyVerifiedDriverLibrariesAndParsesReplies() {

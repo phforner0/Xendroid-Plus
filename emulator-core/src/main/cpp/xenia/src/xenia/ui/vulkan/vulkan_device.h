@@ -218,6 +218,13 @@ class VulkanDevice {
     // VK_KHR_driver_properties (#197, promoted to 1.2)
 
     VkDriverId driverID = VkDriverId(0);
+    char driverName[VK_MAX_DRIVER_NAME_SIZE] = {};
+    char driverInfo[VK_MAX_DRIVER_INFO_SIZE] = {};
+    uint32_t maliDriverMajor = 0;
+    uint32_t maliDriverMinor = 0;
+    bool isPanvk = false;
+    bool isMalisx2 = false;
+    bool isArmsx2Turnip = false;
 
     // VK_KHR_shader_float_controls (#198, promoted to 1.2)
 

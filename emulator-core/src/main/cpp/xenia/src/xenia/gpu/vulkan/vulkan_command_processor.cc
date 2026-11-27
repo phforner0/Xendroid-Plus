@@ -1410,12 +1410,22 @@ bool VulkanCommandProcessor::SetupContext() {
   // Guest draw constants.
   // VK_KHR_push_descriptor gate (strictly blacklisted on Qualcomm proprietary
   // and Arm Mali proprietary blobs; Eden maxPushDescriptors clamp applied).
+  // PanVK / malisx2 wrappers (even with driverID == 0) are never treated as
+  // Arm proprietary Mali.
+  const bool is_proprietary_mali =
+      !device_properties.isPanvk &&
+      IsProprietaryMaliDriver(device_properties.vendorID,
+                              uint32_t(device_properties.driverID));
+  const uint32_t effective_push_descriptor_driver_id =
+      (!is_proprietary_mali && device_properties.isPanvk)
+          ? kVkDriverIdMesaPanvk
+          : uint32_t(device_properties.driverID);
   const draw_cuts::PushDescriptorPolicyResult push_descriptor_policy =
       draw_cuts::EvaluatePushDescriptorPolicy(
           cvars::vulkan_use_push_descriptors,
           vulkan_device->extensions().ext_KHR_push_descriptor,
           dfn.vkCmdPushDescriptorSetKHR != nullptr, device_properties.vendorID,
-          uint32_t(device_properties.driverID),
+          effective_push_descriptor_driver_id,
           device_properties.maxPushDescriptors,
           SpirvShaderTranslator::kConstantBufferCount);
   use_push_descriptors_ = push_descriptor_policy.enabled;

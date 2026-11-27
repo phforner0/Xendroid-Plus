@@ -16,7 +16,36 @@ import kotlinx.serialization.json.booleanOrNull
  */
 object DriverSources {
     const val DEFAULT = "K11MCH1/AdrenoToolsDrivers"
+    const val ARMSX2_TURNIP = "bmdhacks/armsx2-turnip"
+    const val MALISX2 = "bmdhacks/malisx2"
     const val MAX = 8
+
+    /** Optional community repository offered for one-tap addition in the driver manager. */
+    data class SuggestedSource(
+        val repo: String,
+        val label: String,
+        val description: String,
+    )
+
+    val SUGGESTED: List<SuggestedSource> = listOf(
+        SuggestedSource(
+            repo = ARMSX2_TURNIP,
+            label = "armsx2-turnip (Adreno A7xx/A8xx)",
+            description = "Turnip builds with A7xx RB restore and opt-in KGSL/UBWC features",
+        ),
+        SuggestedSource(
+            repo = MALISX2,
+            label = "malisx2 (Mali PanVK-on-kbase)",
+            description = "Mesa PanVK custom Vulkan driver builds for Arm Mali / Immortalis GPUs",
+        ),
+    )
+
+    /** Suggested optional sources filtered/ordered for the detected GPU. */
+    fun suggestedForGpu(gpu: String?): List<SuggestedSource> = when {
+        DriverSuggestion.adrenoModel(gpu) != null -> SUGGESTED.filter { it.repo == ARMSX2_TURNIP }
+        DriverSuggestion.maliModel(gpu) != null -> SUGGESTED.filter { it.repo == MALISX2 }
+        else -> SUGGESTED
+    }
 
     private val OWNER = Regex("[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
     private val REPO = Regex("[A-Za-z0-9._-]{1,100}")

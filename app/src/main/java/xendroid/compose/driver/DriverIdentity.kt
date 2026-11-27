@@ -46,6 +46,59 @@ data class DriverIdentity(
             return (if (gpu.isBlank()) driver else "$driver · $gpu") + source
         }
 
+    /** High-level Vulkan driver family derived from runtime properties (not serialized). */
+    enum class DriverFamily {
+        TURNIP,
+        ARMSX2_TURNIP,
+        PANVK,
+        MALISX2,
+        MALI_PROPRIETARY,
+        QUALCOMM_PROPRIETARY,
+        XCLIPSE_PROPRIETARY,
+        RADV,
+        OTHER,
+    }
+
+    /** True for open-source Mesa PanVK (including malisx2 PanVK-on-kbase wrappers with driverId 0). */
+    val isPanvk: Boolean
+        get() = driverId == 20 ||
+            driverName.contains("panvk", ignoreCase = true) ||
+            driverInfo.contains("malisx2", ignoreCase = true) ||
+            driverName.contains("malisx2", ignoreCase = true)
+
+    /** True for malisx2 (PanVK-on-kbase) builds on Arm Mali / Immortalis GPUs. */
+    val isMalisx2: Boolean
+        get() = isPanvk && (
+            driverInfo.contains("malisx2", ignoreCase = true) ||
+                driverName.contains("malisx2", ignoreCase = true) ||
+                driverInfo.contains("kbase", ignoreCase = true) ||
+                library.contains("malisx2", ignoreCase = true)
+            )
+
+    /** True for armsx2-turnip custom Turnip builds targeting Adreno A7xx/A8xx. */
+    val isArmsx2Turnip: Boolean
+        get() = (driverId == 18 || driverName.contains("turnip", ignoreCase = true)) && (
+            driverInfo.contains("armsx2", ignoreCase = true) ||
+                driverName.contains("armsx2", ignoreCase = true) ||
+                library.contains("armsx2", ignoreCase = true)
+            )
+
+    val driverFamily: DriverFamily
+        get() = when {
+            isMalisx2 -> DriverFamily.MALISX2
+            isPanvk -> DriverFamily.PANVK
+            isArmsx2Turnip -> DriverFamily.ARMSX2_TURNIP
+            driverId == 18 || driverName.contains("turnip", ignoreCase = true) -> DriverFamily.TURNIP
+            driverId == 3 || driverName.contains("radv", ignoreCase = true) -> DriverFamily.RADV
+            driverId == 9 || ((driverId == null || driverId == 0) && vendorId.equals("0x13B5", ignoreCase = true)) ->
+                DriverFamily.MALI_PROPRIETARY
+            driverId == 8 || ((driverId == null || driverId == 0) && vendorId.equals("0x5143", ignoreCase = true)) ->
+                DriverFamily.QUALCOMM_PROPRIETARY
+            driverId == 21 || ((driverId == null || driverId == 0) && vendorId.equals("0x144D", ignoreCase = true)) ->
+                DriverFamily.XCLIPSE_PROPRIETARY
+            else -> DriverFamily.OTHER
+        }
+
     /** U01: what the in-game Graphics tab says about the driver of the running game. */
     enum class InGame {
         /** The presenter has not reported a driver yet. */

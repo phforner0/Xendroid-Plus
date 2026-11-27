@@ -39,6 +39,7 @@
 #include "xenia/gpu/texture_cache.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
+#include "xenia/gpu/vulkan/rt_height_policy.h"
 #include "xenia/gpu/vulkan/spirv_single_sample_patch.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/gpu/vulkan/vulkan_driver_quirks.h"
@@ -48,6 +49,7 @@
 
 DECLARE_bool(accurate_resolve_number_formats);
 DECLARE_bool(log_gpu_frame_time_breakdown);
+DECLARE_bool(merge_tiling_bands);
 DECLARE_bool(msaa_4x_as_2x);
 DECLARE_bool(vulkan_resolve_dest_diag);
 DECLARE_bool(rt_cache_ownership_claim_memo);
@@ -146,6 +148,14 @@ DEFINE_bool(
     "resolve_fast_64bpp_*, resolve_host_depth_*) from 8x8 to 64x1 workgroups "
     "for stride-1 X coalescing. Read at initialization (runtime startup prop: "
     "debug.xendroid.resolve_compute_64x1).",
+    "Vulkan");
+DEFINE_bool(
+    vulkan_rt_rows_on_demand, false,
+    "Allocate Vulkan host render targets with on-demand guest height (floor "
+    "128 px, or >=720 px for multisampled merge_tiling_bands) and grow "
+    "geometrically (>=50%) via vkCmdCopyImage up to the EDRAM wrap height to "
+    "cut 2x/3x resolution-scaling VRAM peaks. Runtime override: "
+    "debug.xendroid.rt_rows_on_demand.",
     "Vulkan");
 DEFINE_int32(
     vulkan_in_pass_resolve_debug_reject, 0,
@@ -1063,13 +1073,14 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   rasterization_order_color_access_ =
       cvars::vulkan_rasterization_order_attachment_access &&
       device_properties.rasterizationOrderColorAttachmentAccess;
-  mali_normalize_mixed_load_ops_ =
-      IsProprietaryMaliDriver(device_properties.vendorID,
-                              uint32_t(device_properties.driverID)) &&
-      (device_properties.maliDriverMajorR <= 0 ||
-       device_properties.maliDriverMajorR * 100 +
-               device_properties.maliDriverMinorP <
-           3801);
+  const MaliDriverQuirks mali_quirks = ComputeMaliQuirks(
+      !device_properties.isPanvk &&
+          IsProprietaryMaliDriver(device_properties.vendorID,
+                                  uint32_t(device_properties.driverID)),
+      device_properties.isPanvk, device_properties.maliDriverMajor,
+      device_properties.maliDriverMinor,
+      device_properties.maxDrawIndirectCount <= 1);
+  mali_normalize_mixed_load_ops_ = mali_quirks.normalize_mixed_load_ops;
   if (mali_normalize_mixed_load_ops_) {
     XELOGI("VulkanRenderTargetCache: normalizing mixed DONT_CARE/LOAD "
            "attachments for Mali < r38p1");
@@ -2226,6 +2237,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
                              nullptr);
   }
   framebuffers_.clear();
+  DestroyDeferredRtDestructions(UINT64_MAX);
 
   last_update_render_pass_ = VK_NULL_HANDLE;
   for (const auto& render_pass_pair : render_passes_) {
@@ -2376,6 +2388,7 @@ void VulkanRenderTargetCache::ClearCache() {
                              nullptr);
   }
   framebuffers_.clear();
+  DestroyDeferredRtDestructions(UINT64_MAX);
 
   last_update_render_pass_ = VK_NULL_HANDLE;
   for (const auto& render_pass_pair : render_passes_) {
@@ -2392,14 +2405,15 @@ void VulkanRenderTargetCache::ClearCache() {
 }
 
 void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
+  const uint64_t completed_submission =
+      command_processor_.GetCompletedSubmission();
   if (transfer_vertex_buffer_pool_) {
-    transfer_vertex_buffer_pool_->Reclaim(
-        command_processor_.GetCompletedSubmission());
+    transfer_vertex_buffer_pool_->Reclaim(completed_submission);
   }
   if (direct_host_resolve_constants_pool_) {
-    direct_host_resolve_constants_pool_->Reclaim(
-        command_processor_.GetCompletedSubmission());
+    direct_host_resolve_constants_pool_->Reclaim(completed_submission);
   }
+  DestroyDeferredRtDestructions(completed_submission);
   SaveRtPipelineCache(false);
 }
 
@@ -2787,6 +2801,7 @@ uint32_t VulkanRenderTargetCache::NoteTilingBandDraw(
     // A draw replacing the whole screen (a clear by a quad, drawn with the
     // scissor of the screen) leaves no rows of the earlier frame to replace.
     if (!tiling_band_color_key_ && is_band_target(color_key)) {
+      EnsureRenderTargetHeight(rts[1], kMergedTilingBandsHeight);
       tiling_band_color_key_ = color_key.key;
       if (!DrawReplacesArea(false, normalized_depth_control,
                             normalized_color_mask, vertex_shader,
@@ -2795,6 +2810,7 @@ uint32_t VulkanRenderTargetCache::NoteTilingBandDraw(
       }
     }
     if (!tiling_band_depth_key_ && is_band_target(depth_key)) {
+      EnsureRenderTargetHeight(rts[0], kMergedTilingBandsHeight);
       tiling_band_depth_key_ = depth_key.key;
       if (!DrawReplacesArea(true, normalized_depth_control,
                             normalized_color_mask, vertex_shader,
@@ -2824,10 +2840,11 @@ void VulkanRenderTargetCache::ReplicateTilingBandRenderTargetRows(
     RenderTarget* render_target, uint32_t band_rows) {
   auto& rt = *static_cast<VulkanRenderTarget*>(render_target);
   FlushDeferredResolveClearForTarget(&rt);
+  EnsureRenderTargetHeight(render_target,
+                           std::max(kMergedTilingBandsHeight, band_rows));
   const RenderTargetKey key = rt.key();
   const uint32_t guest_width = key.GetWidth();
-  const uint32_t guest_height =
-      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples);
+  const uint32_t guest_height = rt.allocated_guest_height();
   const uint32_t guest_band_rows = band_rows;
   const uint32_t width = guest_width * GetKeyScaleX(key);
   const uint32_t height = guest_height * GetKeyScaleY(key);
@@ -4036,6 +4053,43 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
                                      resolve_info.copy_dest_extent_length));
   }
 
+  // Ensure every resolve source render target covers all rows read by its
+  // dispatches (including merge_tiling_bands offsets) before pushing barriers
+  // or binding descriptor sets.
+  for (const DirectHostResolveSource& source : sources) {
+    const uint32_t src_pitch_tiles = source.key.GetPitchTiles();
+    if (!src_pitch_tiles) {
+      continue;
+    }
+    const uint32_t band_offset = GetTilingBandSourceTileOffset(source.key);
+    const uint32_t tile_h =
+        ComputeRtTileHeightPixels(uint32_t(source.key.msaa_samples));
+    uint32_t needed_guest_height = 0;
+    for (uint32_t i = 0; i < source.dispatch_count; ++i) {
+      const ResolveCopyDumpRectangle::Dispatch& dispatch = source.dispatches[i];
+      if (!dispatch.width_tiles || !dispatch.height_tiles) {
+        continue;
+      }
+      const uint64_t last_tile =
+          uint64_t(dump_base) + uint64_t(dispatch.offset) +
+          uint64_t(dispatch.height_tiles - 1u) * uint64_t(dump_pitch) +
+          uint64_t(dispatch.width_tiles - 1u) + uint64_t(band_offset);
+      if (last_tile >= uint64_t(source.key.base_tiles)) {
+        const uint32_t linear =
+            uint32_t(last_tile - uint64_t(source.key.base_tiles));
+        const uint32_t max_tile_y = linear / src_pitch_tiles;
+        needed_guest_height =
+            std::max(needed_guest_height, (max_tile_y + 1u) * tile_h);
+      }
+    }
+    if (needed_guest_height > source.render_target->allocated_guest_height()) {
+      if (!EnsureRenderTargetHeight(source.render_target,
+                                    needed_guest_height)) {
+        return false;
+      }
+    }
+  }
+
   constexpr VkPipelineStageFlags kSourceStageMask =
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   constexpr VkAccessFlags kSourceAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -4120,8 +4174,7 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
           resolve_is_depth ? "depth" : "color",
           ((last_resolve_key_ >> 11) & 0x7FF) * 8,
           (last_resolve_key_ & 0x7FF) * 8, source.key.GetDebugName(),
-          GetRenderTargetHeight(source.key.pitch_tiles_at_32bpp,
-                                source.key.msaa_samples),
+          source.render_target->allocated_guest_height(),
           dump_base, dump_pitch, dump_rows, dump_row_length_used,
           source.pixels_per_thread, dispatches);
     }
@@ -4350,8 +4403,11 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
       }
     }
     const uint32_t rt_w = link_src.key.GetWidth();
-    const uint32_t rt_h = GetRenderTargetHeight(
-        link_src.key.pitch_tiles_at_32bpp, link_src.key.msaa_samples);
+    if (mapping_affine && affine_dx >= 0 && affine_dy >= 0) {
+      EnsureRenderTargetHeight(link_src.render_target,
+                               uint32_t(affine_dy) + resolve_h);
+    }
+    const uint32_t rt_h = link_src.render_target->allocated_guest_height();
     if (mapping_affine && affine_dx >= 0 && affine_dy >= 0 &&
         uint64_t(affine_dx) + resolve_w <= rt_w &&
         uint64_t(affine_dy) + resolve_h <= rt_h &&
@@ -4975,9 +5031,7 @@ bool VulkanRenderTargetCache::Resolve(
             clear_rect.height = clear_rectangle.height_pixels * scale_y;
             const uint32_t rt_host_width = rt_key.GetWidth() * scale_x;
             const uint32_t rt_host_height =
-                GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp,
-                                      rt_key.msaa_samples) *
-                scale_y;
+                vulkan_rt->allocated_guest_height() * scale_y;
             const bool bounds_fit = DeferredClearRectFitsExtent(
                 clear_rect, rt_host_width, rt_host_height);
             const bool has_separate_transfer_view =
@@ -5246,6 +5300,18 @@ void VulkanRenderTargetCache::PollRuntimeDebugProperties() {
   poll_bool_prop("debug.xendroid.resolve_compute_64x1",
                  cvars::vulkan_resolve_compute_64x1,
                  "vulkan_resolve_compute_64x1");
+  {
+    char val[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.rt_rows_on_demand", val) > 0) {
+      bool desired = cvars::vulkan_rt_rows_on_demand;
+      if (ParseStrictBinaryBoolProp(val, desired) &&
+          cvars::vulkan_rt_rows_on_demand != desired) {
+        cvars::vulkan_rt_rows_on_demand = desired;
+        XELOGI("debug.xendroid.rt_rows_on_demand: vulkan_rt_rows_on_demand = {}",
+               desired ? "true" : "false");
+      }
+    }
+  }
 #endif
 }
 
@@ -6818,15 +6884,16 @@ uint32_t VulkanRenderTargetCache::GetMaxRenderTargetHeight() const {
                   device_properties.maxImageDimension2D);
 }
 
-RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
-    RenderTargetKey key) {
+bool VulkanRenderTargetCache::CreateRenderTargetBackingResources(
+    RenderTargetKey key, uint32_t guest_height,
+    RenderTargetBackingResources& out) {
+  out = RenderTargetBackingResources{};
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
   // Create the image.
-
   VkImageCreateInfo image_create_info;
   image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_create_info.pNext = nullptr;
@@ -6834,8 +6901,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
   image_create_info.imageType = VK_IMAGE_TYPE_2D;
   image_create_info.extent.width = key.GetWidth() * GetKeyScaleX(key);
   image_create_info.extent.height =
-      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
-      GetKeyScaleY(key);
+      std::min(guest_height * GetKeyScaleY(key), GetMaxRenderTargetHeight());
   image_create_info.extent.depth = 1;
   image_create_info.mipLevels = 1;
   image_create_info.arrayLayers = 1;
@@ -6878,7 +6944,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
   if (image_create_info.format == VK_FORMAT_UNDEFINED) {
     XELOGE("VulkanRenderTargetCache: Unknown {} render target format {}",
            key.is_depth ? "depth" : "color", key.resource_format);
-    return nullptr;
+    return false;
   }
   // Declare the full set of view formats for mutable-format images (the
   // UNORM/SFLOAT attachment format is aliased with a UINT view for ownership
@@ -6909,7 +6975,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
         "image",
         image_create_info.extent.width, image_create_info.extent.height,
         uint32_t(1) << uint32_t(key.msaa_samples), key.GetFormatName());
-    return nullptr;
+    return false;
   }
 
   // Set debug name for the image.
@@ -6917,7 +6983,6 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
   vulkan_device->SetObjectName(VK_OBJECT_TYPE_IMAGE, image, debug_name.c_str());
 
   // Create the image views.
-
   VkImageViewCreateInfo view_create_info;
   view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
   view_create_info.pNext = nullptr;
@@ -6943,7 +7008,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
         uint32_t(1) << uint32_t(key.msaa_samples), key.GetFormatName());
     dfn.vkDestroyImage(device, image, nullptr);
     dfn.vkFreeMemory(device, memory, nullptr);
-    return nullptr;
+    return false;
   }
   VkImageView view_depth_stencil = VK_NULL_HANDLE;
   VkImageView view_stencil = VK_NULL_HANDLE;
@@ -6962,7 +7027,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
       dfn.vkDestroyImageView(device, view_depth_color, nullptr);
       dfn.vkDestroyImage(device, image, nullptr);
       dfn.vkFreeMemory(device, memory, nullptr);
-      return nullptr;
+      return false;
     }
     view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
     if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
@@ -6977,7 +7042,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
       dfn.vkDestroyImageView(device, view_depth_color, nullptr);
       dfn.vkDestroyImage(device, image, nullptr);
       dfn.vkFreeMemory(device, memory, nullptr);
-      return nullptr;
+      return false;
     }
   } else {
     if (transfer_format != image_create_info.format) {
@@ -6992,7 +7057,7 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
         dfn.vkDestroyImageView(device, view_depth_color, nullptr);
         dfn.vkDestroyImage(device, image, nullptr);
         dfn.vkFreeMemory(device, memory, nullptr);
-        return nullptr;
+        return false;
       }
     }
   }
@@ -7009,10 +7074,16 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
     if (view_color_transfer_separate != VK_NULL_HANDLE) {
       dfn.vkDestroyImageView(device, view_color_transfer_separate, nullptr);
     }
+    if (view_stencil != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, view_stencil, nullptr);
+    }
+    if (view_depth_stencil != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, view_depth_stencil, nullptr);
+    }
     dfn.vkDestroyImageView(device, view_depth_color, nullptr);
     dfn.vkDestroyImage(device, image, nullptr);
     dfn.vkFreeMemory(device, memory, nullptr);
-    return nullptr;
+    return false;
   }
   VkDescriptorSet descriptor_set_transfer_source =
       descriptor_set_pool.Get(descriptor_set_index_transfer_source);
@@ -7085,13 +7156,255 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
     }
   }
 
+  out.image = image;
+  out.memory = memory;
+  out.view_depth_color = view_depth_color;
+  out.view_depth_stencil = view_depth_stencil;
+  out.view_stencil = view_stencil;
+  out.view_color_transfer_separate = view_color_transfer_separate;
+  out.descriptor_set_index_transfer_source =
+      descriptor_set_index_transfer_source;
+  out.descriptor_set_index_input_attachment =
+      descriptor_set_index_input_attachment;
+  return true;
+}
+
+RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
+    RenderTargetKey key) {
+  const uint32_t max_guest_height =
+      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples);
+  const uint32_t initial_guest_height = ComputeInitialRenderTargetHeight(
+      max_guest_height, create_render_target_height_hint(),
+      uint32_t(key.msaa_samples), cvars::merge_tiling_bands,
+      cvars::vulkan_rt_rows_on_demand);
+  RenderTargetBackingResources resources;
+  if (!CreateRenderTargetBackingResources(key, initial_guest_height,
+                                          resources)) {
+    return nullptr;
+  }
   VulkanRenderTarget* render_target = new VulkanRenderTarget(
-      key, *this, image, memory, view_depth_color, view_depth_stencil,
-      view_stencil, view_color_transfer_separate,
-      descriptor_set_index_transfer_source);
+      key, *this, resources.image, resources.memory, resources.view_depth_color,
+      resources.view_depth_stencil, resources.view_stencil,
+      resources.view_color_transfer_separate,
+      resources.descriptor_set_index_transfer_source, initial_guest_height,
+      max_guest_height);
   render_target->SetDescriptorSetIndexInputAttachment(
-      descriptor_set_index_input_attachment);
+      resources.descriptor_set_index_input_attachment);
   return render_target;
+}
+
+bool VulkanRenderTargetCache::EnsureRenderTargetHeight(
+    RenderTarget* render_target, uint32_t needed_guest_height) {
+  if (!render_target || GetPath() != Path::kHostRenderTargets) {
+    return true;
+  }
+  auto* vulkan_rt = static_cast<VulkanRenderTarget*>(render_target);
+  const uint32_t clamped_needed =
+      std::min(needed_guest_height, vulkan_rt->max_guest_height());
+  if (clamped_needed <= vulkan_rt->allocated_guest_height()) {
+    return true;
+  }
+  return GrowRenderTarget(vulkan_rt, clamped_needed);
+}
+
+bool VulkanRenderTargetCache::GrowRenderTarget(
+    VulkanRenderTarget* render_target, uint32_t needed_guest_height) {
+  const RenderTargetKey key = render_target->key();
+  const uint32_t old_guest_height = render_target->allocated_guest_height();
+  const uint32_t max_guest_height = render_target->max_guest_height();
+  const uint32_t grown_guest_height = ComputeGrownRenderTargetHeight(
+      old_guest_height, needed_guest_height, max_guest_height,
+      uint32_t(key.msaa_samples));
+  if (grown_guest_height <= old_guest_height) {
+    return true;
+  }
+
+  // 1. Drain any pending deferred clear on this RT while the old backing and
+  // framebuffers are still valid, then close any open render pass before copy.
+  FlushDeferredResolveClearForTarget(render_target);
+  if (command_processor_.in_render_pass()) {
+    command_processor_.EndRenderPass();
+  }
+
+  // 2. Allocate the taller VkImage, views, and fresh descriptor set slots.
+  RenderTargetBackingResources next_res;
+  if (!CreateRenderTargetBackingResources(key, grown_guest_height, next_res)) {
+    return false;
+  }
+
+  // 3. Copy preserved sub-region [0, old_host_height) when the old image has
+  // defined contents, preserving exact aspectMask and MSAA sample count.
+  const VkImage old_image = render_target->image();
+  const VkImageLayout old_layout = render_target->current_layout();
+  const VkPipelineStageFlags old_stage = render_target->current_stage_mask();
+  const VkAccessFlags old_access = render_target->current_access_mask();
+  if (old_layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+    const VkImageAspectFlags aspect =
+        key.is_depth
+            ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+            : VK_IMAGE_ASPECT_COLOR_BIT;
+    const VkImageSubresourceRange subresource_range =
+        ui::vulkan::util::InitializeSubresourceRange(aspect);
+    const VkPipelineStageFlags src_stage =
+        old_stage ? old_stage : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    command_processor_.PushImageMemoryBarrier(
+        old_image, subresource_range, src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        old_access, VK_ACCESS_TRANSFER_READ_BIT, old_layout,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    command_processor_.PushImageMemoryBarrier(
+        next_res.image, subresource_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    command_processor_.SubmitBarriers(true);
+
+    const uint32_t old_host_width = key.GetWidth() * GetKeyScaleX(key);
+    const uint32_t old_host_height = std::min(
+        old_guest_height * GetKeyScaleY(key), GetMaxRenderTargetHeight());
+    VkImageCopy copy_region = {};
+    copy_region.srcSubresource.aspectMask = aspect;
+    copy_region.srcSubresource.mipLevel = 0;
+    copy_region.srcSubresource.baseArrayLayer = 0;
+    copy_region.srcSubresource.layerCount = 1;
+    copy_region.srcOffset = {0, 0, 0};
+    copy_region.dstSubresource = copy_region.srcSubresource;
+    copy_region.dstOffset = {0, 0, 0};
+    copy_region.extent = {old_host_width, old_host_height, 1};
+    command_processor_.deferred_command_buffer().CmdVkCopyImage(
+        old_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, next_res.image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+
+    VkPipelineStageFlags target_stage;
+    VkAccessFlags target_access;
+    VkImageLayout target_layout;
+    if (old_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL ||
+        old_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+        old_layout == VK_IMAGE_LAYOUT_GENERAL) {
+      render_target->GetDrawUsage(&target_stage, &target_access,
+                                  &target_layout);
+    } else {
+      target_stage = src_stage;
+      target_access = old_access;
+      target_layout = old_layout;
+    }
+    command_processor_.PushImageMemoryBarrier(
+        next_res.image, subresource_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        target_stage, VK_ACCESS_TRANSFER_WRITE_BIT, target_access,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, target_layout);
+    render_target->SetUsage(target_stage, target_access, target_layout);
+  } else {
+    render_target->SetUsage(0, 0, VK_IMAGE_LAYOUT_UNDEFINED);
+  }
+
+  // 4 & 5. Retire old image/views/descriptors for deferred destruction after
+  // the current submission completes (Onda 3A Submit Worker safe).
+  DeferredRtDestruction deferred;
+  deferred.submission = command_processor_.GetCurrentSubmission();
+  deferred.image = old_image;
+  deferred.memory = render_target->memory();
+  deferred.view_depth_color = render_target->view_depth_color();
+  deferred.view_depth_stencil = render_target->view_depth_stencil();
+  deferred.view_stencil = render_target->view_stencil();
+  deferred.view_color_transfer_separate =
+      render_target->view_color_transfer_separate();
+  deferred.is_depth = key.is_depth != 0;
+  deferred.descriptor_set_index_transfer_source =
+      render_target->descriptor_set_index_transfer_source();
+  deferred.descriptor_set_index_input_attachment =
+      render_target->descriptor_set_index_input_attachment();
+
+  render_target->ReplaceBackingResources(
+      next_res.image, next_res.memory, next_res.view_depth_color,
+      next_res.view_depth_stencil, next_res.view_stencil,
+      next_res.view_color_transfer_separate,
+      next_res.descriptor_set_index_transfer_source,
+      next_res.descriptor_set_index_input_attachment, grown_guest_height);
+
+  // 6. Invalidate every cached framebuffer referencing this RT's base_tiles
+  // and move its VkFramebuffer to deferred destruction.
+  for (auto it = framebuffers_.begin(); it != framebuffers_.end();) {
+    const FramebufferKey& fb_key = it->first;
+    const uint32_t color_bases[4] = {
+        fb_key.color_0_base_tiles, fb_key.color_1_base_tiles,
+        fb_key.color_2_base_tiles, fb_key.color_3_base_tiles};
+    if (FramebufferReferencesRenderTargetBase(
+            fb_key.render_pass_key.depth_and_color_used,
+            fb_key.depth_base_tiles, color_bases, key.is_depth != 0,
+            key.base_tiles)) {
+      if (&it->second == last_update_framebuffer_) {
+        last_update_framebuffer_ = nullptr;
+      }
+      if (it->second.framebuffer != VK_NULL_HANDLE) {
+        deferred.framebuffers.push_back(it->second.framebuffer);
+      }
+      it = framebuffers_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  deferred_rt_destructions_.push_back(std::move(deferred));
+
+  XELOGGPU("Grew {} from {} to {} guest rows (max {})", key.GetDebugName(),
+           old_guest_height, grown_guest_height, max_guest_height);
+  return true;
+}
+
+void VulkanRenderTargetCache::DestroyDeferredRtDestructions(
+    uint64_t completed_submission) {
+  if (deferred_rt_destructions_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  size_t write_index = 0;
+  for (size_t i = 0; i < deferred_rt_destructions_.size(); ++i) {
+    DeferredRtDestruction& entry = deferred_rt_destructions_[i];
+    if (entry.submission > completed_submission) {
+      if (write_index != i) {
+        deferred_rt_destructions_[write_index] = std::move(entry);
+      }
+      ++write_index;
+      continue;
+    }
+    for (VkFramebuffer fb : entry.framebuffers) {
+      if (fb != VK_NULL_HANDLE) {
+        dfn.vkDestroyFramebuffer(device, fb, nullptr);
+      }
+    }
+    if (entry.descriptor_set_index_transfer_source != SIZE_MAX) {
+      auto* pool = entry.is_depth ? descriptor_set_pool_sampled_image_x2_.get()
+                                  : descriptor_set_pool_sampled_image_.get();
+      if (pool) {
+        pool->Free(entry.descriptor_set_index_transfer_source);
+      }
+    }
+    if (entry.descriptor_set_index_input_attachment != SIZE_MAX &&
+        descriptor_set_pool_input_attachment_) {
+      descriptor_set_pool_input_attachment_->Free(
+          entry.descriptor_set_index_input_attachment);
+    }
+    if (entry.view_color_transfer_separate != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, entry.view_color_transfer_separate,
+                             nullptr);
+    }
+    if (entry.view_stencil != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, entry.view_stencil, nullptr);
+    }
+    if (entry.view_depth_stencil != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, entry.view_depth_stencil, nullptr);
+    }
+    if (entry.view_depth_color != VK_NULL_HANDLE) {
+      dfn.vkDestroyImageView(device, entry.view_depth_color, nullptr);
+    }
+    if (entry.image != VK_NULL_HANDLE) {
+      dfn.vkDestroyImage(device, entry.image, nullptr);
+    }
+    if (entry.memory != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, entry.memory, nullptr);
+    }
+  }
+  deferred_rt_destructions_.resize(write_index);
 }
 
 bool VulkanRenderTargetCache::IsHostDepthEncodingDifferent(
@@ -7257,6 +7570,7 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
   }
 
   VkImageView attachments[1 + xenos::kMaxColorRenderTargets];
+  uint32_t attachment_guest_heights[1 + xenos::kMaxColorRenderTargets];
   uint32_t attachment_count = 0;
   uint32_t depth_and_color_rts_remaining = render_pass_key.depth_and_color_used;
   uint32_t rt_index;
@@ -7272,6 +7586,8 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
     } else {
       attachment = vulkan_rt.view_depth_stencil();
     }
+    attachment_guest_heights[attachment_count] =
+        vulkan_rt.allocated_guest_height();
     attachments[attachment_count++] = attachment;
   }
 
@@ -7290,8 +7606,10 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
   if (pitch_tiles_at_32bpp) {
     host_extent.width = RenderTargetKey::GetWidth(pitch_tiles_at_32bpp,
                                                   render_pass_key.msaa_samples);
-    host_extent.height = GetRenderTargetHeight(pitch_tiles_at_32bpp,
-                                               render_pass_key.msaa_samples);
+    const uint32_t max_guest_height =
+        GetRenderTargetHeight(pitch_tiles_at_32bpp, render_pass_key.msaa_samples);
+    host_extent.height = ComputeFramebufferGuestHeight(
+        max_guest_height, attachment_guest_heights, attachment_count);
     if (IsScaleNativeForPitch(pitch_tiles_at_32bpp,
                               render_pass_key.msaa_samples)) {
       framebuffer_scale_x = 1;
@@ -12129,6 +12447,44 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
 
   command_processor_.PushDebugMarker(
       "DumpRenderTargets (EDRAM Write): base tile %u", dump_base);
+
+  // Ensure dumped render targets cover all rows read by their dispatches.
+  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+    auto* rt = static_cast<VulkanRenderTarget*>(rectangle.render_target);
+    const RenderTargetKey rt_key = rt->key();
+    const uint32_t src_pitch_tiles = rt_key.GetPitchTiles();
+    if (!src_pitch_tiles) {
+      continue;
+    }
+    ResolveCopyDumpRectangle::Dispatch
+        dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
+    const uint32_t dispatch_count =
+        rectangle.GetDispatches(dump_pitch, dump_row_length_used, dispatches);
+    const uint32_t band_offset = GetTilingBandSourceTileOffset(rt_key);
+    const uint32_t tile_h =
+        ComputeRtTileHeightPixels(uint32_t(rt_key.msaa_samples));
+    uint32_t needed_guest_height = 0;
+    for (uint32_t i = 0; i < dispatch_count; ++i) {
+      const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
+      if (!dispatch.width_tiles || !dispatch.height_tiles) {
+        continue;
+      }
+      const uint64_t last_tile =
+          uint64_t(dump_base) + uint64_t(dispatch.offset) +
+          uint64_t(dispatch.height_tiles - 1u) * uint64_t(dump_pitch) +
+          uint64_t(dispatch.width_tiles - 1u) + uint64_t(band_offset);
+      if (last_tile >= uint64_t(rt_key.base_tiles)) {
+        const uint32_t linear =
+            uint32_t(last_tile - uint64_t(rt_key.base_tiles));
+        const uint32_t max_tile_y = linear / src_pitch_tiles;
+        needed_guest_height =
+            std::max(needed_guest_height, (max_tile_y + 1u) * tile_h);
+      }
+    }
+    if (needed_guest_height > rt->allocated_guest_height()) {
+      EnsureRenderTargetHeight(rt, needed_guest_height);
+    }
+  }
 
   // Clear previously set temporary indices.
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
