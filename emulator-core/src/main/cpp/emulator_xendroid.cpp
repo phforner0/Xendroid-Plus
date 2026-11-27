@@ -21,9 +21,14 @@
 #include "xenia/vfs/devices/stfs_xbox.h"
 #include "xenia/base/mapped_memory.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/android_thermal.h"
 #include "xenia/base/frame_stats.h"
 #include "xenia/ui/presentation_runtime.h"
+#include "xenia/ui/vulkan/vulkan_present_timing.h"
 #include "xenia/ui/vulkan/zerofg_config.h"
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 #include "xenia/gpu/gpu_live_options.h"
 #include "third_party/lsfg/lsfg_dll.h"
 #include "xenia/apu/apu_flags.h"
@@ -1328,6 +1333,20 @@ static void j_set_presenter_adpf_target(JNIEnv* env, jobject thiz, jlong target_
     }
     if (sync) sync(clamped);
 }
+DECLARE_bool(vulkan_auto_vrs_headroom);
+static void j_set_system_headroom(JNIEnv* env, jobject thiz, jfloat cpu_headroom, jfloat gpu_headroom) {
+    bool enabled = cvars::vulkan_auto_vrs_headroom;
+#if defined(__ANDROID__)
+    char prop[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.auto_vrs_headroom", prop) > 0) {
+        xe::ui::vulkan::ParseStrictBoolProperty(prop, enabled);
+    }
+#endif
+    xe::SetAndroidComputeHeadroomEnabled(enabled);
+    xe::SetAndroidComputeHeadroom(static_cast<float>(cpu_headroom),
+                                  static_cast<float>(gpu_headroom),
+                                  xe::AndroidThermalMonotonicMs());
+}
 // The diagnostic build's "Capture frame" (ae::request_frame_trace).
 static jboolean j_frame_trace_available(JNIEnv* env, jobject thiz) { return ae::frame_trace_available(); }
 static jboolean j_request_frame_trace(JNIEnv* env, jobject thiz) { return ae::request_frame_trace(); }
@@ -2461,6 +2480,7 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"request_frame_trace", "()Z", (void *) j_request_frame_trace}
             ,{"presenter_work", "()[J", (void *) j_presenter_work}
             ,{"set_presenter_adpf_target", "(J)V", (void *) j_set_presenter_adpf_target}
+            ,{"set_system_headroom", "(FF)V", (void *) j_set_system_headroom}
             ,{"set_frame_generation", "(ZIF)V", (void *) j_set_frame_generation}
             ,{"set_zerofg_mode", "(I)V", (void *) j_set_zerofg_mode}
             ,{"zerofg_mode", "()I", (void *) j_zerofg_mode}

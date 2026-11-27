@@ -34,6 +34,7 @@
 #include "xenia/ui/vulkan/vulkan_device.h"
 #include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
 #include "xenia/ui/vulkan/vulkan_instance.h"
+#include "xenia/ui/vulkan/vulkan_present_timing.h"
 #include "xenia/ui/vulkan/zerofg_independent_presenter.h"
 #include "xenia/ui/vulkan/zerofg_config.h"
 
@@ -443,6 +444,19 @@ class VulkanPresenter final : public Presenter {
       VkFramebuffer framebuffer;
     };
 
+    struct SwapchainTimingState {
+      PresentTimingBackend backend = PresentTimingBackend::kNone;
+      uint64_t refresh_duration_ns = 0;
+      uint64_t timing_properties_counter = 0;
+      uint64_t time_domains_counter = 0;
+      SelectedTimeDomain time_domain = {};
+      uint32_t stage_query_mask = 0;
+      uint32_t target_stage = 0;
+      bool present_at_absolute_time = false;
+      bool use_present_id2 = false;
+      bool use_present_id1 = false;
+    };
+
     explicit PaintContext(VulkanDevice* const vulkan_device)
         : vulkan_device(vulkan_device),
           completion_timeline(vulkan_device, "paint") {}
@@ -455,7 +469,13 @@ class VulkanPresenter final : public Presenter {
         uint32_t& present_queue_family_out, VkFormat& image_format_out,
         VkExtent2D& image_extent_out, bool& is_fifo_out,
         uint32_t& requested_image_count_out,
-        VkPresentModeKHR& present_mode_out, bool& ui_surface_unusable_out);
+        VkPresentModeKHR& present_mode_out,
+        SwapchainTimingState& timing_state_out, bool& ui_surface_unusable_out);
+#ifdef VK_EXT_present_timing
+    static bool QueryExtSwapchainTimingMetadata(
+        const VulkanDevice* vulkan_device, VkSwapchainKHR swapchain,
+        SwapchainTimingState& state);
+#endif
 
     VkSwapchainKHR PrepareForSwapchainRetirement();
     void DestroySwapchainAndVulkanSurface();
@@ -500,6 +520,7 @@ class VulkanPresenter final : public Presenter {
     bool swapchain_frame_generation_policy = false;
     uint32_t swapchain_requested_image_count = 0;
     VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    SwapchainTimingState swapchain_timing;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
     std::vector<VkSemaphore> swapchain_image_present_semaphores;
@@ -627,6 +648,8 @@ class VulkanPresenter final : public Presenter {
   uint64_t native_latency_overflow_samples_ = 0;
   uint64_t native_latency_unmatched_timings_ = 0;
   uint64_t native_latency_overwritten_records_ = 0;
+  uint64_t native_last_present_ns_ = 0;
+  void RefreshSwapchainTimingMetadata();
   void PollNativeLatency();
 };
 

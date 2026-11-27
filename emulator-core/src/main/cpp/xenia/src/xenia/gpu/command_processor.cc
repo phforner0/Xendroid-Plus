@@ -35,9 +35,11 @@ DECLARE_bool(kernel_delay0_backoff);
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/frame_stats.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
+#include "xenia/ui/vulkan/vulkan_present_timing.h"
 #include "xenia/config.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/backend/code_cache.h"
@@ -1665,17 +1667,36 @@ void CommandProcessor::ThrottlePresentation() {
       target_duration_ms * static_cast<double>(tick_freq) / 1000.0);
 
   // Spin until target duration has elapsed
+  bool late_swap_enabled = false;
+  if (cvar::ConfigVars) {
+    auto it = cvar::ConfigVars->find("vulkan_late_swap_present");
+    if (it != cvar::ConfigVars->end() && it->second) {
+      const std::string val = it->second->effective_value();
+      if (val == "true" || val == "1") {
+        late_swap_enabled = true;
+      } else if (val == "false" || val == "0") {
+        late_swap_enabled = false;
+      }
+    }
+  }
+#if defined(__ANDROID__)
+  char late_swap_prop[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.xendroid.late_swap", late_swap_prop) > 0) {
+    ui::vulkan::ParseStrictBoolProperty(late_swap_prop, late_swap_enabled);
+  }
+#endif
+  // Explicit ZeroFG safety bypass: never alter frame pacing when ZeroFG owns
+  // the main surface.
+  const bool zerofg_active = xe::IsZeroFGMainSurfaceActive();
+
   while (true) {
     const uint64_t current_time = Clock::QueryGuestTickCount();
     const uint64_t time_delta = current_time - last_swap_time_;
 
     if (time_delta >= target_duration_ticks) {
-      // If we've fallen behind by more than 2 frames, reset to catch up
-      if (time_delta > target_duration_ticks * 2) {
-        last_swap_time_ = current_time;
-      } else {
-        last_swap_time_ += target_duration_ticks;
-      }
+      last_swap_time_ = ui::vulkan::ComputeNextThrottleAnchorTicks(
+          last_swap_time_, current_time, target_duration_ticks, zerofg_active,
+          late_swap_enabled);
       return;
     }
 

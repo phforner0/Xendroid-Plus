@@ -313,6 +313,13 @@ class VulkanDevice {
     bool pipelineExecutableInfoSupported = false;
     bool pipelineExecutableInfo = false;
 
+    // VK_EXT_present_timing (#209) + VK_KHR_present_id2 / VK_KHR_present_id.
+    bool presentTiming = false;
+    bool presentAtAbsoluteTime = false;
+    bool presentAtRelativeTime = false;
+    bool presentId2 = false;
+    bool presentId = false;
+
     // VK_KHR_buffer_device_address (#245, promoted to 1.2)
     bool bufferDeviceAddress = false;
 
@@ -358,6 +365,9 @@ class VulkanDevice {
   struct Extensions {
     bool ext_KHR_pipeline_executable_properties = false;
     bool ext_KHR_swapchain = false;                     // #2
+    bool ext_EXT_present_timing = false;                // #209
+    bool ext_KHR_present_id2 = false;                   // #480
+    bool ext_KHR_present_id = false;                    // #295
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
@@ -454,6 +464,35 @@ class VulkanDevice {
       const {
     return vkGetPastPresentationTimingGOOGLE_;
   }
+  PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR
+  vkGetPhysicalDeviceSurfaceCapabilities2KHR() const {
+    return vkGetPhysicalDeviceSurfaceCapabilities2KHR_;
+  }
+#ifdef VK_EXT_present_timing
+  PFN_vkSetSwapchainPresentTimingQueueSizeEXT
+  vkSetSwapchainPresentTimingQueueSizeEXT() const {
+    return vkSetSwapchainPresentTimingQueueSizeEXT_;
+  }
+  PFN_vkGetSwapchainTimingPropertiesEXT vkGetSwapchainTimingPropertiesEXT()
+      const {
+    return vkGetSwapchainTimingPropertiesEXT_;
+  }
+  PFN_vkGetSwapchainTimeDomainPropertiesEXT
+  vkGetSwapchainTimeDomainPropertiesEXT() const {
+    return vkGetSwapchainTimeDomainPropertiesEXT_;
+  }
+  PFN_vkGetPastPresentationTimingEXT vkGetPastPresentationTimingEXT() const {
+    return vkGetPastPresentationTimingEXT_;
+  }
+  bool HasPresentTimingExtPfns() const {
+    return vkSetSwapchainPresentTimingQueueSizeEXT_ &&
+           vkGetSwapchainTimingPropertiesEXT_ &&
+           vkGetSwapchainTimeDomainPropertiesEXT_ &&
+           vkGetPastPresentationTimingEXT_;
+  }
+#else
+  bool HasPresentTimingExtPfns() const { return false; }
+#endif
   PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue() const {
     return vkGetSemaphoreCounterValue_;
   }
@@ -732,6 +771,17 @@ class VulkanDevice {
       nullptr;
   PFN_vkGetPastPresentationTimingGOOGLE vkGetPastPresentationTimingGOOGLE_ =
       nullptr;
+  PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR
+      vkGetPhysicalDeviceSurfaceCapabilities2KHR_ = nullptr;
+#ifdef VK_EXT_present_timing
+  PFN_vkSetSwapchainPresentTimingQueueSizeEXT
+      vkSetSwapchainPresentTimingQueueSizeEXT_ = nullptr;
+  PFN_vkGetSwapchainTimingPropertiesEXT vkGetSwapchainTimingPropertiesEXT_ =
+      nullptr;
+  PFN_vkGetSwapchainTimeDomainPropertiesEXT
+      vkGetSwapchainTimeDomainPropertiesEXT_ = nullptr;
+  PFN_vkGetPastPresentationTimingEXT vkGetPastPresentationTimingEXT_ = nullptr;
+#endif
   PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue_ = nullptr;
   PFN_vkWaitSemaphores vkWaitSemaphores_ = nullptr;
   PFN_vkCmdPipelineBarrier2 vkCmdPipelineBarrier2_ = nullptr;

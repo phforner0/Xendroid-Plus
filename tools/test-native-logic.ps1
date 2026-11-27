@@ -118,4 +118,16 @@ foreach ($Pair in @(
   $Passed++
 }
 
+# Wave 6 Onda 4C (VK_EXT_present_timing + late-swap + Android 16 Headroom VRS)
+$Onda4cSrc = Join-Path $TestDir "wave6_onda4c_platform_test.cc"
+if (Test-Path $Onda4cSrc) {
+  $Onda4cExe = Join-Path $BuildDir "wave6_onda4c_platform_test.exe"
+  $VulkanHeadersInc = Join-Path $Xenia "third_party\Vulkan-Headers\include"
+  & $Compiler @CommonFlags "-I" $VulkanHeadersInc "-DXE_DISABLE_ANDROID_DLOPEN=1" $Onda4cSrc -o $Onda4cExe
+  if ($LASTEXITCODE -ne 0) { throw "Compile failed for wave6_onda4c_platform_test" }
+  & $Onda4cExe $Cpp
+  if ($LASTEXITCODE -ne 0) { throw "Test failed: wave6_onda4c_platform_test" }
+  $Passed++
+}
+
 Write-Output "test-native-logic.ps1: PASS ($Passed suite(s) passed on Windows host via $Compiler)"
