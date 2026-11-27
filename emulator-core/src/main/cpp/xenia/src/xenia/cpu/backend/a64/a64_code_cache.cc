@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/backend/a64/a64_code_cache.h"
 
+#include <algorithm>
 #include <cstdint>
 
 #include "xenia/base/cvar.h"
@@ -312,12 +313,51 @@ bool A64CodeCache::TryPatchDirectCallSite(uint32_t target_guest_addr,
   return false;
 }
 
+void A64CodeCache::RetirePicSiteLocked(
+    std::unordered_map<uintptr_t, IndirectCallPicSite>::iterator site_it) {
+  const uintptr_t gate_rx = site_it->first;
+  if (site_it->second.state == IndirectCallPicState::kPatched) {
+    auto patched_it =
+        patched_pic_sites_.find(site_it->second.cached_guest_target);
+    if (patched_it != patched_pic_sites_.end()) {
+      auto& gates = patched_it->second;
+      gates.erase(std::remove(gates.begin(), gates.end(), gate_rx),
+                  gates.end());
+      if (gates.empty()) {
+        patched_pic_sites_.erase(patched_it);
+      }
+    }
+  }
+  auto caller_it = pic_caller_by_gate_.find(gate_rx);
+  if (caller_it != pic_caller_by_gate_.end()) {
+    const uint32_t caller_addr = caller_it->second;
+    pic_caller_by_gate_.erase(caller_it);
+    auto by_caller_it = pic_sites_by_caller_.find(caller_addr);
+    if (by_caller_it != pic_sites_by_caller_.end()) {
+      auto& caller_gates = by_caller_it->second;
+      caller_gates.erase(
+          std::remove(caller_gates.begin(), caller_gates.end(), gate_rx),
+          caller_gates.end());
+      if (caller_gates.empty()) {
+        pic_sites_by_caller_.erase(by_caller_it);
+      }
+    }
+  }
+  pic_sites_by_gate_.erase(site_it);
+}
+
+size_t A64CodeCache::TrackedPicSiteCount() const {
+  std::lock_guard<std::mutex> lock(pic_sites_mutex_);
+  return pic_sites_by_gate_.size();
+}
+
 void A64CodeCache::RegisterIndirectCallPicSite(uintptr_t gate_rx,
                                                uintptr_t cmp_lo_rx,
                                                uintptr_t cmp_hi_rx,
                                                uintptr_t call_op_rx,
                                                uintptr_t fallback_rx,
-                                               bool is_tail) {
+                                               bool is_tail,
+                                               uint32_t caller_guest_addr) {
   if (!IsInExecuteRange(gate_rx) || !IsInExecuteRange(cmp_lo_rx) ||
       !IsInExecuteRange(cmp_hi_rx) || !IsInExecuteRange(call_op_rx) ||
       !IsInExecuteRange(fallback_rx)) {
@@ -336,6 +376,10 @@ void A64CodeCache::RegisterIndirectCallPicSite(uintptr_t gate_rx,
   site.is_tail = is_tail;
   site.state = IndirectCallPicState::kUninitialized;
   pic_sites_by_gate_.emplace(gate_rx, site);
+  if (caller_guest_addr != 0) {
+    pic_caller_by_gate_.emplace(gate_rx, caller_guest_addr);
+    pic_sites_by_caller_[caller_guest_addr].push_back(gate_rx);
+  }
 }
 
 bool A64CodeCache::FallbackIndirectCallPicSite(uintptr_t gate_rx) {
@@ -357,7 +401,9 @@ bool A64CodeCache::FallbackIndirectCallPicSite(uintptr_t gate_rx) {
     return false;
   }
   FlushPatchedInstruction(gate_rw, reinterpret_cast<void*>(gate_rx));
-  it->second.state = IndirectCallPicState::kFallback;
+  // Permanently retired to fallback: evict from tracking maps so
+  // pic_sites_by_gate_ never grows unboundedly.
+  RetirePicSiteLocked(it);
   return true;
 }
 
@@ -381,17 +427,26 @@ bool A64CodeCache::TryPatchIndirectCallPicSite(uintptr_t gate_rx,
       !ComputeIndirectCallPicPatchWords(site, target_guest_addr, target_rx,
                                         &words)) {
     // Target is out of +-128 MiB rel26 reach (or external to code cache):
-    // permanently rewrite gate to `b pic_fallback_lookup` via 1-word CMODX.
+    // permanently rewrite gate to `b pic_fallback_lookup` via 1-word CMODX
+    // and evict the retired entry from pic_sites_by_gate_.
+    bool retired = false;
     uint32_t fallback_gate = 0;
     if (ComputeIndirectCallPicFallbackGate(site, &fallback_gate)) {
       if (uint32_t* gate_rw = WriteSlotForExecuteAddress(site.gate_rx)) {
         if (PatchA64InstructionAtomic(gate_rw, fallback_gate)) {
           FlushPatchedInstruction(gate_rw,
                                   reinterpret_cast<void*>(site.gate_rx));
+          retired = true;
         }
       }
+    } else {
+      retired = true;
     }
-    site.state = IndirectCallPicState::kFallback;
+    if (retired) {
+      RetirePicSiteLocked(it);
+    } else {
+      site.state = IndirectCallPicState::kFallback;
+    }
     return false;
   }
 
@@ -431,17 +486,13 @@ void A64CodeCache::RevertDirectCallSitesInRange(uint32_t guest_start,
   if (guest_start > guest_end) {
     return;
   }
+  const bool single_address = (guest_start == guest_end);
   {
     std::lock_guard<std::mutex> lock(direct_call_sites_mutex_);
-    for (auto it = patched_direct_call_sites_.begin();
-         it != patched_direct_call_sites_.end();) {
-      const uint32_t target_addr = it->first;
-      if (target_addr < guest_start || target_addr > guest_end) {
-        ++it;
-        continue;
-      }
+    auto revert_direct_entry = [&](uint32_t target_addr,
+                                   const std::vector<DirectCallSite>& sites) {
       auto& pending = pending_direct_call_sites_[target_addr];
-      for (const auto& site : it->second) {
+      for (const auto& site : sites) {
         uint32_t* rw_slot = WriteSlotForExecuteAddress(site.call_site_rx);
         if (rw_slot &&
             PatchA64InstructionAtomic(rw_slot, site.original_stub_insn)) {
@@ -450,37 +501,88 @@ void A64CodeCache::RevertDirectCallSitesInRange(uint32_t guest_start,
         }
         pending.push_back(site);
       }
-      it = patched_direct_call_sites_.erase(it);
+    };
+    if (single_address) {
+      // O(1) point lookup avoids O(N^2) scans during bulk per-function
+      // invalidation (e.g. late VSCR[SAT] census flip after .jprof precompile).
+      auto it = patched_direct_call_sites_.find(guest_start);
+      if (it != patched_direct_call_sites_.end()) {
+        revert_direct_entry(it->first, it->second);
+        patched_direct_call_sites_.erase(it);
+      }
+    } else {
+      for (auto it = patched_direct_call_sites_.begin();
+           it != patched_direct_call_sites_.end();) {
+        const uint32_t target_addr = it->first;
+        if (target_addr < guest_start || target_addr > guest_end) {
+          ++it;
+          continue;
+        }
+        revert_direct_entry(target_addr, it->second);
+        it = patched_direct_call_sites_.erase(it);
+      }
     }
   }
   {
     std::lock_guard<std::mutex> lock(pic_sites_mutex_);
-    for (auto it = patched_pic_sites_.begin();
-         it != patched_pic_sites_.end();) {
-      const uint32_t target_addr = it->first;
-      if (target_addr < guest_start || target_addr > guest_end) {
-        ++it;
-        continue;
+    std::vector<uintptr_t> gates_to_retire;
+    if (single_address) {
+      // O(1) point lookups for both target-matched and caller-owned PIC sites.
+      auto pit = patched_pic_sites_.find(guest_start);
+      if (pit != patched_pic_sites_.end()) {
+        gates_to_retire.insert(gates_to_retire.end(), pit->second.begin(),
+                               pit->second.end());
+        patched_pic_sites_.erase(pit);
       }
-      for (uintptr_t gate_rx : it->second) {
-        auto site_it = pic_sites_by_gate_.find(gate_rx);
-        if (site_it == pic_sites_by_gate_.end() ||
-            site_it->second.state != IndirectCallPicState::kPatched) {
+      auto cit = pic_sites_by_caller_.find(guest_start);
+      if (cit != pic_sites_by_caller_.end()) {
+        gates_to_retire.insert(gates_to_retire.end(), cit->second.begin(),
+                               cit->second.end());
+        pic_sites_by_caller_.erase(cit);
+      }
+    } else {
+      // 1. Retire PIC sites whose cached target lies inside the swept range.
+      for (auto it = patched_pic_sites_.begin();
+           it != patched_pic_sites_.end();) {
+        const uint32_t target_addr = it->first;
+        if (target_addr < guest_start || target_addr > guest_end) {
+          ++it;
           continue;
         }
-        uint32_t fallback_gate = 0;
-        if (ComputeIndirectCallPicFallbackGate(site_it->second,
-                                               &fallback_gate)) {
-          uint32_t* gate_rw = WriteSlotForExecuteAddress(gate_rx);
-          if (gate_rw && PatchA64InstructionAtomic(gate_rw, fallback_gate)) {
-            FlushPatchedInstruction(gate_rw, reinterpret_cast<void*>(gate_rx));
-          }
-        }
-        // Never overwrite cmp_lo/cmp_hi/call_op while other cores may be in
-        // flight past the gate; permanently retire to fallback lookup.
-        site_it->second.state = IndirectCallPicState::kFallback;
+        gates_to_retire.insert(gates_to_retire.end(), it->second.begin(),
+                               it->second.end());
+        it = patched_pic_sites_.erase(it);
       }
-      it = patched_pic_sites_.erase(it);
+      // 2. Retire any remaining PIC sites (including kUninitialized ones) owned
+      // by swept caller functions so dynamic recompiles cannot leak entries.
+      for (auto it = pic_sites_by_caller_.begin();
+           it != pic_sites_by_caller_.end();) {
+        const uint32_t caller_addr = it->first;
+        if (caller_addr < guest_start || caller_addr > guest_end) {
+          ++it;
+          continue;
+        }
+        gates_to_retire.insert(gates_to_retire.end(), it->second.begin(),
+                               it->second.end());
+        it = pic_sites_by_caller_.erase(it);
+      }
+    }
+    for (uintptr_t gate_rx : gates_to_retire) {
+      auto site_it = pic_sites_by_gate_.find(gate_rx);
+      if (site_it == pic_sites_by_gate_.end()) {
+        continue;
+      }
+      uint32_t fallback_gate = 0;
+      if (ComputeIndirectCallPicFallbackGate(site_it->second,
+                                             &fallback_gate)) {
+        uint32_t* gate_rw = WriteSlotForExecuteAddress(gate_rx);
+        if (gate_rw && PatchA64InstructionAtomic(gate_rw, fallback_gate)) {
+          FlushPatchedInstruction(gate_rw, reinterpret_cast<void*>(gate_rx));
+        }
+      }
+      // Never overwrite cmp_lo/cmp_hi/call_op while other cores may be in
+      // flight past the gate; permanently retire to fallback lookup and evict.
+      RetirePicSiteLocked(site_it);
     }
   }
 }

@@ -25,8 +25,9 @@
 
 DEFINE_bool(
     writable_executable_memory, true,
-    "Allow mapping memory with both write and execute access, for simulating "
-    "behavior on platforms where that's not supported",
+    "Allow RWX fallback when W^X dual-mapping is disabled or unavailable. "
+    "When false, strictly forbids RWX mappings and forces W^X dual-mapping "
+    "without running any RWX boot probe.",
     "Memory");
 
 DEFINE_bool(
@@ -66,21 +67,10 @@ DualMappingWxBackend ProbeDualMappingWxSupport() {
 #endif
 
 bool IsWritableExecutableMemoryPreferred() {
-  if (!IsWritableExecutableMemorySupported()) {
-    (void)ProbeDualMappingWxSupport();
-    return false;
-  }
-  const bool wx_requested =
-      IsWxDualMappingRequested() || !cvars::writable_executable_memory;
-  if (wx_requested) {
-    const DualMappingWxBackend backend = ProbeDualMappingWxSupport();
-    if (ShouldActivateWxDualMapping(true, backend)) {
-      return false;
-    }
-    // Live probe failed (e.g., SELinux blocked r-xs + rw-s): clean RWX fallback.
-    return true;
-  }
-  return true;
+  return ResolveWritableExecutableMemoryPreferred(
+      IsWxDualMappingRequested(), cvars::writable_executable_memory,
+      []() { return ProbeDualMappingWxSupport(); },
+      []() { return IsWritableExecutableMemorySupported(); });
 }
 
 using xe::swcache::CacheLine;

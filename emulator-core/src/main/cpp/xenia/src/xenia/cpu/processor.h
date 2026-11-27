@@ -34,6 +34,7 @@
 #include "xenia/memory.h"
 
 DECLARE_bool(debug);
+DECLARE_bool(vscr_sat_census);
 
 namespace xe {
 namespace cpu {
@@ -156,11 +157,10 @@ class Processor {
   // mfvscr (or dynamic code is enabled), saturating vector ops update VSCR.
   void BeginVscrSatCensus();
   void FinishVscrSatCensus();
-  void OnModuleReadsVscr() {
-    vscr_sat_observable_.store(true, std::memory_order_release);
-  }
+  void OnModuleReadsVscr();
   bool vscr_sat_observable() const {
-    return vscr_sat_observable_.load(std::memory_order_acquire);
+    return !cvars::vscr_sat_census ||
+           vscr_sat_observable_.load(std::memory_order_acquire);
   }
   // Whether |module| holds the code that no module claims.
   bool IsDynamicCodeModule(const Module* module) const {
@@ -338,6 +338,7 @@ class Processor {
                                          uint32_t current_pc);
 
   bool DemandFunction(Function* function);
+  void InvalidateCompiledFunctionsForVscr();
 
   Memory* memory_ = nullptr;
   std::unique_ptr<StackWalker> stack_walker_;

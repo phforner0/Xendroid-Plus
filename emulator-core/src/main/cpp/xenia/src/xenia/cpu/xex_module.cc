@@ -1534,16 +1534,19 @@ bool XexModule::ContainsAddress(uint32_t address) {
 }
 
 bool XexModule::ReadsVscr() const {
-  if (!loaded_ || !finished_load_ || !base_address_ || is_patch()) {
+  if (!loaded_ || !finished_load_ || is_patch()) {
     return false;
+  }
+  if (!base_address_) {
+    return true;
   }
   auto* heap = memory()->LookupHeap(base_address_);
   if (!heap) {
-    return false;
+    return true;
   }
   const auto* sec_header = xex_security_info();
   if (!sec_header || !sec_header->page_descriptors) {
-    return false;
+    return true;
   }
   const uint32_t page_size = heap->page_size();
   for (uint32_t i = 0, page = 0; i < sec_header->page_descriptor_count; ++i) {
@@ -1553,13 +1556,15 @@ bool XexModule::ReadsVscr() const {
       const uint32_t start = base_address_ + (page * page_size);
       const uint32_t size = desc.page_count * page_size;
       const uint8_t* ptr = memory()->TranslateVirtual(start);
-      if (ptr) {
-        for (uint32_t off = 0; off + 4 <= size; off += 4) {
-          const uint32_t code = xe::load_and_swap<uint32_t>(ptr + off);
-          // mfvscr vD: primary opcode 4, RA=0, RB=0, XO=1540 (0x604).
-          if ((code & 0xFC1FFFFFu) == 0x10000604u) {
-            return true;
-          }
+      if (!ptr) {
+        // Conservative: unable to scan code pages, assume VSCR may be read.
+        return true;
+      }
+      for (uint32_t off = 0; off + 4 <= size; off += 4) {
+        const uint32_t code = xe::load_and_swap<uint32_t>(ptr + off);
+        // mfvscr vD: primary opcode 4, RA=0, RB=0, XO=1540 (0x604).
+        if ((code & 0xFC1FFFFFu) == 0x10000604u) {
+          return true;
         }
       }
     }

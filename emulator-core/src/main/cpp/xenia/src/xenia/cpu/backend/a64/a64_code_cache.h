@@ -25,6 +25,32 @@ namespace cpu {
 namespace backend {
 namespace a64 {
 
+// Host-page-aware loop header alignment padding (bytes, multiple of 4):
+// - Under parallel compilation (allow_page_nudge == false) or non-power-of-two
+//   page sizes: align strictly to 32 B relative to the 64 B-aligned entry
+//   (<= 28 B NOPs, zero speculative page-split drift).
+// - When uncontended (allow_page_nudge == true): nudge headers landing in the
+//   final 64 B of a host page (4 KB or 16 KB on Android) across the page
+//   boundary (<= 64 B NOPs, also 32 B aligned); otherwise align to 32 B.
+inline constexpr size_t ComputeLoopHeaderAlignmentPaddingForPage(
+    size_t current_offset, size_t entry_mod_page, size_t host_page_size,
+    bool allow_page_nudge) {
+  if ((current_offset & 3u) != 0) {
+    return 0;
+  }
+  if (!allow_page_nudge || host_page_size < 4096u ||
+      (host_page_size & (host_page_size - 1u)) != 0) {
+    return (32u - (current_offset & 31u)) & 31u;
+  }
+  const size_t page_mask = host_page_size - 1u;
+  const size_t page_off =
+      ((entry_mod_page & page_mask) + current_offset) & page_mask;
+  if (page_off >= host_page_size - 64u) {
+    return host_page_size - page_off;
+  }
+  return (32u - (page_off & 31u)) & 31u;
+}
+
 class A64CodeCache : public CodeCacheBase<A64CodeCache> {
  public:
   ~A64CodeCache() override;
@@ -62,11 +88,13 @@ class A64CodeCache : public CodeCacheBase<A64CodeCache> {
   // 1-word atomic CMODX publication and safe fallback rollback.
   void RegisterIndirectCallPicSite(uintptr_t gate_rx, uintptr_t cmp_lo_rx,
                                    uintptr_t cmp_hi_rx, uintptr_t call_op_rx,
-                                   uintptr_t fallback_rx, bool is_tail);
+                                   uintptr_t fallback_rx, bool is_tail,
+                                   uint32_t caller_guest_addr = 0);
   bool TryPatchIndirectCallPicSite(uintptr_t gate_rx,
                                    uint32_t target_guest_addr,
                                    void* target_execute_address);
   bool FallbackIndirectCallPicSite(uintptr_t gate_rx);
+  size_t TrackedPicSiteCount() const;
 
   // Writes one simpleperf "generic JIT symbols" map entry per placed
   // function (perf-<pid>.map) so profilers can attribute guest code by name
@@ -97,9 +125,14 @@ class A64CodeCache : public CodeCacheBase<A64CodeCache> {
   std::unordered_map<uint32_t, std::vector<DirectCallSite>>
       patched_direct_call_sites_;
 
-  std::mutex pic_sites_mutex_;
+  void RetirePicSiteLocked(
+      std::unordered_map<uintptr_t, IndirectCallPicSite>::iterator site_it);
+
+  mutable std::mutex pic_sites_mutex_;
   std::unordered_map<uintptr_t, IndirectCallPicSite> pic_sites_by_gate_;
   std::unordered_map<uint32_t, std::vector<uintptr_t>> patched_pic_sites_;
+  std::unordered_map<uintptr_t, uint32_t> pic_caller_by_gate_;
+  std::unordered_map<uint32_t, std::vector<uintptr_t>> pic_sites_by_caller_;
 };
 
 }  // namespace a64

@@ -190,22 +190,31 @@ void XEvent::SyncFromGuest() {
   if (!guest_object()) {
     return;
   }
-  bool guest_signaled = false;
+  bool wake_waiters = false;
   {
     auto global_lock = global_critical_region_.Acquire();
     auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
-    guest_signaled = kevent->header.signal_state ? true : false;
+    if (!kevent) {
+      return;
+    }
+    const bool guest_signaled = kevent->header.signal_state ? true : false;
     if (guest_signaled == host_signaled_) {
       return;
     }
     host_signaled_ = guest_signaled;
     if (guest_signaled) {
       event_->Set();
+      if (manual_reset_) {
+        // Releases every parked cooperative waiter even if the event is reset
+        // before it runs; mirrors Set()/Pulse() ordering under global_lock.
+        pulse_epoch_.fetch_add(1);
+      }
+      wake_waiters = true;
     } else {
       event_->Reset();
     }
   }
-  if (guest_signaled) {
+  if (wake_waiters) {
     WakeCooperativeWaiters();
   }
 }

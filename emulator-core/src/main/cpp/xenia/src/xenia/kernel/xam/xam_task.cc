@@ -45,16 +45,20 @@ dword_result_t XamTaskSchedule_entry(lpvoid_t callback,
                                      dword_t optional_ptr, lpdword_t handle_ptr,
                                      const ppc_context_t& ctx) {
   // TODO(gibbed): figure out what this is for
-  *handle_ptr = 12345;
+  if (handle_ptr) {
+    *handle_ptr = 12345;
+  }
 
   uint32_t task_flags = 0;
   if (optional_ptr) {
     auto option = ctx->TranslateVirtual<XAM_TASK_ARGS*>(optional_ptr);
+    if (option) {
+      task_flags = option->flags;
+      auto v2 = option->value2;  // typically 0?
 
-    task_flags = option->flags;
-    auto v2 = option->value2;  // typically 0?
-
-    XELOGI("Got xam task args: v1 = {:08X}, v2 = {:08X}", task_flags, v2.get());
+      XELOGI("Got xam task args: v1 = {:08X}, v2 = {:08X}", task_flags,
+             v2.get());
+    }
   }
 
   auto exe_module = kernel_state()->GetExecutableModule();
@@ -91,15 +95,28 @@ dword_result_t XamTaskSchedule_entry(lpvoid_t callback,
   }
 
   if (foreground_task) {
+    const uint32_t title_process_addr = kernel_state()->GetTitleProcess();
     auto* title_process =
-        kernel_state()->memory()->TranslateVirtual<X_KPROCESS*>(
-            kernel_state()->GetTitleProcess());
+        title_process_addr
+            ? kernel_state()->memory()->TranslateVirtual<X_KPROCESS*>(
+                  title_process_addr)
+            : nullptr;
     auto* kthread = thread->guest_object<X_KTHREAD>();
-    kthread->process_priority_class = title_process->process_priority_class;
-    kthread->base_priority_copy = title_process->default_thread_priority;
-    kthread->max_dynamic_priority = title_process->max_dynamic_priority;
-    kthread->creation_flags = kXamTaskCpu5Flag;
-    thread->SetBasePriority(0);
+    if (title_process && kthread) {
+      kthread->process_priority_class = title_process->process_priority_class;
+      kthread->base_priority_copy = title_process->default_thread_priority;
+      kthread->max_dynamic_priority = title_process->max_dynamic_priority;
+      kthread->creation_flags = kXamTaskCpu5Flag;
+      thread->SetBasePriority(0);
+    } else {
+      XELOGW(
+          "XamTaskSchedule: skipping foreground priority promotion "
+          "(title_process={:08X}, kthread={})",
+          title_process_addr, static_cast<const void*>(kthread));
+      if (kthread) {
+        kthread->creation_flags = kXamTaskCpu5Flag;
+      }
+    }
     thread->Resume();
   }
 
