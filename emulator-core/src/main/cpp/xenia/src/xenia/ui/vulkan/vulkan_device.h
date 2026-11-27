@@ -366,6 +366,7 @@ class VulkanDevice {
     bool ext_KHR_pipeline_executable_properties = false;
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_EXT_present_timing = false;                // #209
+    bool ext_KHR_calibrated_timestamps = false;         // #185
     bool ext_KHR_present_id2 = false;                   // #480
     bool ext_KHR_present_id = false;                    // #295
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128

@@ -104,6 +104,19 @@ inline PresentTimingBackend SelectPresentTimingBackend(
   return PresentTimingBackend::kNone;
 }
 
+// Vulkan 1.4.350 spec v3 VUID dependency gate for VK_EXT_present_timing at
+// logical device creation: requires VK_KHR_calibrated_timestamps and
+// VK_KHR_present_id2 extensions plus presentTiming and a valid presentId
+// feature (presentId2 || presentId).
+inline bool CanEnablePresentTimingExtOnDevice(
+    bool ext_present_timing_advertised, bool ext_calibrated_timestamps,
+    bool ext_present_id2, bool feature_present_timing, bool feature_present_id2,
+    bool feature_present_id) {
+  return ext_present_timing_advertised && ext_calibrated_timestamps &&
+         ext_present_id2 && feature_present_timing &&
+         (feature_present_id2 || feature_present_id);
+}
+
 // Enforces mutual exclusion on VkPresentInfoKHR::pNext: never chain both
 // VkPresentTimingsInfoEXT and VkPresentTimesInfoGOOGLE simultaneously.
 inline PresentInfoTimingChain SelectPresentInfoTimingChain(

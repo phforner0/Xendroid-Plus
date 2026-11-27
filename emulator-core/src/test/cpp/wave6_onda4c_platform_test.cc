@@ -76,6 +76,24 @@ void TestSelectPresentTimingBackend() {
                PresentTimingBackend::kNone);
   ONDA4C_CHECK(SelectPresentTimingBackend(false, false, false, false, false) ==
                PresentTimingBackend::kNone);
+
+  // VUID device dependency gate (Fix #4): requires calibrated_timestamps,
+  // present_id2 extension, presentTiming feature, and (presentId2 || presentId).
+  using vkui::CanEnablePresentTimingExtOnDevice;
+  ONDA4C_CHECK(CanEnablePresentTimingExtOnDevice(true, true, true, true, true,
+                                                 false));
+  ONDA4C_CHECK(CanEnablePresentTimingExtOnDevice(true, true, true, true, false,
+                                                 true));
+  ONDA4C_CHECK(!CanEnablePresentTimingExtOnDevice(false, true, true, true, true,
+                                                  true));
+  ONDA4C_CHECK(!CanEnablePresentTimingExtOnDevice(true, false, true, true, true,
+                                                  true));
+  ONDA4C_CHECK(!CanEnablePresentTimingExtOnDevice(true, true, false, true, true,
+                                                  true));
+  ONDA4C_CHECK(!CanEnablePresentTimingExtOnDevice(true, true, true, false, true,
+                                                  true));
+  ONDA4C_CHECK(!CanEnablePresentTimingExtOnDevice(true, true, true, true, false,
+                                                  false));
 }
 
 void TestTimeDomainAndPastTimingConversion() {
@@ -589,6 +607,16 @@ void TestSourceContracts(const fs::path& cpp_dir) {
   ONDA4C_CHECK(dev_h.find("vkGetPastPresentationTimingEXT") !=
                std::string::npos);
   ONDA4C_CHECK(dev_cc.find("VK_EXT_PRESENT_TIMING_EXTENSION_NAME") !=
+               std::string::npos);
+  ONDA4C_CHECK(dev_cc.find("VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME") !=
+               std::string::npos);
+  ONDA4C_CHECK(dev_h.find("ext_KHR_calibrated_timestamps") !=
+               std::string::npos);
+  ONDA4C_CHECK(dev_cc.find("CanEnablePresentTimingExtOnDevice") !=
+               std::string::npos);
+  ONDA4C_CHECK(dev_cc.find("erase_enabled_extension(VK_EXT_PRESENT_TIMING_EXTENSION_NAME)") !=
+               std::string::npos);
+  ONDA4C_CHECK(zfg_cc.find("(!ext_use_present_id2_ && !ext_use_present_id1_)") !=
                std::string::npos);
   ONDA4C_CHECK(dev_cc.find("VkPhysicalDevicePresentTimingFeaturesEXT") !=
                std::string::npos);

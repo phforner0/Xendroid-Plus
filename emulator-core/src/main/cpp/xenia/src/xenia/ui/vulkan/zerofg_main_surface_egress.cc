@@ -716,11 +716,13 @@ bool ZeroFGMainSurfaceEgress::CreateSwapchain() {
             device, swapchain_, kPresentTimingQueueSize);
     RefreshExtSwapchainTimingMetadata();
     if (queue_size_result != VK_SUCCESS || ext_stage_query_mask_ == 0 ||
-        !ext_time_domain_.valid || !ext_time_domain_.is_monotonic_clock) {
+        !ext_time_domain_.valid || !ext_time_domain_.is_monotonic_clock ||
+        (!ext_use_present_id2_ && !ext_use_present_id1_)) {
       XELOGW(
           "ZeroFGMainSurface VK_EXT_present_timing swapchain setup incomplete "
-          "(queue_size_result={} monotonic={}), falling back",
-          int32_t(queue_size_result), ext_time_domain_.is_monotonic_clock);
+          "(queue_size_result={} monotonic={} id2={} id1={}), falling back",
+          int32_t(queue_size_result), ext_time_domain_.is_monotonic_clock,
+          ext_use_present_id2_, ext_use_present_id1_);
       active_timing_backend_ = SelectPresentTimingBackend(
           false, false, false, false, google_timing_supported);
     } else {
