@@ -346,8 +346,9 @@ class ZeroFGMainSurfaceEgress {
   struct TimingRecord {
     bool used = false;
     bool resolved = false;
-    uint32_t present_id = 0;
+    uint64_t present_id = 0;
     uint64_t sequence_id = 0;
+    bool present_id_64bit = false;
     bool synthetic = false;
     uint64_t source_id = 0;
     uint64_t issue_time_ns = 0;

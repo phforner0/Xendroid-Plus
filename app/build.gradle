@@ -131,7 +131,15 @@ android {
     }
 
     packaging {
-        // libe.so from :emulator-core is stored uncompressed (matches core).
+        // Must stay true (extractNativeLibs="true", compressed in APK and extracted to
+        // applicationInfo.nativeLibraryDir at install time): libadrenotools
+        // (adrenotools/driver.h) creates a linker namespace over nativeLibraryDir to
+        // dlopen libhook_impl.so / libmain_hook.so / libkgsl_priority_hook.so for custom
+        // Vulkan drivers (Turnip/PanVK/Xclipse). 16 KB Android 15+ page-size compliance
+        // is preserved because :emulator-core links all .so files with
+        // -Wl,-z,max-page-size=16384 (NDK 29) and extracted files mmap from offset 0.
+        // Switching to useLegacyPackaging = false (uncompressed 16 KB ZIP-aligned APK
+        // mmap) would break custom drivers until hookLibDir resolves base.apk!/lib/arm64-v8a.
         jniLibs.useLegacyPackaging = true
         resources {
             excludes += '/META-INF/{AL2.0,LGPL2.1}'

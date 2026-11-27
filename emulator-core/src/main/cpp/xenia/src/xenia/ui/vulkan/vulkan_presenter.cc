@@ -222,25 +222,47 @@ uint64_t GetZeroFGMonotonicTimeNs() {
 }
 
 bool IsPresentTimingExtEnabledForPresenter() {
-  bool enabled = cvars::vulkan_present_timing_ext;
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
-  char prop[PROP_VALUE_MAX] = {};
-  if (__system_property_get("debug.xendroid.present_timing_ext", prop) > 0) {
-    ParseStrictBoolProperty(prop, enabled);
+  static std::once_flag prop_once;
+  static bool has_prop_override = false;
+  static bool prop_override_value = false;
+  std::call_once(prop_once, []() {
+    char prop[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.present_timing_ext", prop) > 0) {
+      bool parsed = false;
+      if (ParseStrictBoolProperty(prop, parsed)) {
+        has_prop_override = true;
+        prop_override_value = parsed;
+      }
+    }
+  });
+  if (has_prop_override) {
+    return prop_override_value;
   }
 #endif
-  return enabled;
+  return cvars::vulkan_present_timing_ext;
 }
 
 bool IsLateSwapPresentEnabledForPresenter() {
-  bool enabled = cvars::vulkan_late_swap_present;
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
-  char prop[PROP_VALUE_MAX] = {};
-  if (__system_property_get("debug.xendroid.late_swap", prop) > 0) {
-    ParseStrictBoolProperty(prop, enabled);
+  static std::once_flag prop_once;
+  static bool has_prop_override = false;
+  static bool prop_override_value = false;
+  std::call_once(prop_once, []() {
+    char prop[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.late_swap", prop) > 0) {
+      bool parsed = false;
+      if (ParseStrictBoolProperty(prop, parsed)) {
+        has_prop_override = true;
+        prop_override_value = parsed;
+      }
+    }
+  });
+  if (has_prop_override) {
+    return prop_override_value;
   }
 #endif
-  return enabled;
+  return cvars::vulkan_late_swap_present;
 }
 
 constexpr uint64_t kNativePresentTelemetryIntervalNs = 2500000000ull;
@@ -1856,9 +1878,31 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     }
   }
 #endif
-  PresentTimingBackend selected_timing_backend = SelectPresentTimingBackend(
+  const bool ext_stage_ready =
+#ifdef VK_EXT_present_timing
+      SelectPreferredPresentStageQueryMask(ext_surface_stage_queries) != 0u;
+#else
+      false;
+#endif
+  const bool ext_present_id2_ready =
+#ifdef VK_EXT_present_timing
+      vulkan_device->properties().presentId2 && surface_present_id2_supported;
+#else
+      false;
+#endif
+  const bool ext_presenter_ready = CanUseExtPresentTimingForPresenter(
       IsPresentTimingExtEnabledForPresenter(),
       vulkan_device->properties().presentTiming, ext_surface_supported,
+      vulkan_device->HasPresentTimingExtPfns(), ext_present_id2_ready,
+#ifdef VK_EXT_present_timing
+      SelectPreferredPresentStageQueryMask(ext_surface_stage_queries)
+#else
+      0u
+#endif
+  );
+  PresentTimingBackend selected_timing_backend = SelectPresentTimingBackend(
+      ext_presenter_ready, vulkan_device->properties().presentTiming,
+      ext_surface_supported && ext_stage_ready && ext_present_id2_ready,
       vulkan_device->HasPresentTimingExtPfns(), google_timing_supported);
 
   swapchain_create_info.flags = 0;
@@ -1977,6 +2021,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 #ifdef VK_KHR_present_id2
     swapchain_create_info.flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
 #endif
+    // Per Vulkan spec, oldSwapchain is already retired after a failed call.
+    swapchain_create_info.oldSwapchain = VK_NULL_HANDLE;
     selected_timing_backend = SelectPresentTimingBackend(
         false, false, false, false, google_timing_supported);
     swapchain_create_result = dfn.vkCreateSwapchainKHR(
@@ -2009,23 +2055,46 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
         ext_surface_present_at_absolute;
     timing_state_out.use_present_id2 =
         vulkan_device->properties().presentId2 && surface_present_id2_supported;
-    timing_state_out.use_present_id1 =
-        !timing_state_out.use_present_id2 &&
-        vulkan_device->properties().presentId;
+    timing_state_out.use_present_id1 = false;
     const VkResult queue_size_result =
         vulkan_device->vkSetSwapchainPresentTimingQueueSizeEXT()(
             device, swapchain, kPresentTimingQueueSize);
     if (queue_size_result != VK_SUCCESS ||
         timing_state_out.stage_query_mask == 0 ||
+        !timing_state_out.use_present_id2 ||
         !QueryExtSwapchainTimingMetadata(vulkan_device, swapchain,
-                                         timing_state_out)) {
+                                         timing_state_out) ||
+        !TimeDomainMatchesSteadyClock(timing_state_out.time_domain)) {
       XELOGW(
           "VulkanPresenter: VK_EXT_present_timing swapchain setup incomplete "
-          "(queue_size_result={}), falling back",
-          int32_t(queue_size_result));
+          "(queue_size_result={} mono={} id2={}), recreating swapchain without "
+          "PRESENT_TIMING_BIT_EXT",
+          int32_t(queue_size_result),
+          TimeDomainMatchesSteadyClock(timing_state_out.time_domain),
+          timing_state_out.use_present_id2);
       timing_state_out = {};
-      timing_state_out.backend = SelectPresentTimingBackend(
+      const PresentTimingBackend fallback_backend = SelectPresentTimingBackend(
           false, false, false, false, google_timing_supported);
+      // Never reuse a swapchain created with PRESENT_TIMING_BIT_EXT under
+      // VK_GOOGLE_display_timing; recreate it cleanly without the EXT bits.
+      swapchain_create_info.flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+#ifdef VK_KHR_present_id2
+      swapchain_create_info.flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
+#endif
+      swapchain_create_info.oldSwapchain = swapchain;
+      VkSwapchainKHR fallback_swapchain = VK_NULL_HANDLE;
+      const VkResult fallback_result = dfn.vkCreateSwapchainKHR(
+          device, &swapchain_create_info, nullptr, &fallback_swapchain);
+      dfn.vkDestroySwapchainKHR(device, swapchain, nullptr);
+      if (fallback_result != VK_SUCCESS) {
+        XELOGE(
+            "VulkanPresenter: Failed to recreate fallback swapchain "
+            "(VkResult {})",
+            int32_t(fallback_result));
+        return VK_NULL_HANDLE;
+      }
+      swapchain = fallback_swapchain;
+      timing_state_out.backend = fallback_backend;
     }
   }
 #endif
@@ -2379,7 +2448,7 @@ bool VulkanPresenter::PaintContext::QueryExtSwapchainTimingMetadata(
       std::min<size_t>(domain_props.timeDomainCount, domains.size());
   const SelectedTimeDomain selected =
       SelectPreferredVkTimeDomain(domains.data(), domain_ids.data(), count);
-  if (!selected.valid) {
+  if (!TimeDomainMatchesSteadyClock(selected)) {
     return false;
   }
   state.time_domains_counter = domains_counter;
@@ -2398,11 +2467,10 @@ void VulkanPresenter::RefreshSwapchainTimingMetadata() {
   if (!PaintContext::QueryExtSwapchainTimingMetadata(
           vulkan_device_, paint_context_.swapchain,
           paint_context_.swapchain_timing)) {
-    const bool google_supported =
-        vulkan_device_->vkGetPastPresentationTimingGOOGLE() != nullptr;
+    // Do not fall back to VK_GOOGLE_display_timing on an active swapchain that
+    // was created with VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT.
     paint_context_.swapchain_timing = {};
-    paint_context_.swapchain_timing.backend = SelectPresentTimingBackend(
-        false, false, false, false, google_supported);
+    paint_context_.swapchain_timing.backend = PresentTimingBackend::kNone;
   }
 #endif
 }
@@ -2422,7 +2490,7 @@ void VulkanPresenter::PollNativeLatency() {
     if (!present_id) return;
     bool matched = false;
     for (NativeLatencyRecord& record : native_latency_records_) {
-      if (record.present_id && record.present_id == uint32_t(present_id)) {
+      if (record.present_id && record.present_id == present_id) {
         matched = true;
         if (record.source_id && record.issue_ns &&
             actual_present_time_ns > record.issue_ns &&
@@ -2460,9 +2528,8 @@ void VulkanPresenter::PollNativeLatency() {
     }
     VkPastPresentationTimingInfoEXT query_info = {
         VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT};
-    query_info.flags =
-        VK_PAST_PRESENTATION_TIMING_ALLOW_PARTIAL_RESULTS_BIT_EXT |
-        VK_PAST_PRESENTATION_TIMING_ALLOW_OUT_OF_ORDER_RESULTS_BIT_EXT;
+    // Request strictly complete, in-order results (never partial reports).
+    query_info.flags = 0;
     query_info.swapchain = paint_context_.swapchain;
     VkPastPresentationTimingPropertiesEXT past_props = {
         VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT};
@@ -2483,6 +2550,10 @@ void VulkanPresenter::PollNativeLatency() {
             past_props.timeDomainsCounter, queue_full)) {
       RefreshSwapchainTimingMetadata();
     }
+    if (paint_context_.swapchain_timing.backend !=
+        PresentTimingBackend::kExtPresentTiming) {
+      return;
+    }
     const uint32_t count =
         std::min(past_props.presentationTimingCount,
                  uint32_t(ext_timings.size()));
@@ -2491,8 +2562,8 @@ void VulkanPresenter::PollNativeLatency() {
           ConvertVkPastPresentationTimingEXT(
               ext_timings[i],
               paint_context_.swapchain_timing.refresh_duration_ns);
-      if (conv.valid && paint_context_.swapchain_timing.time_domain
-                            .is_monotonic_clock) {
+      if (IsCompleteMonotonicPastPresentationTiming(
+              conv, paint_context_.swapchain_timing.time_domain)) {
         process_past_timing(conv.present_id, conv.actual_present_time_ns,
                             observation_ns);
       }
@@ -3437,9 +3508,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
 #ifdef VK_KHR_present_id2
   VkPresentId2KHR native_present_id2 = {VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR};
 #endif
-#ifdef VK_KHR_present_id
-  VkPresentIdKHR native_present_id1 = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
-#endif
 #endif
   const SourcePublicationTelemetry& painted_source =
       guest_output_properties.source_publication;
@@ -3469,13 +3537,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   const LateSwapDecision late_swap = EvaluateLateSwapPresent(
       present_now_ns, scheduled_target_ns, refresh_ns, zerofg_active,
       late_swap_enabled);
-  // Native path presents ASAP by default; late-swap explicitly keeps
-  // targetTime == 0 for overdue frames so the compositor never pushes them to
-  // vsync + 1 (always bypassed when ZeroFG is active).
-  uint64_t effective_target_time_ns = 0ull;
-  if (late_swap.action == LateSwapAction::kPresentImmediate) {
-    effective_target_time_ns = late_swap.effective_target_ns;
-  }
+  const bool can_use_absolute_target =
+      (paint_context_.swapchain_timing.backend ==
+       PresentTimingBackend::kGoogleDisplayTiming) ||
+      (paint_context_.swapchain_timing.backend ==
+           PresentTimingBackend::kExtPresentTiming &&
+       paint_context_.swapchain_timing.present_at_absolute_time &&
+       TimeDomainMatchesSteadyClock(
+           paint_context_.swapchain_timing.time_domain));
+  // Native late-swap keeps scheduled_target_ns for early FIFO frames when the
+  // backend supports absolute targets, and emits 0 (immediate) for overdue
+  // frames so the compositor never pushes them to vsync + 1 (always bypassed
+  // when ZeroFG is active).
+  const uint64_t effective_target_time_ns = ResolveNativePresentTargetTimeNs(
+      late_swap, paint_context_.swapchain_is_fifo, can_use_absolute_target);
 
   const bool want_latency_tag =
       paint_context_.swapchain_timing.backend != PresentTimingBackend::kNone &&
@@ -3484,19 +3559,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
       painted_source.source_id != native_latency_last_source_id_;
   const PresentInfoTimingChain timing_chain = SelectPresentInfoTimingChain(
       paint_context_.swapchain_timing.backend, want_latency_tag);
+  uint64_t candidate_present_id = 0;
+  uint64_t record_present_id = 0;
   if (timing_chain != PresentInfoTimingChain::kNone) {
-    native_latency_last_source_id_ = painted_source.source_id;
-    if (!++native_latency_present_id_) {
-      ++native_latency_present_id_;
+    candidate_present_id = native_latency_present_id_ + 1;
+    if (!candidate_present_id) {
+      ++candidate_present_id;
     }
-    if (native_latency_records_[native_latency_record_next_].present_id) {
-      ++native_latency_overwritten_records_;
-    }
-    native_latency_records_[native_latency_record_next_] = {
-        native_latency_present_id_, painted_source.source_id,
-        painted_source.issue_time_ns};
-    native_latency_record_next_ =
-        (native_latency_record_next_ + 1) % kNativeLatencyRecordCount;
 #ifdef VK_EXT_present_timing
     if (timing_chain == PresentInfoTimingChain::kExtOnly) {
       native_ext_timing.flags = 0;
@@ -3511,7 +3580,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
               : 0u;
       native_ext_timings.swapchainCount = 1;
       native_ext_timings.pTimingInfos = &native_ext_timing;
-      native_present_id_64 = native_latency_present_id_;
+      native_present_id_64 = candidate_present_id;
+      record_present_id = candidate_present_id;
 #ifdef VK_KHR_present_id2
       if (paint_context_.swapchain_timing.use_present_id2) {
         native_present_id2.swapchainCount = 1;
@@ -3519,27 +3589,23 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
         native_ext_timings.pNext = &native_present_id2;
       }
 #endif
-#ifdef VK_KHR_present_id
-      if (!native_ext_timings.pNext &&
-          paint_context_.swapchain_timing.use_present_id1) {
-        native_present_id1.swapchainCount = 1;
-        native_present_id1.pPresentIds = &native_present_id_64;
-        native_ext_timings.pNext = &native_present_id1;
-      }
-#endif
       present_info.pNext = &native_ext_timings;
     } else
 #endif
     if (timing_chain == PresentInfoTimingChain::kGoogleOnly) {
-      native_present_time.presentID = native_latency_present_id_;
+      const uint32_t google_present_id =
+          NormalizeGooglePresentId32(candidate_present_id);
+      native_present_time.presentID = google_present_id;
       native_present_time.desiredPresentTime = effective_target_time_ns;
       native_present_times.swapchainCount = 1;
       native_present_times.pTimes = &native_present_time;
+      record_present_id = uint64_t(google_present_id);
       present_info.pNext = &native_present_times;
     }
   }
 #endif
   VkResult present_result;
+  bool retried_without_pnext = false;
   {
     const uint64_t present_queue_lock_begin_ns =
         cvars::vulkan_completion_wait_telemetry ? GetZeroFGMonotonicTimeNs()
@@ -3561,6 +3627,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
       PollNativeLatency();
       RefreshSwapchainTimingMetadata();
       present_info.pNext = nullptr;
+      retried_without_pnext = true;
       present_result =
           dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
     }
@@ -3571,7 +3638,24 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
                                            present_begin_ns);
     }
   }
-  if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+  const bool present_succeeded =
+      present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR;
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  if (ShouldEnqueueTimingRecord(timing_chain, present_succeeded,
+                                retried_without_pnext)) {
+    native_latency_last_source_id_ = painted_source.source_id;
+    native_latency_present_id_ = candidate_present_id;
+    if (native_latency_records_[native_latency_record_next_].present_id) {
+      ++native_latency_overwritten_records_;
+    }
+    native_latency_records_[native_latency_record_next_] = {
+        record_present_id, painted_source.source_id,
+        painted_source.issue_time_ns};
+    native_latency_record_next_ =
+        (native_latency_record_next_ + 1) % kNativeLatencyRecordCount;
+  }
+#endif
+  if (present_succeeded) {
     native_last_present_ns_ = GetZeroFGMonotonicTimeNs();
     PollNativeLatency();
   }

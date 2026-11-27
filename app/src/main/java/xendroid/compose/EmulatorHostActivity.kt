@@ -965,10 +965,16 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
      *  limit; the timeline gets each change and the player one notice per rise, five minutes apart. */
     private fun watchThermalHeadroom() {
         if (thermalTick++ % 2 != 0) return
-        val systemHeadroom = systemHeadroomReader.read()
+        val autoVrsThermal = bootChangedSettings?.any {
+            it.startsWith("GPU|vulkan_auto_vrs_thermal = true")
+        } == true
+        val systemHeadroom = if (autoVrsThermal) systemHeadroomReader.read() else null
         if (systemHeadroom != null) {
             val (cpuJni, gpuJni) = thermalWatch.recordSystemHeadroom(
                 systemHeadroom.cpuHeadroom, systemHeadroom.gpuHeadroom)
+            runCatching { Emulator.get?.set_system_headroom(cpuJni, gpuJni) }
+        } else if (thermalWatch.lastCpuHeadroom != null || thermalWatch.lastGpuHeadroom != null) {
+            val (cpuJni, gpuJni) = thermalWatch.recordSystemHeadroom(null, null)
             runCatching { Emulator.get?.set_system_headroom(cpuJni, gpuJni) }
         }
         val headroom = if (Build.VERSION.SDK_INT >= 30) {

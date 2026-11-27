@@ -127,4 +127,103 @@ class SystemHeadroomReaderTest {
         assertNull(partial!!.cpuHeadroom)
         assertEquals(25f, partial.gpuHeadroom!!, 0f)
     }
+
+    class StrictParams {
+        class Builder {
+            fun build(): StrictParams {
+                buildCount++
+                return StrictParams()
+            }
+        }
+        companion object {
+            var buildCount = 0
+        }
+    }
+
+    class StrictSystemHealthManager(var cpu: Float = 66f, var gpu: Float = 33f) {
+        var cpuCalls = 0
+        var gpuCalls = 0
+        var nullCalls = 0
+
+        fun getCpuHeadroom(params: StrictParams?): Float {
+            cpuCalls++
+            if (params == null) {
+                nullCalls++
+                throw NullPointerException("params must not be null")
+            }
+            return cpu
+        }
+
+        fun getGpuHeadroom(params: StrictParams?): Float {
+            gpuCalls++
+            if (params == null) {
+                nullCalls++
+                throw NullPointerException("params must not be null")
+            }
+            return gpu
+        }
+
+        fun getCpuHeadroomMinIntervalMillis(): Long = 500L
+        fun getGpuHeadroomMinIntervalMillis(): Long = 500L
+    }
+
+    class BrokenBuilderParams {
+        class Builder {
+            fun build(): BrokenBuilderParams {
+                attempts++
+                throw IllegalStateException("builder unavailable")
+            }
+        }
+        companion object {
+            var attempts = 0
+        }
+    }
+
+    class BrokenParamsHealthManager {
+        var cpuCalls = 0
+        @Suppress("UNUSED_PARAMETER")
+        fun getCpuHeadroom(params: BrokenBuilderParams?): Float {
+            cpuCalls++
+            throw IllegalStateException("requires params")
+        }
+        fun getCpuHeadroomMinIntervalMillis(): Long = 100L
+    }
+
+    @Test fun buildsDefaultParamsUpFrontWithoutNullInvocationException() {
+        StrictParams.buildCount = 0
+        var now = 1000L
+        val mgr = StrictSystemHealthManager(cpu = 72f, gpu = 28f)
+        val reader = SystemHeadroomReader(sdkInt = 36, clockMs = { now }, serviceProvider = { mgr })
+
+        val s1 = reader.read()
+        assertNotNull(s1)
+        assertEquals(72f, s1!!.cpuHeadroom!!, 0f)
+        assertEquals(28f, s1.gpuHeadroom!!, 0f)
+        assertEquals(0, mgr.nullCalls)
+        assertEquals(1, mgr.cpuCalls)
+        assertEquals(1, mgr.gpuCalls)
+        assertEquals(2, StrictParams.buildCount)
+
+        now = 2000L
+        val s2 = reader.read()
+        assertNotNull(s2)
+        assertEquals(0, mgr.nullCalls)
+        assertEquals(2, mgr.cpuCalls)
+        assertEquals(2, mgr.gpuCalls)
+        assertEquals(2, StrictParams.buildCount)
+    }
+
+    @Test fun doesNotRetryReflectionLoopWhenParamsBuilderFails() {
+        BrokenBuilderParams.attempts = 0
+        var now = 1000L
+        val mgr = BrokenParamsHealthManager()
+        val reader = SystemHeadroomReader(sdkInt = 36, clockMs = { now }, serviceProvider = { mgr })
+
+        assertNull(reader.read())
+        now = 2000L
+        assertNull(reader.read())
+        now = 3000L
+        assertNull(reader.read())
+        assertEquals(1, BrokenBuilderParams.attempts)
+    }
 }

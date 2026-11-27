@@ -166,7 +166,7 @@
     <string name="st_t_kernel_precise_guest_delays">Esperas precisas do jogo</string>
     <string name="st_d_kernel_precise_guest_delays">Atende as esperas do jogo com precisão abaixo de 1 ms. Uma espera comum do sistema passa do ponto e aumenta o tempo de cada quadro.</string>
     <string name="st_t_apu_apu_performance_hint">Dica de desempenho para o áudio (ADPF)</string>
-    <string name="st_d_apu_apu_performance_hint">Registra uma sessão ADPF nas threads de despacho e de áudio para o sistema segurar os clocks no prazo do áudio.</string>
+    <string name="st_d_apu_apu_performance_hint">Registra uma sessão ADPF nas threads de áudio (Audio Worker e decodificador XMA) para o sistema segurar os clocks no prazo do áudio.</string>
     <string name="st_t_vulkan_adrenotools_force_max_clocks">Forçar clocks máximos da GPU</string>
     <string name="st_d_vulkan_adrenotools_force_max_clocks">Com driver personalizado, pede a GPU no clock máximo. Mais velocidade, mais calor e bateria.</string>
     <string name="st_t_vulkan_adrenotools_turbo_reassert_seconds">Repetir o pedido de clocks máximos a cada</string>
