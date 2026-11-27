@@ -772,21 +772,22 @@ void TestSourceContracts(const fs::path& cpp_root) {
       ReadSourceText(xenia / "cpu/mmio_handler.cc");
   const std::string cmake = ReadSourceText(cpp_root / "CMakeLists.txt");
 
-  // 6a. All 5 new CVars MUST default to false, ZERO new UPDATE_from_*,
-  //     and strict '0'|'1' live properties via __system_property_get.
-  WAVE6_4B_CHECK(mem_cc.find("a64_wx_dual_mapping, false,") !=
+  // 6a. Promoted Onda 4B winners default to true, non-promoted stay false,
+  //     ZERO new UPDATE_from_*, and strict '0'|'1' live properties via
+  //     __system_property_get.
+  WAVE6_4B_CHECK(mem_cc.find("a64_wx_dual_mapping, true,") !=
                  std::string::npos);
   WAVE6_4B_CHECK(mem_cc.find("debug.xendroid.jit_wx") != std::string::npos);
   WAVE6_4B_CHECK(mem_cc.find("ParseStrictBoolProp(") != std::string::npos);
   WAVE6_4B_CHECK(mem_cc.find("UPDATE_from_") == std::string::npos);
 
-  WAVE6_4B_CHECK(a64_em_cc.find("a64_indirect_call_pic, false,") !=
+  WAVE6_4B_CHECK(a64_em_cc.find("a64_indirect_call_pic, true,") !=
                      std::string::npos ||
-                 a64_be_cc.find("a64_indirect_call_pic, false,") !=
+                 a64_be_cc.find("a64_indirect_call_pic, true,") !=
                      std::string::npos);
-  WAVE6_4B_CHECK(a64_em_cc.find("a64_align_hot_code, false,") !=
+  WAVE6_4B_CHECK(a64_em_cc.find("a64_align_hot_code, true,") !=
                      std::string::npos ||
-                 a64_cc_cc.find("a64_align_hot_code, false,") !=
+                 a64_cc_cc.find("a64_align_hot_code, true,") !=
                      std::string::npos);
   WAVE6_4B_CHECK(a64_em_cc.find("a64_lrcpc_tso, false,") != std::string::npos);
   WAVE6_4B_CHECK(a64_em_cc.find("a64_skip_low_addr_skew_fixup, false,") !=
@@ -810,7 +811,7 @@ void TestSourceContracts(const fs::path& cpp_root) {
   WAVE6_4B_CHECK(mem_posix.find("std::once_flag") != std::string::npos);
   // Regression (#121 P1): CreateFileMappingHandle MUST require
   // !IsWritableExecutableMemoryPreferred() before probing/using memfd_create
-  // so default a64_wx_dual_mapping=false stays 100% on ASharedMemory_create.
+  // so debug.xendroid.jit_wx=0 / RWX fallback stays 100% on ASharedMemory_create.
   const std::string create_fmh = ExtractFunctionBody(
       mem_posix, "FileMappingHandle CreateFileMappingHandle(");
   {

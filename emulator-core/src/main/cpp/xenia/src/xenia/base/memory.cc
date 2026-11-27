@@ -30,7 +30,7 @@ DEFINE_bool(
     "Memory");
 
 DEFINE_bool(
-    a64_wx_dual_mapping, false,
+    a64_wx_dual_mapping, true,
     "Use W^X dual-mapping (r-xs + rw-s via memfd_create/ASharedMemory) for JIT "
     "code cache and guest trampolines after live SELinux probe. Overridable on "
     "Android via debug.xendroid.jit_wx=0|1.",

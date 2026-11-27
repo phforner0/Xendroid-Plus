@@ -34,7 +34,7 @@ DEFINE_bool(a64_perf_map, true,
             "names, so profilers can attribute JIT samples.",
             "CPU");
 
-DEFINE_bool(a64_align_hot_code, false,
+DEFINE_bool(a64_align_hot_code, true,
             "Align hot A64 function entries (>= 64 B) to 64 B and loop headers "
             "to 32 B with a bounded 4 KB anti-page-split nudge (<= 64 B NOPs). "
             "Overridable on Android via debug.xendroid.a64_align_hot_code=0|1.",

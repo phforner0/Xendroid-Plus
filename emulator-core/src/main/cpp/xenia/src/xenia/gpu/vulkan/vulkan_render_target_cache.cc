@@ -150,7 +150,7 @@ DEFINE_bool(
     "debug.xendroid.resolve_compute_64x1).",
     "Vulkan");
 DEFINE_bool(
-    vulkan_rt_rows_on_demand, false,
+    vulkan_rt_rows_on_demand, true,
     "Allocate Vulkan host render targets with on-demand guest height (floor "
     "128 px, or >=720 px for multisampled merge_tiling_bands) and grow "
     "geometrically (>=50%) via vkCmdCopyImage up to the EDRAM wrap height to "

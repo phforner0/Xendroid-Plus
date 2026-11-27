@@ -66,7 +66,7 @@ DEFINE_bool(
     "Vulkan");
 
 DEFINE_bool(
-    vulkan_present_timing_ext, false,
+    vulkan_present_timing_ext, true,
     "Prefer VK_EXT_present_timing (spec v3) over VK_GOOGLE_display_timing "
     "when advertised by the device and surface, with clean automatic fallback "
     "to VK_GOOGLE_display_timing and untimed presentation.",

@@ -578,16 +578,16 @@ void TestSourceContracts(const fs::path& cpp_dir) {
   const std::string jni_cpp =
       ReadSourceText(cpp_dir / "emulator_xendroid.cpp");
 
-  // 1) All 3 new cvars default to false and have zero UPDATE_from_*.
-  ONDA4C_CHECK(dev_cc.find("vulkan_present_timing_ext, false,") !=
+  // 1) All 3 promoted Onda 4C cvars default to true and have zero UPDATE_from_*.
+  ONDA4C_CHECK(dev_cc.find("vulkan_present_timing_ext, true,") !=
                std::string::npos);
   ONDA4C_CHECK(dev_cc.find("UPDATE_from_bool(vulkan_present_timing_ext") ==
                std::string::npos);
-  ONDA4C_CHECK(pres_cc.find("vulkan_late_swap_present, false,") !=
+  ONDA4C_CHECK(pres_cc.find("vulkan_late_swap_present, true,") !=
                std::string::npos);
   ONDA4C_CHECK(pres_cc.find("UPDATE_from_bool(vulkan_late_swap_present") ==
                std::string::npos);
-  ONDA4C_CHECK(pres_cc.find("vulkan_auto_vrs_headroom, false,") !=
+  ONDA4C_CHECK(pres_cc.find("vulkan_auto_vrs_headroom, true,") !=
                std::string::npos);
   ONDA4C_CHECK(pres_cc.find("UPDATE_from_bool(vulkan_auto_vrs_headroom") ==
                std::string::npos);

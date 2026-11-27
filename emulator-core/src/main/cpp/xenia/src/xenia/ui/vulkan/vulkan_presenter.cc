@@ -131,13 +131,13 @@ DEFINE_bool(
     "rate.",
     "Vulkan");
 DEFINE_bool(
-    vulkan_late_swap_present, false,
+    vulkan_late_swap_present, true,
     "Native presentation only (explicitly bypassed while ZeroFG is active): "
     "release overdue frames immediately without pushing them to the next "
     "refresh and cap framerate_limit carry-over to half a frame.",
     "Vulkan");
 DEFINE_bool(
-    vulkan_auto_vrs_headroom, false,
+    vulkan_auto_vrs_headroom, true,
     "Android 16 (API 36+): couple SystemHealthManager CPU/GPU headroom into "
     "ThermalVrsController with thermal-baseline gating and hysteresis.",
     "Vulkan");

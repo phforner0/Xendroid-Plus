@@ -370,9 +370,9 @@ void TestSourceContracts(const std::string& cpp_root) {
 
   const std::string vk_rt_cc =
       ReadFileText(xenia_src + "/gpu/vulkan/vulkan_render_target_cache.cc");
-  assert(vk_rt_cc.find("DEFINE_bool(\n    vulkan_rt_rows_on_demand, false") !=
+  assert(vk_rt_cc.find("DEFINE_bool(\n    vulkan_rt_rows_on_demand, true") !=
              std::string::npos ||
-         vk_rt_cc.find("DEFINE_bool(vulkan_rt_rows_on_demand, false") !=
+         vk_rt_cc.find("DEFINE_bool(vulkan_rt_rows_on_demand, true") !=
              std::string::npos);
   assert(vk_rt_cc.find("debug.xendroid.rt_rows_on_demand") != std::string::npos);
   assert(vk_rt_cc.find("GrowRenderTarget") != std::string::npos);

@@ -44,7 +44,7 @@ DECLARE_bool(a64_skip_stack_skew_fixup);
 DECLARE_bool(a64_align_hot_code);
 
 DEFINE_bool(
-    a64_indirect_call_pic, false,
+    a64_indirect_call_pic, true,
     "Enable 1-slot monomorphic PIC for indirect guest calls (bctrl) using "
     "2-stage 1-word atomic CMODX patching. Overridable on Android via "
     "debug.xendroid.a64_indirect_call_pic=0|1.",
@@ -54,7 +54,9 @@ DEFINE_bool(
     a64_lrcpc_tso, false,
     "Use ARMv8.3-A FEAT_LRCPC (ldaprb/ldaprh/ldapr) for scalar LOAD and "
     "LOAD_OFFSET when a64_guest_memory_tso is enabled and HWCAP_LRCPC is "
-    "present. Overridable on Android via debug.xendroid.a64_lrcpc_tso=0|1.",
+    "present. Kept off by default: ARMv8.3+LSE2 LDAPR still raises an "
+    "Alignment Fault (SIGBUS) on unaligned guest loads crossing a 16-byte "
+    "boundary. Overridable on Android via debug.xendroid.a64_lrcpc_tso=0|1.",
     "CPU");
 
 DEFINE_bool(
