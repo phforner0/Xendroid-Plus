@@ -223,7 +223,7 @@ static void resolve_linker_symbols() {
         auto blInstr{reinterpret_cast<const BranchLinked *>(&dlopen)};
         for (int i{}; i < MaxWrapperInstrs; ++i, ++blInstr) {
             if (blInstr->Verify())
-                return reinterpret_cast<loader_dlopen_t>(blInstr + blInstr->Offset());
+                return reinterpret_cast<loader_dlopen_t>(reinterpret_cast<uintptr_t>(blInstr + blInstr->Offset()));
         }
         return nullptr;
     }()};

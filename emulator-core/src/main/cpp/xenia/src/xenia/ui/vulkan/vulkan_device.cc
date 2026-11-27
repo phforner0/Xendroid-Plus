@@ -1209,7 +1209,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       device->properties_.presentId2 =
           features_KHR_present_id2.enabled.presentId2 != VK_FALSE;
       if (device->properties_.presentId2) {
-        features_KHR_present_id2.enabled.pNext = device_create_info.pNext;
+        features_KHR_present_id2.enabled.pNext =
+            const_cast<void*>(device_create_info.pNext);
         device_create_info.pNext = &features_KHR_present_id2.enabled;
       } else {
         device->extensions_.ext_KHR_present_id2 = false;
@@ -1224,7 +1225,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       device->properties_.presentId =
           features_KHR_present_id.enabled.presentId != VK_FALSE;
       if (device->properties_.presentId) {
-        features_KHR_present_id.enabled.pNext = device_create_info.pNext;
+        features_KHR_present_id.enabled.pNext =
+            const_cast<void*>(device_create_info.pNext);
         device_create_info.pNext = &features_KHR_present_id.enabled;
       } else {
         device->extensions_.ext_KHR_present_id = false;
@@ -1245,7 +1247,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
             features_EXT_present_timing.supported.presentAtAbsoluteTime;
         features_EXT_present_timing.enabled.presentAtRelativeTime =
             features_EXT_present_timing.supported.presentAtRelativeTime;
-        features_EXT_present_timing.enabled.pNext = device_create_info.pNext;
+        features_EXT_present_timing.enabled.pNext =
+            const_cast<void*>(device_create_info.pNext);
         device_create_info.pNext = &features_EXT_present_timing.enabled;
         device->properties_.presentTiming = true;
         device->properties_.presentAtAbsoluteTime =

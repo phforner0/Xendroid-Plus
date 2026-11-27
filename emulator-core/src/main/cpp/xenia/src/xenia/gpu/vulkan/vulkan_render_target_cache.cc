@@ -12653,7 +12653,7 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
       "DumpRenderTargets (EDRAM Write): base tile %u", dump_base);
 
   // Ensure dumped render targets cover all rows read by their dispatches.
-  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+  for (ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     auto* rt = static_cast<VulkanRenderTarget*>(rectangle.render_target);
     const RenderTargetKey rt_key = rt->key();
     const uint32_t src_pitch_tiles = rt_key.GetPitchTiles();
