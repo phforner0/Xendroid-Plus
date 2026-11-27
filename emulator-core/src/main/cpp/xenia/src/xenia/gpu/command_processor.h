@@ -529,6 +529,12 @@ class CommandProcessor {
   void WorkerThreadMain();
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
+  // Called on the GPU Commands thread inside Pause() before signalling the
+  // caller's fence and parking on pause_resume_event_. Backends with an
+  // asynchronous submit worker override this to drain queued submissions so no
+  // vkQueueSubmit or command-buffer replay races with onPause, surface
+  // recreation, or savestate Save/Load.
+  virtual void OnPause() {}
   // rarely needed, most register writes have no special logic here
   XE_NOINLINE
   void HandleSpecialRegisterWrite(uint32_t index, uint32_t value);
@@ -1121,6 +1127,15 @@ class CommandProcessor {
   pm4_ib::Pm4IndirectBufferCache pm4_ib_cache_;
   void* pm4_ib_watch_callback_handle_ = nullptr;
   bool pm4_ib_cache_was_enabled_ = false;
+
+  // Cached vulkan_late_swap_present lookup and debug.xendroid.late_swap
+  // override (-1 = unset, 0 = false, 1 = true) so ThrottlePresentation() never
+  // does per-frame ConfigVars map lookups, std::string allocations, or
+  // __system_property_get syscalls.
+  void PollLateSwapProperty();
+  const bool* late_swap_cvar_ptr_ = nullptr;
+  bool late_swap_cvar_resolved_ = false;
+  std::atomic<int32_t> late_swap_prop_override_{-1};
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

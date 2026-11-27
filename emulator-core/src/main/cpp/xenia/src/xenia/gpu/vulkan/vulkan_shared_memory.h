@@ -204,6 +204,37 @@ inline void PartitionZeroCopySpans(
   flush_st(span_start + span_len);
 }
 
+// Describes why sparse shared memory is bypassed in favor of a dense
+// host-mapped 512 MiB buffer so startup logs reflect the true cause (zero-copy
+// upload vs UMA readback vs resolve/memexport without host-memory import).
+inline const char* DescribeDenseSharedMemoryReason(
+    bool uma_readback, bool zero_copy_upload,
+    bool readback_or_memexport_without_host_buffer) {
+  const uint32_t mask =
+      (uint32_t(uma_readback) << 0) | (uint32_t(zero_copy_upload) << 1) |
+      (uint32_t(readback_or_memexport_without_host_buffer) << 2);
+  switch (mask) {
+    case 0b001u:
+      return "UMA resolve readback (readback_resolve=uma)";
+    case 0b010u:
+      return "zero-copy CPU upload (vulkan_shared_memory_zero_copy_upload)";
+    case 0b011u:
+      return "UMA resolve readback + zero-copy CPU upload";
+    case 0b100u:
+      return "resolve/memexport readback without host-memory import";
+    case 0b101u:
+      return "UMA/resolve/memexport readback without host-memory import";
+    case 0b110u:
+      return "zero-copy CPU upload + resolve/memexport readback without "
+             "host-memory import";
+    case 0b111u:
+      return "UMA readback + zero-copy CPU upload + resolve/memexport readback "
+             "without host-memory import";
+    default:
+      return "host-mapped shared memory";
+  }
+}
+
 }  // namespace vulkan
 }  // namespace gpu
 }  // namespace xe

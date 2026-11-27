@@ -2804,31 +2804,43 @@ uint32_t VulkanRenderTargetCache::NoteTilingBandDraw(
     if (!tiling_band_color_key_ && is_band_target(color_key)) {
       const uint32_t prev_height =
           static_cast<VulkanRenderTarget*>(rts[1])->allocated_guest_height();
-      EnsureRenderTargetHeight(rts[1], kMergedTilingBandsHeight);
-      if (static_cast<VulkanRenderTarget*>(rts[1])->allocated_guest_height() !=
-          prev_height) {
-        grew_band_target = true;
-      }
-      tiling_band_color_key_ = color_key.key;
-      if (!DrawReplacesArea(false, normalized_depth_control,
-                            normalized_color_mask, vertex_shader,
-                            color_key.GetWidth(), kMergedTilingBandsHeight)) {
-        replicate |= 0b1;
+      if (!EnsureRenderTargetHeight(rts[1], kMergedTilingBandsHeight)) {
+        XELOGW(
+            "NoteTilingBandDraw: failed to grow color RT {} to {} rows (OOM); "
+            "skipping band merge for color target",
+            color_key.GetDebugName(), kMergedTilingBandsHeight);
+      } else {
+        if (static_cast<VulkanRenderTarget*>(rts[1])
+                ->allocated_guest_height() != prev_height) {
+          grew_band_target = true;
+        }
+        tiling_band_color_key_ = color_key.key;
+        if (!DrawReplacesArea(false, normalized_depth_control,
+                              normalized_color_mask, vertex_shader,
+                              color_key.GetWidth(), kMergedTilingBandsHeight)) {
+          replicate |= 0b1;
+        }
       }
     }
     if (!tiling_band_depth_key_ && is_band_target(depth_key)) {
       const uint32_t prev_height =
           static_cast<VulkanRenderTarget*>(rts[0])->allocated_guest_height();
-      EnsureRenderTargetHeight(rts[0], kMergedTilingBandsHeight);
-      if (static_cast<VulkanRenderTarget*>(rts[0])->allocated_guest_height() !=
-          prev_height) {
-        grew_band_target = true;
-      }
-      tiling_band_depth_key_ = depth_key.key;
-      if (!DrawReplacesArea(true, normalized_depth_control,
-                            normalized_color_mask, vertex_shader,
-                            depth_key.GetWidth(), kMergedTilingBandsHeight)) {
-        replicate |= 0b10;
+      if (!EnsureRenderTargetHeight(rts[0], kMergedTilingBandsHeight)) {
+        XELOGW(
+            "NoteTilingBandDraw: failed to grow depth RT {} to {} rows (OOM); "
+            "skipping band merge for depth target",
+            depth_key.GetDebugName(), kMergedTilingBandsHeight);
+      } else {
+        if (static_cast<VulkanRenderTarget*>(rts[0])
+                ->allocated_guest_height() != prev_height) {
+          grew_band_target = true;
+        }
+        tiling_band_depth_key_ = depth_key.key;
+        if (!DrawReplacesArea(true, normalized_depth_control,
+                              normalized_color_mask, vertex_shader,
+                              depth_key.GetWidth(), kMergedTilingBandsHeight)) {
+          replicate |= 0b10;
+        }
       }
     }
     if (!last_update_framebuffer_ &&
@@ -2863,13 +2875,24 @@ void VulkanRenderTargetCache::ReplicateTilingBandRenderTargetRows(
     RenderTarget* render_target, uint32_t band_rows) {
   auto& rt = *static_cast<VulkanRenderTarget*>(render_target);
   FlushDeferredResolveClearForTarget(&rt);
-  EnsureRenderTargetHeight(render_target,
-                           std::max(kMergedTilingBandsHeight, band_rows));
+  const uint32_t prev_height = rt.allocated_guest_height();
+  const uint32_t target_height = std::max(kMergedTilingBandsHeight, band_rows);
+  if (!EnsureRenderTargetHeight(render_target, target_height)) {
+    XELOGW(
+        "ReplicateTilingBandRenderTargetRows: failed to grow RT {} to {} rows "
+        "(OOM); skipping band row replication",
+        rt.key().GetDebugName(), target_height);
+    return;
+  }
+  const bool grew = rt.allocated_guest_height() != prev_height;
   if (!last_update_framebuffer_ && last_update_render_pass_ != VK_NULL_HANDLE) {
     last_update_framebuffer_ = GetHostRenderTargetsFramebuffer(
         last_update_render_pass_key_,
         last_update_framebuffer_pitch_tiles_at_32bpp_,
         last_update_accumulated_render_targets());
+  }
+  if (grew) {
+    StageDeferredResolveClearsForLastUpdate();
   }
   const RenderTargetKey key = rt.key();
   const uint32_t guest_width = key.GetWidth();
@@ -4433,8 +4456,10 @@ bool VulkanRenderTargetCache::TryDirectHostResolveCopy(
     }
     const uint32_t rt_w = link_src.key.GetWidth();
     if (mapping_affine && affine_dx >= 0 && affine_dy >= 0) {
-      EnsureRenderTargetHeight(link_src.render_target,
-                               uint32_t(affine_dy) + resolve_h);
+      if (!EnsureRenderTargetHeight(link_src.render_target,
+                                    uint32_t(affine_dy) + resolve_h)) {
+        mapping_affine = false;
+      }
     }
     const uint32_t rt_h = link_src.render_target->allocated_guest_height();
     if (mapping_affine && affine_dx >= 0 && affine_dy >= 0 &&
@@ -5584,6 +5609,13 @@ bool VulkanRenderTargetCache::Update(
         FlushDeferredResolveClearsForTransfers(
             1 + xenos::kMaxColorRenderTargets, depth_and_color_render_targets,
             update_transfers, /*flush_dests=*/true);
+        // Ensure all transfer destinations, sources, and host depth sources
+        // cover the transferred tile rows BEFORE queueing in-pass transfers or
+        // building the draw pass framebuffer (growing inside an active pass is
+        // illegal).
+        EnsureTransferRenderTargetsHeight(1 + xenos::kMaxColorRenderTargets,
+                                          depth_and_color_render_targets,
+                                          update_transfers, nullptr);
         if (cvars::vulkan_in_pass_transfers) {
           // Try to queue each render target's transfers for in-pass execution;
           // transfers that can't be merged into the active pass fall back to
@@ -7268,17 +7300,43 @@ bool VulkanRenderTargetCache::GrowRenderTarget(
   const VkPipelineStageFlags old_stage = render_target->current_stage_mask();
   const VkAccessFlags old_access = render_target->current_access_mask();
   if (old_layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+    static_assert(resolve_opts::kVkStageTopOfPipeBit ==
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT &&
+                  resolve_opts::kVkStageFragmentShaderBit ==
+                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT &&
+                  resolve_opts::kVkStageComputeShaderBit ==
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT &&
+                  resolve_opts::kVkStageAllCommandsBit ==
+                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT &&
+                  resolve_opts::kVkAccessShaderReadBit ==
+                      VK_ACCESS_SHADER_READ_BIT);
     const VkImageAspectFlags aspect =
         key.is_depth
             ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
             : VK_IMAGE_ASPECT_COLOR_BIT;
     const VkImageSubresourceRange subresource_range =
         ui::vulkan::util::InitializeSubresourceRange(aspect);
-    const VkPipelineStageFlags src_stage =
-        old_stage ? old_stage : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkPipelineStageFlags draw_stage = 0;
+    VkAccessFlags draw_access = 0;
+    VkImageLayout draw_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    render_target->GetDrawUsage(&draw_stage, &draw_access, &draw_layout);
+    const bool old_layout_is_transient_or_transfer =
+        old_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL ||
+        old_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+        old_layout == VK_IMAGE_LAYOUT_GENERAL;
+    const bool old_layout_is_shader_read =
+        old_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    const resolve_opts::GrowBarrierPlan barrier_plan =
+        resolve_opts::ResolveGrowBarrierStates(
+            uint32_t(old_stage), uint32_t(old_access), uint32_t(old_layout),
+            uint32_t(draw_stage), uint32_t(draw_access), uint32_t(draw_layout),
+            old_layout_is_transient_or_transfer, old_layout_is_shader_read);
     command_processor_.PushImageMemoryBarrier(
-        old_image, subresource_range, src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        old_access, VK_ACCESS_TRANSFER_READ_BIT, old_layout,
+        old_image, subresource_range,
+        VkPipelineStageFlags(barrier_plan.pre_src_stage),
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VkAccessFlags(barrier_plan.pre_src_access),
+        VK_ACCESS_TRANSFER_READ_BIT, old_layout,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     command_processor_.PushImageMemoryBarrier(
         next_res.image, subresource_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -7302,23 +7360,17 @@ bool VulkanRenderTargetCache::GrowRenderTarget(
         old_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, next_res.image,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
 
-    VkPipelineStageFlags target_stage;
-    VkAccessFlags target_access;
-    VkImageLayout target_layout;
-    if (old_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL ||
-        old_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
-        old_layout == VK_IMAGE_LAYOUT_GENERAL) {
-      render_target->GetDrawUsage(&target_stage, &target_access,
-                                  &target_layout);
-    } else {
-      target_stage = src_stage;
-      target_access = old_access;
-      target_layout = old_layout;
-    }
+    const VkPipelineStageFlags target_stage =
+        VkPipelineStageFlags(barrier_plan.post_dst_stage);
+    const VkAccessFlags target_access =
+        VkAccessFlags(barrier_plan.post_dst_access);
+    const VkImageLayout target_layout =
+        VkImageLayout(barrier_plan.post_layout);
     command_processor_.PushImageMemoryBarrier(
         next_res.image, subresource_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
         target_stage, VK_ACCESS_TRANSFER_WRITE_BIT, target_access,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, target_layout);
+    command_processor_.SubmitBarriers(true);
     render_target->SetUsage(target_stage, target_access, target_layout);
   } else {
     render_target->SetUsage(0, 0, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -7375,6 +7427,76 @@ bool VulkanRenderTargetCache::GrowRenderTarget(
   XELOGGPU("Grew {} from {} to {} guest rows (max {})", key.GetDebugName(),
            old_guest_height, grown_guest_height, max_guest_height);
   return true;
+}
+
+bool VulkanRenderTargetCache::EnsureTransferRenderTargetsHeight(
+    uint32_t render_target_count, RenderTarget* const* render_targets,
+    const std::vector<Transfer>* render_target_transfers,
+    const Transfer::Rectangle* resolve_clear_rectangle) {
+  if (!cvars::vulkan_rt_rows_on_demand) {
+    return true;
+  }
+  bool all_succeeded = true;
+  auto ensure_for_transfer = [this, &all_succeeded](
+                                 RenderTarget* rt, const Transfer& transfer,
+                                 const char* role) {
+    if (!rt) {
+      return;
+    }
+    auto* vulkan_rt = static_cast<VulkanRenderTarget*>(rt);
+    const RenderTargetKey key = rt->key();
+    const uint32_t needed_height =
+        resolve_opts::ComputeTransferNeededGuestHeight(
+            transfer.start_tiles, transfer.end_tiles, key.base_tiles,
+            key.GetPitchTiles(), uint32_t(key.msaa_samples));
+    if (!resolve_opts::RenderTargetHeightCoversNeeded(
+            vulkan_rt->allocated_guest_height(), vulkan_rt->max_guest_height(),
+            needed_height)) {
+      const uint32_t clamped_needed =
+          std::min(needed_height, vulkan_rt->max_guest_height());
+      if (!EnsureRenderTargetHeight(rt, clamped_needed)) {
+        XELOGW(
+            "EnsureTransferRenderTargetsHeight: failed to grow {} RT {} to {} "
+            "rows (OOM)",
+            role, key.GetDebugName(), clamped_needed);
+        all_succeeded = false;
+      }
+    }
+  };
+  for (uint32_t i = 0; i < render_target_count; ++i) {
+    RenderTarget* dest_rt = render_targets[i];
+    if (!dest_rt) {
+      continue;
+    }
+    if (resolve_clear_rectangle && resolve_clear_rectangle->height_pixels) {
+      auto* dest_vulkan_rt = static_cast<VulkanRenderTarget*>(dest_rt);
+      const uint32_t clear_needed_height =
+          resolve_clear_rectangle->y_pixels +
+          resolve_clear_rectangle->height_pixels;
+      if (!resolve_opts::RenderTargetHeightCoversNeeded(
+              dest_vulkan_rt->allocated_guest_height(),
+              dest_vulkan_rt->max_guest_height(), clear_needed_height)) {
+        const uint32_t clamped_clear_height =
+            std::min(clear_needed_height, dest_vulkan_rt->max_guest_height());
+        if (!EnsureRenderTargetHeight(dest_rt, clamped_clear_height)) {
+          XELOGW(
+              "EnsureTransferRenderTargetsHeight: failed to grow clear dest RT "
+              "{} to {} rows (OOM)",
+              dest_rt->key().GetDebugName(), clamped_clear_height);
+          all_succeeded = false;
+        }
+      }
+    }
+    for (const Transfer& transfer : render_target_transfers[i]) {
+      ensure_for_transfer(dest_rt, transfer, "dest");
+      ensure_for_transfer(transfer.source, transfer, "source");
+      if (transfer.host_depth_source && transfer.host_depth_source != dest_rt) {
+        ensure_for_transfer(transfer.host_depth_source, transfer,
+                            "host_depth_source");
+      }
+    }
+  }
+  return all_succeeded;
 }
 
 void VulkanRenderTargetCache::DestroyDeferredRtDestructions(
@@ -10804,7 +10926,32 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         }
       }
     }
+    // Ensure transfer destinations, sources, host depth sources, and resolve
+    // clear targets are tall enough for the transferred/cleared rows before
+    // host depth store or image layout transitions.
+    EnsureTransferRenderTargetsHeight(
+        render_target_count, render_targets, render_target_transfers,
+        resolve_clear_needed ? resolve_clear_rectangle : nullptr);
   }
+
+  auto transfer_targets_tall_enough = [](const RenderTarget* dest,
+                                         const Transfer& transfer) -> bool {
+    auto rt_covers = [&transfer](const RenderTarget* rt) -> bool {
+      if (!rt) {
+        return true;
+      }
+      const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rt);
+      const RenderTargetKey key = rt->key();
+      const uint32_t needed = resolve_opts::ComputeTransferNeededGuestHeight(
+          transfer.start_tiles, transfer.end_tiles, key.base_tiles,
+          key.GetPitchTiles(), uint32_t(key.msaa_samples));
+      return resolve_opts::RenderTargetHeightCoversNeeded(
+          vulkan_rt->allocated_guest_height(), vulkan_rt->max_guest_height(),
+          needed);
+    };
+    return rt_covers(dest) && rt_covers(transfer.source) &&
+           rt_covers(transfer.host_depth_source);
+  };
 
   command_processor_.PushDebugMarker("PerformTransfersAndResolveClears");
 
@@ -10859,6 +11006,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     const std::vector<Transfer>& depth_transfers = render_target_transfers[i];
     for (const Transfer& transfer : depth_transfers) {
       if (transfer.host_depth_source != dest_rt) {
+        continue;
+      }
+      if (!transfer_targets_tall_enough(dest_rt, transfer)) {
         continue;
       }
       assert_false(dest_rt_key.scale_native);
@@ -11185,6 +11335,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         }
         for (const Transfer& transfer : current_transfers) {
           assert_not_null(transfer.source);
+          if (!transfer_targets_tall_enough(dest_rt, transfer)) {
+            continue;
+          }
           auto& source_vulkan_rt =
               *static_cast<VulkanRenderTarget*>(transfer.source);
           VulkanRenderTarget* host_depth_source_vulkan_rt =
@@ -11243,6 +11396,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       std::sort(current_transfer_invocations_.begin(),
                 current_transfer_invocations_.end());
 
+      if (!current_transfer_invocations_.empty()) {
       // For in-pass transfers, the source barriers were already issued before
       // the active render pass was entered (PreparePendingDrawPassTransferBarriers),
       // and the pass can't be (re)entered here.
@@ -11311,6 +11465,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         stencil_clear_attachment->clearValue.depthStencil.depth = 0.0f;
         stencil_clear_attachment->clearValue.depthStencil.stencil = 0;
         for (const Transfer& transfer : current_transfers) {
+          if (!transfer_targets_tall_enough(dest_rt, transfer)) {
+            continue;
+          }
           Transfer::Rectangle transfer_stencil_clear_rectangles
               [Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_stencil_clear_rectangle_count =
@@ -11667,22 +11824,40 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                     }
         }
       }
+      }
     }
 
     // Perform the clear.
     if (resolve_clear_needed) {
-      if (!in_current_render_pass) {
-        command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-            transfer_render_pass, transfer_framebuffer, transfer_dest_view,
-            dest_rt_key.is_depth);
+      VkClearRect clamped_clear_rect = resolve_clear_rect;
+      const uint32_t fb_w = transfer_framebuffer->host_extent.width;
+      const uint32_t fb_h = transfer_framebuffer->host_extent.height;
+      const uint32_t off_x = uint32_t(std::max(clamped_clear_rect.rect.offset.x, 0));
+      const uint32_t off_y = uint32_t(std::max(clamped_clear_rect.rect.offset.y, 0));
+      if (off_x < fb_w && off_y < fb_h) {
+        clamped_clear_rect.rect.extent.width =
+            std::min(clamped_clear_rect.rect.extent.width, fb_w - off_x);
+        clamped_clear_rect.rect.extent.height =
+            std::min(clamped_clear_rect.rect.extent.height, fb_h - off_y);
+      } else {
+        clamped_clear_rect.rect.extent.width = 0;
+        clamped_clear_rect.rect.extent.height = 0;
       }
-      VkClearAttachment resolve_clear_attachment;
-      GetResolveClearAttachment(dest_rt_key,
-                                render_target_resolve_clear_values[i],
-                                resolve_clear_attachment);
-      resolve_clear_attachment.colorAttachment = 0;
-      command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1,
-                                           &resolve_clear_rect);
+      if (clamped_clear_rect.rect.extent.width &&
+          clamped_clear_rect.rect.extent.height) {
+        if (!in_current_render_pass) {
+          command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+              transfer_render_pass, transfer_framebuffer, transfer_dest_view,
+              dest_rt_key.is_depth);
+        }
+        VkClearAttachment resolve_clear_attachment;
+        GetResolveClearAttachment(dest_rt_key,
+                                  render_target_resolve_clear_values[i],
+                                  resolve_clear_attachment);
+        resolve_clear_attachment.colorAttachment = 0;
+        command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1,
+                                             &clamped_clear_rect);
+      }
     }
   }
 
@@ -12511,8 +12686,24 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
       }
     }
     if (needed_guest_height > rt->allocated_guest_height()) {
-      EnsureRenderTargetHeight(rt, needed_guest_height);
+      if (!EnsureRenderTargetHeight(rt, needed_guest_height)) {
+        XELOGW(
+            "DumpRenderTargets: failed to grow RT {} to {} rows (OOM); "
+            "omitting rectangle from EDRAM dump",
+            rt_key.GetDebugName(), needed_guest_height);
+        rectangle.render_target = nullptr;
+      }
     }
+  }
+  dump_rectangles_.erase(
+      std::remove_if(dump_rectangles_.begin(), dump_rectangles_.end(),
+                     [](const ResolveCopyDumpRectangle& rect) {
+                       return rect.render_target == nullptr;
+                     }),
+      dump_rectangles_.end());
+  if (dump_rectangles_.empty()) {
+    command_processor_.PopDebugMarker();
+    return;
   }
 
   // Clear previously set temporary indices.

@@ -150,21 +150,29 @@ bool VulkanSharedMemory::Initialize() {
   TryInitializeHostBuffer();
 
   const ReadbackResolveMode readback_mode = GetReadbackResolveMode();
-  const bool needs_host_mapping =
-      readback_mode == ReadbackResolveMode::kUma ||
-      cvars::vulkan_shared_memory_zero_copy_upload ||
-      (host_buffer_ == VK_NULL_HANDLE &&
-       (readback_mode != ReadbackResolveMode::kDisabled ||
-        cvars::memexport_enable));
+  const bool uma_readback = readback_mode == ReadbackResolveMode::kUma;
+  const bool zero_copy_upload_enabled =
+      cvars::vulkan_shared_memory_zero_copy_upload;
+  const bool readback_or_memexport_no_host_buf =
+      host_buffer_ == VK_NULL_HANDLE &&
+      (readback_mode != ReadbackResolveMode::kDisabled ||
+       cvars::memexport_enable);
+  const bool needs_host_mapping = uma_readback || zero_copy_upload_enabled ||
+                                  readback_or_memexport_no_host_buf;
   if (needs_host_mapping && cvars::vulkan_sparse_shared_memory) {
     XELOGI(
-        "Shared memory: sparse binding disabled so the buffer can be "
-        "host-mapped for resolve/memexport readback");
+        "Shared memory: sparse binding bypassed for dense host-mapped 512 MB "
+        "buffer (reason: {})",
+        DescribeDenseSharedMemoryReason(uma_readback, zero_copy_upload_enabled,
+                                        readback_or_memexport_no_host_buf));
   }
   buffer_device_address_ = 0;
   bool buffer_has_bda = false;
-  if (cvars::vulkan_sparse_shared_memory && !needs_host_mapping &&
-      vulkan_device->properties().sparseResidencyBuffer) {
+  auto try_create_sparse_buffer = [&]() {
+    if (!vulkan_device->properties().sparseResidencyBuffer) {
+      return;
+    }
+    buffer_create_info.flags |= sparse_flags;
     for (int bda_attempt = 0;
          bda_attempt < (device_has_bda ? 2 : 1) && buffer_ == VK_NULL_HANDLE;
          ++bda_attempt) {
@@ -223,9 +231,12 @@ bool VulkanSharedMemory::Initialize() {
                kBufferSize >> 20);
       }
     }
+  };
+  if (cvars::vulkan_sparse_shared_memory && !needs_host_mapping) {
+    try_create_sparse_buffer();
   }
 
-  // Create a non-sparse buffer if there were issues with the sparse buffer.
+  // Create a non-sparse buffer if sparse was bypassed or failed.
   if (buffer_ == VK_NULL_HANDLE) {
     XELOGGPU(
         "Vulkan sparse binding is not used for shared memory emulation - video "
@@ -236,6 +247,7 @@ bool VulkanSharedMemory::Initialize() {
     bool buffer_host_visible = false;
     bool buffer_host_coherent = false;
     VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
+    bool dense_alloc_failed = false;
     for (int bda_attempt = 0; bda_attempt < (device_has_bda ? 2 : 1);
          ++bda_attempt) {
       const bool try_bda = device_has_bda && (bda_attempt == 0);
@@ -253,8 +265,8 @@ bool VulkanSharedMemory::Initialize() {
         }
         XELOGE("Shared memory: Failed to create the {} MB Vulkan buffer",
                kBufferSize >> 20);
-        Shutdown();
-        return false;
+        dense_alloc_failed = true;
+        break;
       }
       VkMemoryRequirements buffer_memory_requirements;
       dfn.vkGetBufferMemoryRequirements(device, buffer_,
@@ -317,8 +329,8 @@ bool VulkanSharedMemory::Initialize() {
         XELOGE(
             "Shared memory: Failed to get a device-local Vulkan memory type "
             "for the buffer");
-        Shutdown();
-        return false;
+        dense_alloc_failed = true;
+        break;
       }
       VkMemoryAllocateInfo buffer_memory_allocate_info;
       buffer_memory_allocate_info.sType =
@@ -364,8 +376,8 @@ bool VulkanSharedMemory::Initialize() {
             "Shared memory: Failed to allocate {} MB of memory for the Vulkan "
             "buffer",
             kBufferSize >> 20);
-        Shutdown();
-        return false;
+        dense_alloc_failed = true;
+        break;
       }
       if (dfn.vkBindBufferMemory(device, buffer_, buffer_memory, 0) !=
           VK_SUCCESS) {
@@ -380,17 +392,34 @@ bool VulkanSharedMemory::Initialize() {
           continue;
         }
         XELOGE("Shared memory: Failed to bind memory to the Vulkan buffer");
-        Shutdown();
-        return false;
+        dense_alloc_failed = true;
+        break;
       }
       buffer_memory_.push_back(buffer_memory);
       buffer_has_bda = try_bda;
       break;
     }
 
-    // Persistently map the buffer for direct CPU readback (readback_resolve=uma)
-    // when it landed on a host-visible type.
-    if (buffer_host_visible) {
+    if (dense_alloc_failed) {
+      // Low-RAM fallback: if dense 512 MB allocation failed when sparse was
+      // bypassed solely for host mapping (zero-copy upload / UMA), degrade
+      // cleanly to a sparse device-local buffer (staging uploads).
+      if (needs_host_mapping && cvars::vulkan_sparse_shared_memory &&
+          vulkan_device->properties().sparseResidencyBuffer) {
+        XELOGW(
+            "Shared memory: dense {} MB allocation failed; falling back to "
+            "sparse device-local buffer (zero-copy upload / direct host "
+            "mapping disabled for this session)",
+            kBufferSize >> 20);
+        try_create_sparse_buffer();
+      }
+      if (buffer_ == VK_NULL_HANDLE) {
+        Shutdown();
+        return false;
+      }
+    } else if (buffer_host_visible && buffer_memory != VK_NULL_HANDLE) {
+      // Persistently map the buffer for direct CPU readback (readback_resolve=uma)
+      // and zero-copy uploads when it landed on a host-visible type.
       void* mapped_data;
       if (dfn.vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0,
                           &mapped_data) == VK_SUCCESS) {

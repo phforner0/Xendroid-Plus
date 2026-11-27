@@ -414,6 +414,124 @@ inline void ComputeDirectHostResolveDispatchGroups(uint32_t thread_count_x,
   }
 }
 
+// Computes the minimum guest pixel height required on a render target to cover
+// EDRAM ownership-transfer range [start_tiles, end_tiles) (with 2048-tile ring
+// wraparound). `rt_pitch_tiles` must be `RenderTargetKey::GetPitchTiles()`.
+inline uint32_t ComputeTransferNeededGuestHeight(uint32_t start_tiles,
+                                                 uint32_t end_tiles,
+                                                 uint32_t rt_base_tiles,
+                                                 uint32_t rt_pitch_tiles,
+                                                 uint32_t msaa_samples) {
+  constexpr uint32_t kEdramTileCount = 2048u;
+  if (end_tiles <= start_tiles || !rt_pitch_tiles) {
+    return 0u;
+  }
+  const uint32_t clamped_start = std::min(start_tiles, kEdramTileCount);
+  const uint32_t clamped_end = std::min(end_tiles, kEdramTileCount);
+  if (clamped_end <= clamped_start) {
+    return 0u;
+  }
+  uint32_t max_local_tile_end = 0u;
+  if (clamped_start >= rt_base_tiles) {
+    max_local_tile_end = clamped_end - rt_base_tiles;
+  } else if (clamped_end <= rt_base_tiles) {
+    max_local_tile_end = (kEdramTileCount - rt_base_tiles) + clamped_end;
+  } else {
+    max_local_tile_end = kEdramTileCount;
+  }
+  const uint32_t tile_rows =
+      (max_local_tile_end + rt_pitch_tiles - 1u) / rt_pitch_tiles;
+  const uint32_t tile_height_px = (msaa_samples >= kMsaa2X) ? 8u : 16u;
+  return tile_rows * tile_height_px;
+}
+
+// Returns whether a render target with `allocated_guest_height` and legal cap
+// `max_guest_height` covers `needed_guest_height` (clamped to max_guest_height
+// to match EnsureRenderTargetHeight(), preventing narrow or wrapped RTs already
+// at max_guest_height from being mistakenly dropped as OOM-undersized).
+constexpr bool RenderTargetHeightCoversNeeded(uint32_t allocated_guest_height,
+                                              uint32_t max_guest_height,
+                                              uint32_t needed_guest_height) {
+  const uint32_t clamped_needed =
+      max_guest_height ? std::min(needed_guest_height, max_guest_height)
+                       : needed_guest_height;
+  return allocated_guest_height >= clamped_needed;
+}
+
+// Vulkan stage/access bitmask constants mirrored for pure-logic unit tests
+// (static_asserted against Vulkan headers in vulkan_render_target_cache.cc).
+constexpr uint32_t kVkStageTopOfPipeBit = 0x00000001u;
+constexpr uint32_t kVkStageFragmentShaderBit = 0x00000080u;
+constexpr uint32_t kVkStageComputeShaderBit = 0x00000800u;
+constexpr uint32_t kVkStageAllCommandsBit = 0x00010000u;
+constexpr uint32_t kVkAccessShaderReadBit = 0x00000020u;
+
+struct GrowBarrierPlan {
+  uint32_t pre_src_stage = 0;
+  uint32_t pre_src_access = 0;
+  uint32_t post_dst_stage = 0;
+  uint32_t post_dst_access = 0;
+  uint32_t post_layout = 0;
+};
+
+// Resolves valid Vulkan pre-copy and post-copy barrier stages/accesses for
+// GrowRenderTarget(), guaranteeing:
+//   1. pre_src_stage != 0, and TOP_OF_PIPE is never paired with non-zero access
+//   2. post_dst_stage != 0 and NEVER contains VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+//      (preventing VUID-vkCmdPipelineBarrier-dstStageMask-03900).
+inline GrowBarrierPlan ResolveGrowBarrierStates(
+    uint32_t old_stage, uint32_t old_access, uint32_t old_layout,
+    uint32_t draw_stage, uint32_t draw_access, uint32_t draw_layout,
+    bool old_layout_is_transient_or_transfer, bool old_layout_is_shader_read) {
+  GrowBarrierPlan plan{};
+  uint32_t pre_stage = old_stage;
+  uint32_t pre_access = old_access;
+  if (pre_stage == 0u) {
+    pre_stage = pre_access ? kVkStageAllCommandsBit : kVkStageTopOfPipeBit;
+  } else if ((pre_stage & kVkStageTopOfPipeBit) != 0u && pre_access != 0u) {
+    pre_stage &= ~kVkStageTopOfPipeBit;
+    if (pre_stage == 0u) {
+      pre_stage = kVkStageAllCommandsBit;
+    }
+  }
+  if (pre_stage == kVkStageTopOfPipeBit) {
+    pre_access = 0u;
+  }
+  plan.pre_src_stage = pre_stage;
+  plan.pre_src_access = pre_access;
+
+  const uint32_t safe_draw_stage =
+      (draw_stage & ~kVkStageTopOfPipeBit) ? (draw_stage & ~kVkStageTopOfPipeBit)
+                                           : kVkStageAllCommandsBit;
+  if (old_layout_is_transient_or_transfer) {
+    plan.post_dst_stage = safe_draw_stage;
+    plan.post_dst_access = draw_access;
+    plan.post_layout = draw_layout;
+  } else if (old_layout_is_shader_read) {
+    const uint32_t stripped = old_stage & ~kVkStageTopOfPipeBit;
+    if (stripped != 0u && old_access != 0u) {
+      plan.post_dst_stage = stripped;
+      plan.post_dst_access = old_access;
+    } else {
+      plan.post_dst_stage =
+          kVkStageFragmentShaderBit | kVkStageComputeShaderBit;
+      plan.post_dst_access = kVkAccessShaderReadBit;
+    }
+    plan.post_layout = old_layout;
+  } else {
+    const uint32_t stripped = old_stage & ~kVkStageTopOfPipeBit;
+    if (stripped != 0u) {
+      plan.post_dst_stage = stripped;
+      plan.post_dst_access = old_access ? old_access : draw_access;
+    } else {
+      plan.post_dst_stage = safe_draw_stage;
+      plan.post_dst_access = draw_access;
+    }
+    plan.post_layout = old_layout;
+  }
+  return plan;
+}
+
 }  // namespace resolve_opts
 }  // namespace vulkan
 }  // namespace gpu
@@ -1881,6 +1999,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                           RenderTargetBackingResources& out);
   bool GrowRenderTarget(VulkanRenderTarget* render_target,
                         uint32_t needed_guest_height);
+  bool EnsureTransferRenderTargetsHeight(
+      uint32_t render_target_count, RenderTarget* const* render_targets,
+      const std::vector<Transfer>* render_target_transfers,
+      const Transfer::Rectangle* resolve_clear_rectangle);
 
   // Retired VulkanRenderTarget images/views/descriptors/framebuffers from
   // row-on-demand growth, destroyed once entry.submission <= completed.

@@ -30,6 +30,9 @@ DECLARE_int32(spin_park_mode);
 DECLARE_uint32(guest_yield_sleep_us);
 DECLARE_int32(apu_queue_target);
 DECLARE_bool(kernel_delay0_backoff);
+#if defined(__ANDROID__)
+DECLARE_bool(vulkan_late_swap_present);
+#endif
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/byte_stream.h"
@@ -1052,6 +1055,24 @@ void BinTraceCount(std::vector<std::pair<uint64_t, uint32_t>>& counts,
 }
 }  // namespace
 
+void CommandProcessor::PollLateSwapProperty() {
+#if defined(__ANDROID__)
+  char late_swap_prop[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.xendroid.late_swap", late_swap_prop) > 0) {
+    bool parsed = false;
+    if (ui::vulkan::ParseStrictBoolProperty(late_swap_prop, parsed)) {
+      const int32_t next = parsed ? 1 : 0;
+      if (late_swap_prop_override_.exchange(next, std::memory_order_relaxed) !=
+          next) {
+        XELOGI("debug.xendroid.late_swap: override = {}", parsed);
+      }
+      return;
+    }
+  }
+  late_swap_prop_override_.store(-1, std::memory_order_relaxed);
+#endif
+}
+
 void CommandProcessor::BinTracePoll() {
 #if defined(__ANDROID__)
   auto& t = bin_trace_;
@@ -1062,6 +1083,7 @@ void CommandProcessor::BinTracePoll() {
   char value[PROP_VALUE_MAX] = {};
   PollGpuThreadNiceProperty();
   PollPm4OptimizationProperties();
+  PollLateSwapProperty();
   // Read by the spin_park_guest_functions wait helper at run time.
   if (__system_property_get("debug.xendroid.spin_park", value) > 0 &&
       value[0] >= '0' && value[0] <= '2') {
@@ -1666,23 +1688,33 @@ void CommandProcessor::ThrottlePresentation() {
   const uint64_t target_duration_ticks = static_cast<uint64_t>(
       target_duration_ms * static_cast<double>(tick_freq) / 1000.0);
 
-  // Spin until target duration has elapsed
+  // Spin until target duration has elapsed.
+  // Avoid per-frame ConfigVars map lookup, std::string allocation, and
+  // __system_property_get syscall: read the cvar directly (or via one-time
+  // cached pointer on non-Android) and apply the cached debug property override
+  // polled at startup and every 30 frames in BinTracePoll().
   bool late_swap_enabled = false;
-  if (cvar::ConfigVars) {
-    auto it = cvar::ConfigVars->find("vulkan_late_swap_present");
-    if (it != cvar::ConfigVars->end() && it->second) {
-      const std::string val = it->second->effective_value();
-      if (val == "true" || val == "1") {
-        late_swap_enabled = true;
-      } else if (val == "false" || val == "0") {
-        late_swap_enabled = false;
+#if defined(__ANDROID__)
+  late_swap_enabled = cvars::vulkan_late_swap_present;
+  const int32_t prop_override =
+      late_swap_prop_override_.load(std::memory_order_relaxed);
+  if (prop_override >= 0) {
+    late_swap_enabled = prop_override != 0;
+  }
+#else
+  if (!late_swap_cvar_resolved_) {
+    late_swap_cvar_resolved_ = true;
+    if (cvar::ConfigVars) {
+      auto it = cvar::ConfigVars->find("vulkan_late_swap_present");
+      if (it != cvar::ConfigVars->end() && it->second) {
+        if (auto* bool_var = dynamic_cast<cvar::CommandVar<bool>*>(it->second)) {
+          late_swap_cvar_ptr_ = bool_var->current_value();
+        }
       }
     }
   }
-#if defined(__ANDROID__)
-  char late_swap_prop[PROP_VALUE_MAX] = {};
-  if (__system_property_get("debug.xendroid.late_swap", late_swap_prop) > 0) {
-    ui::vulkan::ParseStrictBoolProperty(late_swap_prop, late_swap_enabled);
+  if (late_swap_cvar_ptr_) {
+    late_swap_enabled = *late_swap_cvar_ptr_;
   }
 #endif
   // Explicit ZeroFG safety bypass: never alter frame pacing when ZeroFG owns
@@ -1737,6 +1769,7 @@ void CommandProcessor::WorkerThreadMain() {
   int32_t last_logged_nice = 0;
   PollGpuThreadNiceProperty();
   PollPm4OptimizationProperties();
+  PollLateSwapProperty();
   ApplyGpuCommandsThreadNice(last_logged_nice);
   auto nice_reapply_last = std::chrono::steady_clock::now();
 #endif
@@ -1839,6 +1872,11 @@ void CommandProcessor::Pause() {
 
   threading::Fence fence;
   CallInThread([this, &fence]() {
+    // Allow backends (e.g. Vulkan async Submit Worker) to drain all queued
+    // submissions BEFORE signalling Pause() completion and parking on
+    // pause_resume_event_, eliminating concurrent vkQueueSubmit / replay races
+    // during onPause, surface recreation, or savestate Save/Load.
+    OnPause();
     fence.Signal();
     // Event, not thread Suspend(): a Resume() landing before the worker
     // suspends would be lost forever; an early event Set() is remembered.
