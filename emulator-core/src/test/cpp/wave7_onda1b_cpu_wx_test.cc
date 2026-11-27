@@ -1013,6 +1013,15 @@ void TestSourceContracts(const fs::path& cpp_root) {
       a64_cc_cc, "void A64CodeCache::RevertDirectCallSitesInRange(");
   WAVE7_1B_CHECK(rev_pic.find("RetirePicSiteLocked(") != std::string::npos);
   WAVE7_1B_CHECK(rev_pic.find("pic_sites_by_caller_") != std::string::npos);
+  // Regression (#174): single-address invalidation must use O(1) .find() on
+  // all three tracking maps rather than O(N) full scans per function.
+  WAVE7_1B_CHECK(rev_pic.find("guest_start == guest_end") != std::string::npos);
+  WAVE7_1B_CHECK(rev_pic.find("patched_direct_call_sites_.find(guest_start)") !=
+                 std::string::npos);
+  WAVE7_1B_CHECK(rev_pic.find("patched_pic_sites_.find(guest_start)") !=
+                 std::string::npos);
+  WAVE7_1B_CHECK(rev_pic.find("pic_sites_by_caller_.find(guest_start)") !=
+                 std::string::npos);
 
   const std::string call_ind = ExtractFunctionBody(
       a64_em_cc, "void A64Emitter::CallIndirect(");

@@ -486,17 +486,13 @@ void A64CodeCache::RevertDirectCallSitesInRange(uint32_t guest_start,
   if (guest_start > guest_end) {
     return;
   }
+  const bool single_address = (guest_start == guest_end);
   {
     std::lock_guard<std::mutex> lock(direct_call_sites_mutex_);
-    for (auto it = patched_direct_call_sites_.begin();
-         it != patched_direct_call_sites_.end();) {
-      const uint32_t target_addr = it->first;
-      if (target_addr < guest_start || target_addr > guest_end) {
-        ++it;
-        continue;
-      }
+    auto revert_direct_entry = [&](uint32_t target_addr,
+                                   const std::vector<DirectCallSite>& sites) {
       auto& pending = pending_direct_call_sites_[target_addr];
-      for (const auto& site : it->second) {
+      for (const auto& site : sites) {
         uint32_t* rw_slot = WriteSlotForExecuteAddress(site.call_site_rx);
         if (rw_slot &&
             PatchA64InstructionAtomic(rw_slot, site.original_stub_insn)) {
@@ -505,36 +501,71 @@ void A64CodeCache::RevertDirectCallSitesInRange(uint32_t guest_start,
         }
         pending.push_back(site);
       }
-      it = patched_direct_call_sites_.erase(it);
+    };
+    if (single_address) {
+      // O(1) point lookup avoids O(N^2) scans during bulk per-function
+      // invalidation (e.g. late VSCR[SAT] census flip after .jprof precompile).
+      auto it = patched_direct_call_sites_.find(guest_start);
+      if (it != patched_direct_call_sites_.end()) {
+        revert_direct_entry(it->first, it->second);
+        patched_direct_call_sites_.erase(it);
+      }
+    } else {
+      for (auto it = patched_direct_call_sites_.begin();
+           it != patched_direct_call_sites_.end();) {
+        const uint32_t target_addr = it->first;
+        if (target_addr < guest_start || target_addr > guest_end) {
+          ++it;
+          continue;
+        }
+        revert_direct_entry(target_addr, it->second);
+        it = patched_direct_call_sites_.erase(it);
+      }
     }
   }
   {
     std::lock_guard<std::mutex> lock(pic_sites_mutex_);
-    // 1. Retire PIC sites whose cached target lies inside the swept range.
     std::vector<uintptr_t> gates_to_retire;
-    for (auto it = patched_pic_sites_.begin();
-         it != patched_pic_sites_.end();) {
-      const uint32_t target_addr = it->first;
-      if (target_addr < guest_start || target_addr > guest_end) {
-        ++it;
-        continue;
+    if (single_address) {
+      // O(1) point lookups for both target-matched and caller-owned PIC sites.
+      auto pit = patched_pic_sites_.find(guest_start);
+      if (pit != patched_pic_sites_.end()) {
+        gates_to_retire.insert(gates_to_retire.end(), pit->second.begin(),
+                               pit->second.end());
+        patched_pic_sites_.erase(pit);
       }
-      gates_to_retire.insert(gates_to_retire.end(), it->second.begin(),
-                             it->second.end());
-      it = patched_pic_sites_.erase(it);
-    }
-    // 2. Retire any remaining PIC sites (including kUninitialized ones) owned
-    // by swept caller functions so dynamic recompiles cannot leak entries.
-    for (auto it = pic_sites_by_caller_.begin();
-         it != pic_sites_by_caller_.end();) {
-      const uint32_t caller_addr = it->first;
-      if (caller_addr < guest_start || caller_addr > guest_end) {
-        ++it;
-        continue;
+      auto cit = pic_sites_by_caller_.find(guest_start);
+      if (cit != pic_sites_by_caller_.end()) {
+        gates_to_retire.insert(gates_to_retire.end(), cit->second.begin(),
+                               cit->second.end());
+        pic_sites_by_caller_.erase(cit);
       }
-      gates_to_retire.insert(gates_to_retire.end(), it->second.begin(),
-                             it->second.end());
-      it = pic_sites_by_caller_.erase(it);
+    } else {
+      // 1. Retire PIC sites whose cached target lies inside the swept range.
+      for (auto it = patched_pic_sites_.begin();
+           it != patched_pic_sites_.end();) {
+        const uint32_t target_addr = it->first;
+        if (target_addr < guest_start || target_addr > guest_end) {
+          ++it;
+          continue;
+        }
+        gates_to_retire.insert(gates_to_retire.end(), it->second.begin(),
+                               it->second.end());
+        it = patched_pic_sites_.erase(it);
+      }
+      // 2. Retire any remaining PIC sites (including kUninitialized ones) owned
+      // by swept caller functions so dynamic recompiles cannot leak entries.
+      for (auto it = pic_sites_by_caller_.begin();
+           it != pic_sites_by_caller_.end();) {
+        const uint32_t caller_addr = it->first;
+        if (caller_addr < guest_start || caller_addr > guest_end) {
+          ++it;
+          continue;
+        }
+        gates_to_retire.insert(gates_to_retire.end(), it->second.begin(),
+                               it->second.end());
+        it = pic_sites_by_caller_.erase(it);
+      }
     }
     for (uintptr_t gate_rx : gates_to_retire) {
       auto site_it = pic_sites_by_gate_.find(gate_rx);

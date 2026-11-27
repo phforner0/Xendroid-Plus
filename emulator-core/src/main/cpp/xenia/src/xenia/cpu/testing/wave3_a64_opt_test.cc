@@ -748,8 +748,9 @@ TEST_CASE("WAVE7_A64_PIC_EVICTION_RESET_AND_ALIGNMENT", "[wave7][a64]") {
   std::memcpy(&gate1_word, reinterpret_cast<const void*>(g1), 4);
   REQUIRE(gate1_word == kA64NopInsn);
 
-  // Revert target range -> g1 gate switches to `b fallback_rx` AND g1 is evicted.
-  cache->RevertDirectCallSitesInRange(0x82020000u, 0x82020010u);
+  // Point-invalidation (guest_start == guest_end) on target -> g1 gate switches
+  // to `b fallback_rx` AND g1 is evicted in O(1) without sweeping unrelated sites.
+  cache->RevertDirectCallSitesInRange(0x82020000u, 0x82020000u);
   std::memcpy(&gate1_word, reinterpret_cast<const void*>(g1), 4);
   int64_t fb_off = 0;
   bool fb_link = true;
@@ -763,8 +764,9 @@ TEST_CASE("WAVE7_A64_PIC_EVICTION_RESET_AND_ALIGNMENT", "[wave7][a64]") {
   REQUIRE(!cache->FallbackIndirectCallPicSite(g2));
   REQUIRE(cache->TrackedPicSiteCount() == 1u);
 
-  // Sweeping caller range for uninitialized g3 evicts g3 -> 0 tracked sites.
-  cache->RevertDirectCallSitesInRange(0x82010200u, 0x82010210u);
+  // Point-invalidation (guest_start == guest_end) on caller for uninitialized
+  // g3 evicts g3 in O(1) -> 0 tracked sites.
+  cache->RevertDirectCallSitesInRange(0x82010200u, 0x82010200u);
   REQUIRE(cache->TrackedPicSiteCount() == 0u);
 
   // ResetIndirection resets committed slot safely and ignores uncommitted ones.
