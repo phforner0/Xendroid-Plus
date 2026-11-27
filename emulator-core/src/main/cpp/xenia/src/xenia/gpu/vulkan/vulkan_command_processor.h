@@ -216,7 +216,9 @@ inline uint32_t ClassifySysConstRegisterDirtyGroups(uint32_t reg_index) {
       return kSysConstGroupFlags;
     case 0x21FCu:  // VGT_DRAW_INITIATOR
       return kSysConstGroupFlags | kSysConstGroupIndex | kSysConstGroupPoint;
+    case 0x2200u:  // RB_DEPTHCONTROL
     case 0x2201u:  // RB_BLENDCONTROL0
+    case 0x2203u:  // RB_COLOR_MASK
     case 0x2205u:  // PA_SU_SC_MODE_CNTL
     case 0x2209u:  // RB_BLENDCONTROL1
     case 0x220Au:  // RB_BLENDCONTROL2
@@ -278,8 +280,8 @@ inline uint32_t ClassifySysConstRangeDirtyGroups(uint32_t start_index,
   if (overlaps(0x21FCu, 0x21FCu)) {
     mask |= kSysConstGroupFlags | kSysConstGroupIndex | kSysConstGroupPoint;
   }
-  if (overlaps(0x2201u, 0x220Bu)) {
-    if (overlaps(0x2201u, 0x2202u) || overlaps(0x2205u, 0x2205u) ||
+  if (overlaps(0x2200u, 0x220Bu)) {
+    if (overlaps(0x2200u, 0x2203u) || overlaps(0x2205u, 0x2205u) ||
         overlaps(0x2209u, 0x220Bu)) {
       mask |= kSysConstGroupFsi;
     }
@@ -632,6 +634,16 @@ class SmallReadbackRingState {
     return count_ > 0u ? slots_[head_].submission : 0u;
   }
 
+  uint64_t NewestSubmission() const {
+    if (count_ == 0u) {
+      return 0u;
+    }
+    const uint32_t last_idx =
+        (tail_ + kSmallReadbackRingSlotCount - 1u) %
+        kSmallReadbackRingSlotCount;
+    return slots_[last_idx].submission;
+  }
+
   // Marks all currently queued slots as discarded (e.g. on InvalidateGpuMemory)
   // WITHOUT resetting head_/tail_/count_, so in-flight GPU copies still retire
   // before their ring slots can be reused (preventing WAW on the ring buffer).
@@ -684,6 +696,187 @@ class SmallReadbackRingState {
   uint32_t count_ = 0u;
   uint64_t generation_ = 1u;
 };
+
+// Guards fixed-size per-submission Vulkan timestamp query/readback rings
+// (frame/resolve/pass pools, 32 slots each) against wraparound and reuse
+// hazards when bursts of submissions outpace GPU completion or CPU consumption.
+template <uint32_t kSlotCount>
+class TimestampSlotRingGuard {
+ public:
+  static constexpr uint32_t kInvalidSlot = UINT32_MAX;
+
+  void Reset() {
+    slot_submission_.fill(0u);
+    dropped_count_ = 0u;
+  }
+
+  // Returns slot in [0, kSlotCount) if safe to reset/write for
+  // `submission_index`, or kInvalidSlot if the slot may still be in flight on
+  // the GPU or unread in vk_submit_times_.
+  uint32_t TryAcquireSlot(uint64_t submission_index,
+                          uint64_t completed_submission,
+                          uint64_t oldest_unread_submission = 0u) {
+    if (submission_index == 0u) {
+      ++dropped_count_;
+      return kInvalidSlot;
+    }
+    if (submission_index > completed_submission &&
+        (submission_index - completed_submission) >= kSlotCount) {
+      ++dropped_count_;
+      return kInvalidSlot;
+    }
+    const uint32_t slot = uint32_t(submission_index % kSlotCount);
+    const uint64_t prev_sub = slot_submission_[slot];
+    if (prev_sub != 0u) {
+      if (prev_sub > completed_submission) {
+        ++dropped_count_;
+        return kInvalidSlot;
+      }
+      if (oldest_unread_submission != 0u &&
+          prev_sub >= oldest_unread_submission) {
+        ++dropped_count_;
+        return kInvalidSlot;
+      }
+    }
+    return slot;
+  }
+
+  void CommitSlot(uint32_t slot, uint64_t submission_index) {
+    if (slot < kSlotCount) {
+      slot_submission_[slot] = submission_index;
+    }
+  }
+
+  uint64_t slot_submission(uint32_t slot) const {
+    return slot < kSlotCount ? slot_submission_[slot] : 0u;
+  }
+
+  uint64_t dropped_count() const { return dropped_count_; }
+
+ private:
+  std::array<uint64_t, kSlotCount> slot_submission_{};
+  uint64_t dropped_count_ = 0u;
+};
+
+// Periodic nice reapplication controller for the GPU Submit Worker thread
+// (reapplies every 1s to survive Android cgroup/ActivityManager resets without
+// spamming logs).
+class WorkerNiceReapplyTracker {
+ public:
+  static constexpr uint64_t kReapplyIntervalNs = 1000000000ull;
+
+  struct CheckResult {
+    bool should_apply = false;
+    bool valid_range = true;
+    bool should_log_invalid = false;
+  };
+
+  CheckResult Check(int32_t desired_nice, uint64_t now_ns) {
+    CheckResult res{};
+    if (desired_nice < -20 || desired_nice > 19) {
+      res.valid_range = false;
+      if (last_logged_nice_ != desired_nice) {
+        last_logged_nice_ = desired_nice;
+        res.should_log_invalid = true;
+      }
+      last_desired_nice_ = desired_nice;
+      return res;
+    }
+    const bool desired_changed =
+        !initialized_ || desired_nice != last_desired_nice_;
+    const bool period_elapsed =
+        initialized_ && desired_nice != 0 && now_ns >= last_apply_ns_ &&
+        (now_ns - last_apply_ns_) >= kReapplyIntervalNs;
+    if (!desired_changed && !period_elapsed) {
+      return res;
+    }
+    initialized_ = true;
+    last_desired_nice_ = desired_nice;
+    last_apply_ns_ = now_ns;
+    res.should_apply = true;
+    return res;
+  }
+
+  bool already_logged(int32_t desired_nice) const {
+    return last_logged_nice_ == desired_nice;
+  }
+
+  bool ShouldLogOutcome(int32_t desired_nice) {
+    if (last_logged_nice_ != desired_nice) {
+      last_logged_nice_ = desired_nice;
+      return true;
+    }
+    return false;
+  }
+
+ private:
+  bool initialized_ = false;
+  int32_t last_desired_nice_ = 0;
+  int32_t last_logged_nice_ = INT32_MIN;
+  uint64_t last_apply_ns_ = 0;
+};
+
+// Decision policy for VulkanCommandProcessor::PrepareForWait() covering
+// pending non-memexport host writes (small resolve readbacks, ZPD, VIZ).
+struct PrepareForWaitFlushAction {
+  bool close_open_submission = false;
+  bool drain_submit_worker = false;
+  bool poll_completion = false;
+  uint64_t await_submission = 0;
+};
+
+inline PrepareForWaitFlushAction EvaluatePrepareForWaitFlush(
+    bool device_lost, bool submission_open, bool async_submit_worker_active,
+    uint64_t current_submission, uint64_t submitted_submission,
+    uint64_t completed_submission, bool has_pending_small_readbacks,
+    uint64_t newest_small_readback_submission, bool has_pending_zpd_batch,
+    bool has_in_flight_zpd_resolves, uint64_t newest_zpd_resolve_submission,
+    bool has_pending_zpd_retire, bool has_pending_viz_resolves) {
+  PrepareForWaitFlushAction action{};
+  if (device_lost) {
+    return action;
+  }
+  const bool has_non_memexport_pending =
+      has_pending_small_readbacks || has_pending_zpd_batch ||
+      has_in_flight_zpd_resolves || has_pending_zpd_retire ||
+      has_pending_viz_resolves;
+  if (!has_non_memexport_pending) {
+    return action;
+  }
+  const bool pending_in_open_submission =
+      submission_open &&
+      ((has_pending_small_readbacks &&
+        newest_small_readback_submission >= current_submission) ||
+       has_pending_zpd_batch ||
+       (has_in_flight_zpd_resolves &&
+        newest_zpd_resolve_submission >= current_submission));
+  action.close_open_submission = pending_in_open_submission;
+
+  const uint64_t max_pending_submission = std::max(
+      has_pending_small_readbacks ? newest_small_readback_submission : 0u,
+      has_in_flight_zpd_resolves ? newest_zpd_resolve_submission : 0u);
+  const uint64_t effective_target =
+      pending_in_open_submission
+          ? std::max(max_pending_submission, current_submission)
+          : max_pending_submission;
+  const bool retire_or_viz_unsubmitted =
+      (has_pending_zpd_retire || has_pending_viz_resolves) &&
+      current_submission > 1 && (current_submission - 1) > submitted_submission;
+  if (async_submit_worker_active &&
+      (pending_in_open_submission || effective_target > submitted_submission ||
+       retire_or_viz_unsubmitted)) {
+    action.drain_submit_worker = true;
+  }
+  if (has_pending_small_readbacks &&
+      newest_small_readback_submission > completed_submission) {
+    action.await_submission = newest_small_readback_submission;
+  }
+  action.poll_completion =
+      action.await_submission == 0 &&
+      (has_pending_small_readbacks || has_in_flight_zpd_resolves ||
+       has_pending_zpd_retire || has_pending_viz_resolves);
+  return action;
+}
 
 }  // namespace draw_cuts
 }  // namespace gpu
@@ -1128,6 +1321,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
+  void OnPause() override;
   XE_FORCEINLINE
   void WriteRegister(uint32_t index, uint32_t value) override;
   XE_FORCEINLINE
@@ -1766,6 +1960,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // the Turnip/kgsl note in the completion timeline about blocking fence
   // status polls - vkGetQueryPoolResults would have the same hazard).
   static constexpr uint32_t kFrameTimestampSlots = 32;
+  draw_cuts::TimestampSlotRingGuard<kFrameTimestampSlots> timestamp_slot_guard_;
+  uint32_t current_submission_timestamp_slot_ = UINT32_MAX;
   VkQueryPool frame_timestamp_pool_ = VK_NULL_HANDLE;
   // Draws recorded into the currently open submission, for
   // vulkan_mid_frame_submission_draws.
@@ -2279,6 +2475,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // but in_render_pass_ is true.
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
+  VkImageView current_transfer_dest_view_ = VK_NULL_HANDLE;
   // For the VkPassEnd reopen counts: the framebuffer of the last guest pass
   // ended, why it ended, and whether a resolve was issued since.
   const VulkanRenderTargetCache::Framebuffer* last_ended_framebuffer_ = nullptr;

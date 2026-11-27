@@ -811,7 +811,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         // INDIRECT_BUFFERs carry whole per-bin command lists, and running
         // them unconditionally misrenders every tiling title.
         if (opcode == PM4_MEM_WRITE || opcode == PM4_INTERRUPT ||
-            opcode == PM4_EVENT_WRITE || opcode == PM4_EVENT_WRITE_SHD) {
+            opcode == PM4_EVENT_WRITE || opcode == PM4_EVENT_WRITE_SHD ||
+            opcode == PM4_EVENT_WRITE_CFL) {
           static std::atomic<uint32_t> predicated_sync_log_budget{50};
           if (predicated_sync_log_budget.load() > 0 &&
               predicated_sync_log_budget-- > 0) {
@@ -875,6 +876,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         result =
             COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE(packet, count);
         break;
+      // Cache flush done event. Same initiator/address/value layout as SHD.
+      case PM4_EVENT_WRITE_CFL:
       case PM4_EVENT_WRITE_SHD:
         ++guest_sync_count_;
         result = COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(packet,
