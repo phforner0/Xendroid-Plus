@@ -2800,8 +2800,15 @@ uint32_t VulkanRenderTargetCache::NoteTilingBandDraw(
     };
     // A draw replacing the whole screen (a clear by a quad, drawn with the
     // scissor of the screen) leaves no rows of the earlier frame to replace.
+    bool grew_band_target = false;
     if (!tiling_band_color_key_ && is_band_target(color_key)) {
+      const uint32_t prev_height =
+          static_cast<VulkanRenderTarget*>(rts[1])->allocated_guest_height();
       EnsureRenderTargetHeight(rts[1], kMergedTilingBandsHeight);
+      if (static_cast<VulkanRenderTarget*>(rts[1])->allocated_guest_height() !=
+          prev_height) {
+        grew_band_target = true;
+      }
       tiling_band_color_key_ = color_key.key;
       if (!DrawReplacesArea(false, normalized_depth_control,
                             normalized_color_mask, vertex_shader,
@@ -2810,13 +2817,29 @@ uint32_t VulkanRenderTargetCache::NoteTilingBandDraw(
       }
     }
     if (!tiling_band_depth_key_ && is_band_target(depth_key)) {
+      const uint32_t prev_height =
+          static_cast<VulkanRenderTarget*>(rts[0])->allocated_guest_height();
       EnsureRenderTargetHeight(rts[0], kMergedTilingBandsHeight);
+      if (static_cast<VulkanRenderTarget*>(rts[0])->allocated_guest_height() !=
+          prev_height) {
+        grew_band_target = true;
+      }
       tiling_band_depth_key_ = depth_key.key;
       if (!DrawReplacesArea(true, normalized_depth_control,
                             normalized_color_mask, vertex_shader,
                             depth_key.GetWidth(), kMergedTilingBandsHeight)) {
         replicate |= 0b10;
       }
+    }
+    if (!last_update_framebuffer_ &&
+        last_update_render_pass_ != VK_NULL_HANDLE) {
+      last_update_framebuffer_ = GetHostRenderTargetsFramebuffer(
+          last_update_render_pass_key_,
+          last_update_framebuffer_pitch_tiles_at_32bpp_,
+          last_update_accumulated_render_targets());
+    }
+    if (grew_band_target) {
+      StageDeferredResolveClearsForLastUpdate();
     }
   }
   into_band_targets_out =
@@ -2842,6 +2865,12 @@ void VulkanRenderTargetCache::ReplicateTilingBandRenderTargetRows(
   FlushDeferredResolveClearForTarget(&rt);
   EnsureRenderTargetHeight(render_target,
                            std::max(kMergedTilingBandsHeight, band_rows));
+  if (!last_update_framebuffer_ && last_update_render_pass_ != VK_NULL_HANDLE) {
+    last_update_framebuffer_ = GetHostRenderTargetsFramebuffer(
+        last_update_render_pass_key_,
+        last_update_framebuffer_pitch_tiles_at_32bpp_,
+        last_update_accumulated_render_targets());
+  }
   const RenderTargetKey key = rt.key();
   const uint32_t guest_width = key.GetWidth();
   const uint32_t guest_height = rt.allocated_guest_height();

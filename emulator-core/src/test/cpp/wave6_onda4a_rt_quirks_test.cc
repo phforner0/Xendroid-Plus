@@ -379,6 +379,32 @@ void TestSourceContracts(const std::string& cpp_root) {
   assert(vk_rt_cc.find("ComputeFramebufferGuestHeight") != std::string::npos);
   assert(vk_rt_cc.find("DestroyDeferredRtDestructions") != std::string::npos);
 
+  // P0 regression (#121): growing a tiling-band target inside
+  // NoteTilingBandDraw or ReplicateTilingBandRenderTargetRows invalidates
+  // last_update_framebuffer_, so both paths MUST rebuild it before IssueDraw
+  // enters the pass (and NoteTilingBandDraw must re-stage deferred clears).
+  {
+    const size_t note_pos =
+        vk_rt_cc.find("uint32_t VulkanRenderTargetCache::NoteTilingBandDraw(");
+    const size_t rep_pos = vk_rt_cc.find(
+        "void VulkanRenderTargetCache::ReplicateTilingBandRenderTargetRows(");
+    assert(note_pos != std::string::npos);
+    assert(rep_pos != std::string::npos && rep_pos > note_pos);
+    const std::string note_body = vk_rt_cc.substr(note_pos, rep_pos - note_pos);
+    assert(note_body.find("!last_update_framebuffer_") != std::string::npos);
+    assert(note_body.find("GetHostRenderTargetsFramebuffer(") !=
+           std::string::npos);
+    assert(note_body.find("StageDeferredResolveClearsForLastUpdate()") !=
+           std::string::npos);
+
+    const size_t rep_end = vk_rt_cc.find("\n}\n", rep_pos);
+    assert(rep_end != std::string::npos);
+    const std::string rep_body = vk_rt_cc.substr(rep_pos, rep_end - rep_pos);
+    assert(rep_body.find("!last_update_framebuffer_") != std::string::npos);
+    assert(rep_body.find("GetHostRenderTargetsFramebuffer(") !=
+           std::string::npos);
+  }
+
   const std::string vk_dev_h =
       ReadFileText(xenia_src + "/ui/vulkan/vulkan_device.h");
   assert(vk_dev_h.find("driverName[VK_MAX_DRIVER_NAME_SIZE]") != std::string::npos);
