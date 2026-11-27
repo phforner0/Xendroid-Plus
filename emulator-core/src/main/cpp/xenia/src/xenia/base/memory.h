@@ -114,6 +114,38 @@ inline constexpr bool ShouldActivateWxDualMapping(
          probed_backend != DualMappingWxBackend::kUnsupported;
 }
 
+// Pure-logic W^X vs RWX policy resolver shared between memory.cc and tests.
+// Contract:
+//  - If |allow_rwx_fallback| is false (writable_executable_memory=false):
+//    strictly forbid RWX with zero transient RWX mmap probe at boot, forcing
+//    W^X dual-mapping.
+//  - If |wx_dual_mapping_requested| is true (a64_wx_dual_mapping=true):
+//    probe W^X dual-mapping (r-xs + rw-s) FIRST without issuing a transient
+//    RWX mmap probe; only fall back to probing RWX if dual-mapping fails and
+//    |allow_rwx_fallback| is true.
+//  - If |wx_dual_mapping_requested| is false and |allow_rwx_fallback| is true:
+//    probe RWX first, and fall back to W^X dual-mapping only if RWX is denied.
+template <typename ProbeWxFn, typename ProbeRwxFn>
+inline bool ResolveWritableExecutableMemoryPreferred(
+    bool wx_dual_mapping_requested, bool allow_rwx_fallback,
+    ProbeWxFn&& probe_wx, ProbeRwxFn&& probe_rwx) {
+  if (!allow_rwx_fallback) {
+    (void)probe_wx();
+    return false;
+  }
+  if (wx_dual_mapping_requested) {
+    if (ShouldActivateWxDualMapping(true, probe_wx())) {
+      return false;
+    }
+    return probe_rwx();
+  }
+  if (!probe_rwx()) {
+    (void)probe_wx();
+    return false;
+  }
+  return true;
+}
+
 // Performs a cached live 1-page probe verifying that an r-xs + rw-s shared
 // dual-mapping succeeds and reflects writes across views under the active
 // kernel/SELinux policy.

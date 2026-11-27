@@ -25,15 +25,13 @@ uint64_t Clock::host_tick_frequency_platform() {
     return (uint64_t)((1000000000ull * (uint64_t)info.denom) /
                       (uint64_t)info.numer);
 #else
-    timespec res;
-    int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
-    assert_zero(error);
-    assert_zero(res.tv_sec);  // Sub second resolution is required.
-
-    // Convert nano seconds to hertz. Resolution is 1ns on most systems.
-    return (error == 0 && res.tv_sec == 0 && res.tv_nsec > 0)
-               ? (1000000000ull / static_cast<uint64_t>(res.tv_nsec))
-               : 1000000000ull;
+    // host_tick_count_platform() always converts clock_gettime(CLOCK_MONOTONIC_RAW)
+    // to nanoseconds (1e9 ticks/sec), regardless of the quantization granularity
+    // reported by clock_getres() (res.tv_nsec). Using 1e9 / res.tv_nsec caused
+    // a res.tv_nsec-fold time scale drift whenever res.tv_nsec > 1 (e.g. ARM64
+    // generic timers). Keep the frequency locked to 1e9 Hz to match the unit
+    // returned by host_tick_count_platform().
+    return 1000000000ull;
 #endif
   }();
   return cached_freq;
@@ -47,7 +45,8 @@ uint64_t Clock::host_tick_count_platform() {
   int error = clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
   assert_zero(error);
 
-  return tp.tv_nsec + tp.tv_sec * 1000000000ull;
+  return static_cast<uint64_t>(tp.tv_sec) * 1000000000ull +
+         static_cast<uint64_t>(tp.tv_nsec);
 #endif
 }
 

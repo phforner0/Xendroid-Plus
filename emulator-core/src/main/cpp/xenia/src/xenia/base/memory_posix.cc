@@ -826,21 +826,38 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length,
       base_address != nullptr && IsViewReservation(base_address, length);
 
   int flags = MAP_SHARED;
-  // Views here go over address space reserved for them, so they replace it:
-  // a reservation of ReserveFileViewPages, or one Memory made for its views.
-  if (over_reservation || base_address != nullptr) {
+  // Views inside a ReserveFileViewPages reservation intentionally replace the
+  // PROT_NONE placeholder covering that range. Outside a managed reservation,
+  // never clobber an existing unrelated mapping with MAP_FIXED.
+  if (over_reservation) {
     flags |= MAP_FIXED;
+  } else if (base_address != nullptr) {
+#ifdef MAP_FIXED_NOREPLACE
+    flags |= MAP_FIXED_NOREPLACE;
+#endif
   }
 
-    void* result = mmap(base_address, length, prot, flags, handle, file_offset);
+  void* result = mmap(base_address, length, prot, flags, handle, file_offset);
+
+#ifdef MAP_FIXED_NOREPLACE
+  // Older kernels (< Linux 4.17) may reject MAP_FIXED_NOREPLACE with
+  // EOPNOTSUPP/EINVAL; fall back to passing base_address as a non-clobbering
+  // hint and enforce exact address equality below.
+  if (result == MAP_FAILED && !over_reservation && base_address != nullptr &&
+      (errno == EOPNOTSUPP || errno == EINVAL)) {
+    flags &= ~MAP_FIXED_NOREPLACE;
+    result = mmap(base_address, length, prot, flags, handle, file_offset);
+  }
+#endif
 
   if (result == MAP_FAILED) {
     return nullptr;
   }
 
-  // Without MAP_FIXED_NOREPLACE (e.g. macOS), a non-null base_address is just
-  // a hint. Enforce the caller's contract by failing on address mismatch so
-  // callers can retry at a different base, matching AllocFixed's behavior.
+  // Without MAP_FIXED_NOREPLACE (e.g. macOS or older kernels), a non-null
+  // base_address is just a hint. Enforce the caller's contract by failing on
+  // address mismatch so callers can retry at a different base, matching
+  // AllocFixed's behavior.
   if (base_address != nullptr && result != base_address) {
     munmap(result, length);
     return nullptr;

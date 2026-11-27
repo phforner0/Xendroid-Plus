@@ -1751,7 +1751,12 @@ uint64_t PatchAndResolveIndirectCallPic(void* raw_context,
   if (processor->dynamic_code_enabled() && code_cache &&
       !code_cache->HasIndirectionSlot(requested_address)) {
     code_cache->FallbackIndirectCallPicSite(gate_rx);
-    return ResolveDynamicCall(raw_context, target_address);
+    const uint64_t dynamic_host =
+        ResolveDynamicCall(raw_context, target_address);
+    if (auto* bctx = backend->BackendContextForGuestContext(raw_context)) {
+      bctx->dynamic_target_in_body = 0;
+    }
+    return dynamic_host;
   }
 
   const uint64_t sweep_count = processor->code_sweep_count();
@@ -2621,6 +2626,11 @@ void A64Backend::DeinitializeBackendContext(void* ctx) {
 void A64Backend::InvalidateDynamicCalls(uint32_t start, uint32_t end) {
   if (code_cache_) {
     code_cache_->RevertDirectCallSitesInRange(start, end);
+    if (start == end &&
+        !(start >= GUEST_TRAMPOLINE_BASE && start < GUEST_TRAMPOLINE_END) &&
+        !(start >= 0x9FFF0000u && start <= 0x9FFFFFFFu)) {
+      code_cache_->ResetIndirection(start);
+    }
   }
   auto global_lock = global_critical_region_.Acquire();
   // A range with fewer instructions than the cache has slots only checks the

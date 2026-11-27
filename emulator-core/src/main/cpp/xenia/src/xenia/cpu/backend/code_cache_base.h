@@ -166,11 +166,37 @@ class CodeCacheBase : public CodeCache {
   }
 
   // Approximate next code-cache offset aligned to |alignment| (for predicting
-  // entry_offset mod 4096 during emission before PlaceGuestCode runs).
+  // entry_offset mod host_page during single-threaded emission before
+  // PlaceGuestCode runs).
   size_t predicted_next_code_offset(size_t alignment) const {
     const size_t hint =
-        generated_code_offset_hint_.load(std::memory_order_relaxed);
-    return alignment ? xe::round_up(hint, alignment) : hint;
+        generated_code_offset_hint_.load(std::memory_order_acquire);
+    return alignment ? xe::round_up(hint, alignment, false) : hint;
+  }
+
+  // Tracks concurrently active code emitters so loop-header page-split nudges
+  // can avoid speculative drift under parallel compilation.
+  class ScopedCodeEmitter {
+   public:
+    explicit ScopedCodeEmitter(std::atomic<uint32_t>& counter)
+        : counter_(counter) {
+      counter_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~ScopedCodeEmitter() {
+      counter_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    ScopedCodeEmitter(const ScopedCodeEmitter&) = delete;
+    ScopedCodeEmitter& operator=(const ScopedCodeEmitter&) = delete;
+
+   private:
+    std::atomic<uint32_t>& counter_;
+  };
+
+  ScopedCodeEmitter EnterCodeEmitter() {
+    return ScopedCodeEmitter(active_emitters_);
+  }
+  uint32_t active_emitters() const {
+    return active_emitters_.load(std::memory_order_acquire);
   }
 
   bool has_indirection_table() { return indirection_table_base_ != nullptr; }
@@ -494,6 +520,36 @@ class CodeCacheBase : public CodeCache {
     for (size_t i = 0; i < entry_count; i++) {
       p[i] = indirection_default_value_;
     }
+
+    std::lock_guard<std::mutex> lock(committed_indirection_mutex_);
+    committed_indirection_ranges_.emplace_back(guest_low, guest_high);
+  }
+
+  // Resets a committed indirection slot back to indirection_default_value_
+  // (resolve thunk) so invalidated guest functions recompile on next call.
+  void ResetIndirection(uint32_t guest_address) {
+    if (!indirection_table_base_ || !HasIndirectionSlot(guest_address)) {
+      return;
+    }
+    bool committed = false;
+    {
+      std::lock_guard<std::mutex> lock(committed_indirection_mutex_);
+      for (const auto& [low, high] : committed_indirection_ranges_) {
+        if (guest_address >= low && guest_address + 4 <= high) {
+          committed = true;
+          break;
+        }
+      }
+    }
+    if (!committed) {
+      return;
+    }
+    const uint64_t guest_delta = guest_address - kIndirectionTableBase;
+    const uint64_t slot_offset = (guest_delta / 4) * 4;
+    uint32_t* slot =
+        reinterpret_cast<uint32_t*>(indirection_table_base_ + slot_offset);
+    std::atomic_ref<uint32_t>(*slot).store(indirection_default_value_,
+                                           std::memory_order_release);
   }
 
   void PlaceHostCode(uint32_t guest_address, void* machine_code,
@@ -519,7 +575,7 @@ class CodeCacheBase : public CodeCache {
       const size_t pad_start_offset = generated_code_offset_;
       const size_t aligned_entry_offset =
           entry_alignment > 16
-              ? xe::round_up(pad_start_offset, entry_alignment)
+              ? xe::round_up(pad_start_offset, entry_alignment, false)
               : pad_start_offset;
       generated_code_offset_ = aligned_entry_offset;
 
@@ -536,14 +592,15 @@ class CodeCacheBase : public CodeCache {
 
       auto unwind_reservation = self().RequestUnwindReservation(
           generated_code_write_base_ + generated_code_offset_);
-      generated_code_offset_ += xe::round_up(unwind_reservation.data_size, 16);
+      generated_code_offset_ +=
+          xe::round_up(unwind_reservation.data_size, 16, false);
 
       auto end_write_address =
           generated_code_write_base_ + generated_code_offset_;
 
       size_t high_mark = generated_code_offset_;
       CheckCapacity(high_mark);
-      generated_code_offset_hint_.store(high_mark, std::memory_order_relaxed);
+      generated_code_offset_hint_.store(high_mark, std::memory_order_release);
 
       generated_code_map_.emplace_back(
           (uint64_t(code_execute_address - generated_code_execute_base_)
@@ -575,9 +632,11 @@ class CodeCacheBase : public CodeCache {
       std::memcpy(code_write_address, machine_code, func_info.code_size.total);
 
       // Fill unused tail/unwind gap with arch-specific trap instructions.
-      self().FillCode(
-          tail_write_address,
-          static_cast<size_t>(end_write_address - tail_write_address));
+      if (end_write_address > tail_write_address) {
+        self().FillCode(
+            tail_write_address,
+            static_cast<size_t>(end_write_address - tail_write_address));
+      }
 
       // Platform-specific unwind registration. Must stay inside the JIT
       // write window: on Mac it writes DWARF entries into the cache view.
@@ -590,45 +649,23 @@ class CodeCacheBase : public CodeCache {
       }
 #endif
 
-      // Flush I-cache for any alignment padding, code, and fill regions.
-      if (aligned_entry_offset > pad_start_offset) {
-        auto pad_write_address = generated_code_write_base_ + pad_start_offset;
-        auto pad_execute_address =
+      // Flush I-cache in a single contiguous call covering any pre-entry
+      // alignment padding, emitted machine code, and trailing trap/unwind fill.
+      const size_t flush_size = generated_code_offset_ - pad_start_offset;
+      if (flush_size > 0) {
+        auto flush_write_address =
+            generated_code_write_base_ + pad_start_offset;
+        auto flush_execute_address =
             generated_code_execute_base_ + pad_start_offset;
-        const size_t pad_size = aligned_entry_offset - pad_start_offset;
         if constexpr (requires {
-                        self().FlushCodeRange(pad_write_address,
-                                              pad_execute_address, pad_size);
+                        self().FlushCodeRange(flush_write_address,
+                                              flush_execute_address,
+                                              flush_size);
                       }) {
-          self().FlushCodeRange(pad_write_address, pad_execute_address,
-                                pad_size);
+          self().FlushCodeRange(flush_write_address, flush_execute_address,
+                                flush_size);
         } else {
-          self().FlushCodeRange(pad_write_address, pad_size);
-        }
-      }
-      if constexpr (requires {
-                      self().FlushCodeRange(code_write_address,
-                                            code_execute_address,
-                                            func_info.code_size.total);
-                    }) {
-        self().FlushCodeRange(code_write_address, code_execute_address,
-                              func_info.code_size.total);
-      } else {
-        self().FlushCodeRange(code_write_address, func_info.code_size.total);
-      }
-      if (tail_write_address < end_write_address) {
-        auto tail_execute_address =
-            code_execute_address + (tail_write_address - code_write_address);
-        const size_t tail_size =
-            static_cast<size_t>(end_write_address - tail_write_address);
-        if constexpr (requires {
-                        self().FlushCodeRange(tail_write_address,
-                                              tail_execute_address, tail_size);
-                      }) {
-          self().FlushCodeRange(tail_write_address, tail_execute_address,
-                                tail_size);
-        } else {
-          self().FlushCodeRange(tail_write_address, tail_size);
+          self().FlushCodeRange(flush_write_address, flush_size);
         }
       }
     }
@@ -655,7 +692,7 @@ class CodeCacheBase : public CodeCache {
       generated_code_offset_ += xe::round_up(length, 16);
       high_mark = generated_code_offset_;
       CheckCapacity(high_mark);
-      generated_code_offset_hint_.store(high_mark, std::memory_order_relaxed);
+      generated_code_offset_hint_.store(high_mark, std::memory_order_release);
     }
     EnsureCommitted(high_mark);
 #if XE_PLATFORM_MAC && XE_ARCH_ARM64
@@ -758,6 +795,9 @@ class CodeCacheBase : public CodeCache {
   uint8_t* generated_code_write_base_ = nullptr;
   size_t generated_code_offset_ = 0;
   std::atomic<size_t> generated_code_offset_hint_ = {0};
+  std::atomic<uint32_t> active_emitters_{0};
+  std::mutex committed_indirection_mutex_;
+  std::vector<std::pair<uint32_t, uint32_t>> committed_indirection_ranges_;
   // Last 64 MiB step logged by CheckCapacity.
   size_t capacity_log_mark_ = 0;
   std::atomic<size_t> generated_code_commit_mark_ = {0};

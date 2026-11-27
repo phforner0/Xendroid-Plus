@@ -171,7 +171,7 @@ A64Emitter::A64Emitter(A64Backend* backend, XbyakA64Allocator* allocator)
       allocator_(allocator),
       feature_flags_(arm64::GetFeatureFlags()) {}
 
-A64Emitter::~A64Emitter() = default;
+A64Emitter::~A64Emitter() { ResetPerFunctionState(); }
 
 bool A64Emitter::UseLrcpcForTsoLoad(const hir::Instr* instr) const {
   if (!instr || !instr->dest) {
@@ -241,36 +241,51 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   // Once: it turns every local into its stack offset (a constant of another
   // type), so a second emission must reuse the layout, not redo it.
   const size_t stack_size = LayOutLocals(builder);
-  for (bool near_branches : {bool(cvars::a64_near_branches), false}) {
-    // Reset state.
-    near_branches_ = near_branches;
-    stack_size_ = StackLayout::GUEST_STACK_SIZE;
-    source_map_arena_.Reset();
-    tail_code_.clear();
-    pending_direct_calls_.clear();
-    pending_indirect_call_pics_.clear();
-    entry_offset_mod_4k_ =
-        cvars::a64_align_hot_code
-            ? (code_cache_->predicted_next_code_offset(64u) & 0xFFFu)
-            : 0u;
-    fpcr_mode_ = FPCRMode::Unknown;
-    func_info = {};
-    try {
-      emitted = Emit(builder, stack_size, func_info);
-    } catch (const Xbyak_aarch64::Error& e) {
-      if (IsNearBranchOutOfRange(e)) {
-        XELOGI(
-            "A64: guest function {:08X} too large for direct branches, "
-            "emitted again with long-range ones",
-            current_guest_function_);
-        ResetPerFunctionState();
-        continue;
-      }
-      XELOGE("A64: assembler error while emitting guest function {:08X}: {}",
-             current_guest_function_, e.what());
-      emitted = false;
+  {
+    auto emitter_scope = code_cache_->EnterCodeEmitter();
+    size_t host_page = xe::memory::page_size();
+    if (host_page < 4096u || (host_page & (host_page - 1u)) != 0) {
+      host_page = 4096u;
     }
-    break;
+    for (bool near_branches : {bool(cvars::a64_near_branches), false}) {
+      // Reset state.
+      near_branches_ = near_branches;
+      stack_size_ = StackLayout::GUEST_STACK_SIZE;
+      source_map_arena_.Reset();
+      tail_code_.clear();
+      pending_direct_calls_.clear();
+      pending_indirect_call_pics_.clear();
+      if (cvars::a64_align_hot_code) {
+        // Under parallel compilation (active_emitters > 1), the bump hint
+        // cannot predict the final page offset; use SIZE_MAX sentinel to keep
+        // 32 B alignment invariant without speculative page-split NOP drift.
+        entry_offset_mod_4k_ =
+            code_cache_->active_emitters() == 1
+                ? (code_cache_->predicted_next_code_offset(64u) &
+                   (host_page - 1u))
+                : SIZE_MAX;
+      } else {
+        entry_offset_mod_4k_ = 0u;
+      }
+      fpcr_mode_ = FPCRMode::Unknown;
+      func_info = {};
+      try {
+        emitted = Emit(builder, stack_size, func_info);
+      } catch (const Xbyak_aarch64::Error& e) {
+        if (IsNearBranchOutOfRange(e)) {
+          XELOGI(
+              "A64: guest function {:08X} too large for direct branches, "
+              "emitted again with long-range ones",
+              current_guest_function_);
+          ResetPerFunctionState();
+          continue;
+        }
+        XELOGE("A64: assembler error while emitting guest function {:08X}: {}",
+               current_guest_function_, e.what());
+        emitted = false;
+      }
+      break;
+    }
   }
   near_branches_ = false;
   uses_stack_skew_skip_ = false;
@@ -295,7 +310,13 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
 }
 
 bool A64Emitter::IsNearBranchOutOfRange(const Xbyak_aarch64::Error& e) const {
-  return near_branches_ && int(e) == Xbyak_aarch64::ERR_LABEL_IS_TOO_FAR;
+  // Conditional branches throw ERR_LABEL_IS_TOO_FAR past +-1 MiB, while
+  // PC-relative `adr` in near-branch tails (PIC / stack-sync) throws
+  // ERR_ILLEGAL_IMM_RANGE past +-1 MiB. Both retry cleanly with
+  // near_branches_ = false (genuine bad immediates still fail on pass 2).
+  return near_branches_ &&
+         (int(e) == Xbyak_aarch64::ERR_LABEL_IS_TOO_FAR ||
+          int(e) == Xbyak_aarch64::ERR_ILLEGAL_IMM_RANGE);
 }
 
 size_t A64Emitter::LayOutLocals(hir::HIRBuilder* builder) {
@@ -543,8 +564,12 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
     // Align loop headers BEFORE binding labels so back-edges land on the
     // aligned instruction and fall-through entries slide cleanly over NOPs.
     if (!loop_header_blocks.empty() && loop_header_blocks.count(block) != 0) {
-      const size_t pad_bytes = ComputeLoopHeaderAlignmentPaddingBytes(
-          getSize(), entry_offset_mod_4k_);
+      const bool allow_page_nudge =
+          entry_offset_mod_4k_ != SIZE_MAX &&
+          code_cache_->active_emitters() == 1;
+      const size_t pad_bytes = ComputeLoopHeaderAlignmentPaddingForPage(
+          getSize(), allow_page_nudge ? entry_offset_mod_4k_ : 0u,
+          xe::memory::page_size(), allow_page_nudge);
       for (size_t i = 0; i < pad_bytes; i += sizeof(uint32_t)) {
         nop();
       }
@@ -722,12 +747,14 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
   // ========================================================================
   // TAIL CODE
   // ========================================================================
-  for (auto& tail_item : tail_code_) {
-    // ARM64 instructions are always 4-byte aligned, so alignment is mostly
-    // a no-op unless we want cache-line alignment for hot paths.
-    L(tail_item.label);
+  for (size_t tail_idx = 0; tail_idx < tail_code_.size(); ++tail_idx) {
+    // Index-based iteration and copied callback: a tail emitter may append to
+    // tail_code_ (reallocating the vector). AddToTail binds its heap-stable
+    // NewCachedLabel() at the start of the wrapped callback.
+    auto func = tail_code_[tail_idx].func;
+    Label unused_label;
     try {
-      tail_item.func(*this, tail_item.label);
+      func(*this, unused_label);
     } catch (const Xbyak_aarch64::Error& e) {
       if (IsNearBranchOutOfRange(e)) {
         throw;  // Emitted again with long-range branches.
@@ -746,6 +773,14 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
   // LITERAL POOL
   // ========================================================================
   if (!FlushV128ConstPool(false)) {
+    return false;
+  }
+
+  // Never publish machine code with unresolved xbyak labels (an unbound
+  // forward branch stays encoded as offset +0, e.g. `b.ne .+0` infinite loop).
+  if (hasUndefinedLabel()) {
+    XELOGE("A64: unresolved label(s) after emitting guest function {:08X}",
+           current_guest_function_);
     return false;
   }
 
@@ -818,7 +853,8 @@ void* A64Emitter::Emplace(const EmitFunctionInfo& func_info,
           base_rx + entry.cmp_lo_code_offset,
           base_rx + entry.cmp_hi_code_offset,
           base_rx + entry.call_op_code_offset,
-          base_rx + entry.fallback_code_offset, entry.is_tail);
+          base_rx + entry.fallback_code_offset, entry.is_tail,
+          function->address());
     }
   }
 
@@ -1200,11 +1236,13 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
 
   // 1-slot monomorphic PIC for virtual/indirect calls (bctrl) using 2-stage
   // 1-word atomic CMODX publication (gate: b pic_miss_stub -> NOP).
+  // Tail indirect calls (bctr) stay on the standard tail-call path so dynamic
+  // code enabled later (EnableDynamicCode) never enters dynamic lookup after
+  // popping the current stack frame and stackpoint.
   const bool is_tail_call = (instr->flags & hir::CALL_TAIL) != 0;
-  if (cvars::a64_indirect_call_pic &&
+  if (cvars::a64_indirect_call_pic && !is_tail_call &&
       !(instr->flags & hir::CALL_POSSIBLE_RETURN) &&
-      code_cache_->has_indirection_table() && near_branches_ &&
-      (!is_tail_call || !processor()->dynamic_code_enabled())) {
+      code_cache_->has_indirection_table() && near_branches_) {
     if (target_w.getIdx() != w16.getIdx()) {
       mov(w16, target_w);
     }
@@ -1992,11 +2030,22 @@ bool A64Emitter::ChangeFpcrMode(FPCRMode new_mode, bool already_set) {
 }
 
 Label& A64Emitter::AddToTail(TailEmitCallback callback, uint32_t alignment) {
+  // Allocate a heap-stable Label in label_cache_ rather than returning a
+  // reference to tail_code_.back().label: tail_code_ is a std::vector that
+  // reallocates whenever a second AddToTail() runs before the first Label& is
+  // used (e.g. CallIndirect PIC registering pic_fallback_lookup followed by
+  // pic_miss_stub). A dangling Label& writes a fresh id into freed memory and
+  // leaves `b.ne pic_fallback_lookup` permanently unbound as `b.ne .+0`.
+  Label& stable_label = NewCachedLabel();
   TailEmitter tail;
   tail.alignment = alignment;
-  tail.func = std::move(callback);
+  tail.func = [cb = std::move(callback), &stable_label](A64Emitter& e,
+                                                        Label&) {
+    e.L(stable_label);
+    cb(e, stable_label);
+  };
   tail_code_.push_back(std::move(tail));
-  return tail_code_.back().label;
+  return stable_label;
 }
 
 Label& A64Emitter::NewCachedLabel() {

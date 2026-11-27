@@ -30,6 +30,10 @@
 #endif
 
 DECLARE_bool(shared_memory_preserve_gpu_writes);
+DECLARE_bool(vscr_sat_census);
+#if XE_ARCH_ARM64
+DECLARE_bool(a64_indirect_call_pic);
+#endif
 
 using namespace xe;
 using namespace xe::cpu;
@@ -672,4 +676,264 @@ TEST_CASE("WAVE3_STRIP_NO_PHYSICAL_SKEW_PRESERVES_NON_LOAD_STORE_FLAGS",
   REQUIRE(branch_count == 1);
   REQUIRE(call_count == 1);
 }
+
+// =============================================================================
+// Wave 7 (Onda 1B): A64 PIC site eviction, unified FlushCodeRange,
+// ResetIndirection, and 16 KB/parallel loop alignment.
+// =============================================================================
+TEST_CASE("WAVE7_A64_PIC_EVICTION_RESET_AND_ALIGNMENT", "[wave7][a64]") {
+  using xe::cpu::backend::EmitFunctionInfo;
+  using xe::cpu::backend::a64::A64CodeCache;
+  using xe::cpu::backend::a64::ComputeLoopHeaderAlignmentPaddingForPage;
+  using xe::cpu::backend::a64::DecodeA64BranchRel26;
+  using xe::cpu::backend::a64::kA64NopInsn;
+
+  auto cache = A64CodeCache::Create();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->Initialize());
+  cache->CommitExecutableRange(0x82010000u, 0x82030000u);
+
+  // Place a 20-word synthetic PIC caller buffer and a 2-word target function.
+  std::array<uint32_t, 20> pic_buf{};
+  pic_buf.fill(kA64NopInsn);
+  pic_buf[19] = 0xD65F03C0u;  // ret
+  const std::array<uint32_t, 2> target_fn = {kA64NopInsn, 0xD65F03C0u};
+
+  EmitFunctionInfo pic_info = {};
+  pic_info.code_size.total = pic_buf.size() * sizeof(uint32_t);
+  EmitFunctionInfo target_info = {};
+  target_info.code_size.total = target_fn.size() * sizeof(uint32_t);
+
+  void* caller1_rx = nullptr;
+  void* caller1_rw = nullptr;
+  void* caller2_rx = nullptr;
+  void* caller2_rw = nullptr;
+  void* caller3_rx = nullptr;
+  void* caller3_rw = nullptr;
+  void* target_rx = nullptr;
+  void* target_rw = nullptr;
+
+  // First placement into an empty code cache with code_size >= 64 B MUST land
+  // at execute_base + 0 (no leading 64 B BRK #0 gap from round_up(0, 64)).
+  REQUIRE(cache->predicted_next_code_offset(64u) == 0u);
+  cache->PlaceGuestCode(0x82010000u, pic_buf.data(), pic_info, nullptr,
+                        caller1_rx, caller1_rw);
+  REQUIRE(reinterpret_cast<uintptr_t>(caller1_rx) ==
+          cache->execute_base_address());
+  cache->PlaceGuestCode(0x82010100u, pic_buf.data(), pic_info, nullptr,
+                        caller2_rx, caller2_rw);
+  cache->PlaceGuestCode(0x82010200u, pic_buf.data(), pic_info, nullptr,
+                        caller3_rx, caller3_rw);
+  cache->PlaceGuestCode(0x82020000u, const_cast<uint32_t*>(target_fn.data()),
+                        target_info, nullptr, target_rx, target_rw);
+  REQUIRE(caller1_rx != nullptr);
+  REQUIRE(caller2_rx != nullptr);
+  REQUIRE(caller3_rx != nullptr);
+  REQUIRE(target_rx != nullptr);
+
+  auto reg_site = [&](void* rx, uint32_t caller_addr) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(rx);
+    cache->RegisterIndirectCallPicSite(base + 0, base + 4, base + 8, base + 20,
+                                       base + 64, false, caller_addr);
+    return base;
+  };
+  const uintptr_t g1 = reg_site(caller1_rx, 0x82010000u);
+  const uintptr_t g2 = reg_site(caller2_rx, 0x82010100u);
+  const uintptr_t g3 = reg_site(caller3_rx, 0x82010200u);
+  REQUIRE(cache->TrackedPicSiteCount() == 3u);
+
+  // Patch g1 to target_rx -> gate becomes NOP.
+  REQUIRE(cache->TryPatchIndirectCallPicSite(g1, 0x82020000u, target_rx));
+  uint32_t gate1_word = 0;
+  std::memcpy(&gate1_word, reinterpret_cast<const void*>(g1), 4);
+  REQUIRE(gate1_word == kA64NopInsn);
+
+  // Revert target range -> g1 gate switches to `b fallback_rx` AND g1 is evicted.
+  cache->RevertDirectCallSitesInRange(0x82020000u, 0x82020010u);
+  std::memcpy(&gate1_word, reinterpret_cast<const void*>(g1), 4);
+  int64_t fb_off = 0;
+  bool fb_link = true;
+  REQUIRE(DecodeA64BranchRel26(gate1_word, &fb_off, &fb_link));
+  REQUIRE(!fb_link);
+  REQUIRE(fb_off == 64);
+  REQUIRE(cache->TrackedPicSiteCount() == 2u);
+
+  // Direct fallback on g2 -> evicted immediately; repeat fallback returns false.
+  REQUIRE(cache->FallbackIndirectCallPicSite(g2));
+  REQUIRE(!cache->FallbackIndirectCallPicSite(g2));
+  REQUIRE(cache->TrackedPicSiteCount() == 1u);
+
+  // Sweeping caller range for uninitialized g3 evicts g3 -> 0 tracked sites.
+  cache->RevertDirectCallSitesInRange(0x82010200u, 0x82010210u);
+  REQUIRE(cache->TrackedPicSiteCount() == 0u);
+
+  // ResetIndirection resets committed slot safely and ignores uncommitted ones.
+  cache->ResetIndirection(0x82020000u);
+  cache->ResetIndirection(0x88000000u);  // uncommitted -> safe no-op
+
+  // ScopedCodeEmitter active counter + 16 KB / parallel alignment check.
+  REQUIRE(cache->active_emitters() == 0u);
+  {
+    auto g_outer = cache->EnterCodeEmitter();
+    REQUIRE(cache->active_emitters() == 1u);
+    {
+      auto g_inner = cache->EnterCodeEmitter();
+      REQUIRE(cache->active_emitters() == 2u);
+    }
+    REQUIRE(cache->active_emitters() == 1u);
+  }
+  REQUIRE(cache->active_emitters() == 0u);
+  REQUIRE(ComputeLoopHeaderAlignmentPaddingForPage(0x3FC0u, 0u, 16384u, true) ==
+          64u);
+  REQUIRE(ComputeLoopHeaderAlignmentPaddingForPage(0x0FC0u, 0u, 16384u, true) ==
+          0u);
+  REQUIRE(ComputeLoopHeaderAlignmentPaddingForPage(0x3FC4u, 0u, 16384u, false) ==
+          28u);
+}
 #endif  // XE_ARCH_ARM64
+
+// =============================================================================
+// Wave 7 (Onda 1B): Indirect tail-call (bctr) + EnableDynamicCode() safety
+// and VSCR[SAT] census / kill-switch / saturating AltiVec execution.
+// =============================================================================
+TEST_CASE("WAVE7_INDIRECT_TAIL_CALL_AND_VSCR_CENSUS_EXEC",
+          "[wave7][a64][vscr]") {
+  const bool saved_vscr_census = cvars::vscr_sat_census;
+#if XE_ARCH_ARM64
+  const bool saved_pic = cvars::a64_indirect_call_pic;
+  cvars::a64_indirect_call_pic = true;
+#endif
+  auto restore_cvars = [&]() {
+    cvars::vscr_sat_census = saved_vscr_census;
+#if XE_ARCH_ARM64
+    cvars::a64_indirect_call_pic = saved_pic;
+#endif
+  };
+
+  auto memory = std::make_unique<Memory>();
+  REQUIRE(memory->Initialize());
+  auto backend = CreateBackend();
+  if (!backend) {
+    restore_cvars();
+    return;
+  }
+  auto processor = std::make_unique<Processor>(memory.get(), nullptr);
+  REQUIRE(processor->Setup(std::move(backend)));
+
+  const uint32_t code_base = 0x80000000u;
+  const uint32_t code_size = 0x10000u;
+  auto* vheap = memory->LookupHeap(code_base);
+  REQUIRE(vheap->AllocFixed(code_base, code_size, 0x1000u,
+                            kMemoryAllocationReserve | kMemoryAllocationCommit,
+                            kMemoryProtectRead | kMemoryProtectWrite));
+  auto w32 = [&](uint32_t addr, uint32_t val) {
+    xe::store_and_swap<uint32_t>(memory->TranslateVirtual(addr), val);
+  };
+
+  // Target A (0x80000200): r3 = r3 + 7; blr
+  const uint32_t target_a = 0x80000200u;
+  w32(target_a + 0, 0x38630007u);  // addi r3, r3, 7
+  w32(target_a + 4, 0x4E800020u);  // blr
+
+  // Target B (0x80000300): r3 = r3 + 11; blr
+  const uint32_t target_b = 0x80000300u;
+  w32(target_b + 0, 0x3863000Bu);  // addi r3, r3, 11
+  w32(target_b + 4, 0x4E800020u);  // blr
+
+  // Indirect non-tail caller (bctrl) at 0x80000100: calls target in r4.
+  const uint32_t caller_bctrl = 0x80000100u;
+  {
+    uint32_t p = caller_bctrl;
+    w32(p, 0x7C0802A6u); p += 4;  // mflr r0
+    w32(p, 0x9001FFF8u); p += 4;  // stw r0, -8(r1)
+    w32(p, 0x7C8903A6u); p += 4;  // mtctr r4
+    w32(p, 0x4E800421u); p += 4;  // bctrl
+    w32(p, 0x8001FFF8u); p += 4;  // lwz r0, -8(r1)
+    w32(p, 0x7C0803A6u); p += 4;  // mtlr r0
+    w32(p, 0x4E800020u);          // blr
+  }
+
+  // Indirect tail caller (bctr) at 0x80000140: tail-calls target in r4.
+  const uint32_t caller_bctr = 0x80000140u;
+  w32(caller_bctr + 0, 0x7C8903A6u);  // mtctr r4
+  w32(caller_bctr + 4, 0x4E800420u);  // bctr
+
+  // AltiVec saturating add + mfvscr at 0x80000400:
+  // mtvscr v0 (clear SAT); vaddsbs v3, v4, v5; mfvscr v6; blr
+  const uint32_t vscr_fn = 0x80000400u;
+  w32(vscr_fn + 0, 0x10000644u);  // mtvscr v0
+  w32(vscr_fn + 4, 0x10642B00u);  // vaddsbs v3, v4, v5
+  w32(vscr_fn + 8, 0x10C00604u);  // mfvscr v6
+  w32(vscr_fn + 12, 0x4E800020u);  // blr
+
+  auto raw = std::make_unique<RawModule>(processor.get());
+  raw->set_name("Wave7IndirectVscrTest");
+  raw->set_executable(true);
+  raw->SetAddressRange(code_base, code_size);
+  REQUIRE(processor->AddModule(std::move(raw)));
+  processor->backend()->CommitExecutableRange(code_base, code_base + code_size);
+
+  // Non-XEX RawModule must keep vscr_sat_observable() == true after census.
+  processor->BeginVscrSatCensus();
+  processor->FinishVscrSatCensus();
+  REQUIRE(processor->vscr_sat_observable());
+
+  // Kill-switch vscr_sat_census=false must keep vscr_sat_observable() == true.
+  cvars::vscr_sat_census = false;
+  REQUIRE(processor->vscr_sat_observable());
+  cvars::vscr_sat_census = true;
+
+  uint32_t stack_addr = memory->SystemHeapAlloc(64u * 1024u);
+  auto ts = std::make_unique<ThreadState>(processor.get(), 0x777u,
+                                          stack_addr + 64u * 1024u);
+
+  // Execute bctrl (PIC) & bctr (tail) before EnableDynamicCode().
+  {
+    uint64_t args_a[2] = {10u, target_a};
+    uint64_t args_b[2] = {10u, target_b};
+    REQUIRE(processor->Execute(ts.get(), caller_bctrl, args_a, 2) == 17u);
+    REQUIRE(processor->Execute(ts.get(), caller_bctrl, args_a, 2) == 17u);
+    REQUIRE(processor->Execute(ts.get(), caller_bctrl, args_b, 2) == 21u);
+    REQUIRE(processor->Execute(ts.get(), caller_bctr, args_a, 2) == 17u);
+    REQUIRE(processor->Execute(ts.get(), caller_bctr, args_b, 2) == 21u);
+  }
+
+  // Enable dynamic code AFTER callers were compiled and place a dynamic target
+  // outside the indirection table range (0x00100000) to verify no frame/PIC
+  // mismatch on either bctrl or tail bctr.
+  const uint32_t dyn_target = 0x00100000u;
+  auto* low_heap = memory->LookupHeap(dyn_target);
+  REQUIRE(low_heap->AllocFixed(
+      dyn_target, 0x1000u, 0x1000u,
+      kMemoryAllocationReserve | kMemoryAllocationCommit,
+      kMemoryProtectRead | kMemoryProtectWrite));
+  w32(dyn_target + 0, 0x3863001Du);  // addi r3, r3, 29
+  w32(dyn_target + 4, 0x4E800020u);  // blr
+  processor->EnableDynamicCode();
+  REQUIRE(processor->vscr_sat_observable());
+  {
+    uint64_t args_dyn[2] = {100u, dyn_target};
+    REQUIRE(processor->Execute(ts.get(), caller_bctrl, args_dyn, 2) == 129u);
+    REQUIRE(processor->Execute(ts.get(), caller_bctr, args_dyn, 2) == 129u);
+  }
+
+  // Verify AltiVec vaddsbs sets PPCContext::vscr_sat when saturating and
+  // saturates signed byte 120 + 120 -> 127.
+  {
+    PPCContext* ctx = ts->context();
+    ctx->v[0] = vec128i(0u, 0u, 0u, 0u);
+    ctx->v[3] = vec128i(0u, 0u, 0u, 0u);
+    ctx->v[4] = vec128b(120, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    ctx->v[5] = vec128b(120, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    ctx->vscr_sat = 0u;
+    REQUIRE(processor->Execute(ts.get(), vscr_fn));
+    REQUIRE(ctx->v[3].i8[0] == 127);
+    REQUIRE(ctx->vscr_sat != 0u);
+  }
+
+  ts.reset();
+  memory->SystemHeapFree(stack_addr);
+  low_heap->Release(dyn_target);
+  vheap->Release(code_base);
+  restore_cvars();
+}
