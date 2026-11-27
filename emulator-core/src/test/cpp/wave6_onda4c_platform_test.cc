@@ -288,9 +288,13 @@ void TestLateSwapPolicyAndZeroFGBypass() {
   constexpr uint64_t kTarget = 1'000'000'000ull;
 
   // Absolute ZeroFG safety rule: zerofg_active == true ALWAYS bypasses.
-  for (uint64_t now :
-       {kTarget - 5'000'000ull, kTarget, kTarget + 3'000'000ull,
-        kTarget + 25'000'000ull}) {
+  const uint64_t now_cases[] = {
+      kTarget - uint64_t{5'000'000},
+      kTarget,
+      kTarget + uint64_t{3'000'000},
+      kTarget + uint64_t{25'000'000},
+  };
+  for (uint64_t now : now_cases) {
     const auto d =
         EvaluateLateSwapPresent(now, kTarget, kRefresh60,
                                 /*zerofg_active=*/true,
