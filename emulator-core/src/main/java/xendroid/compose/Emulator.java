@@ -79,6 +79,8 @@ public class Emulator extends xendroid.emulator.Emulator{
     public native long[] rumble_state();
     public native long[] presenter_work();
     public native void set_presenter_adpf_target(long targetNs);
+    // Android 16 (API 36+) SystemHealthManager CPU/GPU headroom in [0, 100]; < 0 means unavailable.
+    public native void set_system_headroom(float cpuHeadroom, float gpuHeadroom);
     public native void set_frame_generation(boolean enabled, int preset, float displayHz);
     // Requested ZeroFG mode: 0 off, 1 ReallyZero, 2 Zero. The render thread owns the switch.
     public native void set_zerofg_mode(int mode);

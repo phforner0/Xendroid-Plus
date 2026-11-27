@@ -204,6 +204,10 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var lastThermalStatus = -1
     /** 15j: warns before the phone throttles for heat (advisory: it never changes a setting). */
     private val thermalWatch = xendroid.compose.core.ThermalWatch()
+    /** Android 16 (API 36+) SystemHealthManager CPU/GPU headroom reader (no-op below API 36). */
+    private val systemHeadroomReader by lazy {
+        xendroid.compose.core.SystemHeadroomReader.forContext(applicationContext)
+    }
     private var thermalNoticeAt = Long.MIN_VALUE
     private var thermalTick = 0
     /** 15n: the last thermal headroom read (null where the device has none). */
@@ -961,6 +965,12 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
      *  limit; the timeline gets each change and the player one notice per rise, five minutes apart. */
     private fun watchThermalHeadroom() {
         if (thermalTick++ % 2 != 0) return
+        val systemHeadroom = systemHeadroomReader.read()
+        if (systemHeadroom != null) {
+            val (cpuJni, gpuJni) = thermalWatch.recordSystemHeadroom(
+                systemHeadroom.cpuHeadroom, systemHeadroom.gpuHeadroom)
+            runCatching { Emulator.get?.set_system_headroom(cpuJni, gpuJni) }
+        }
         val headroom = if (Build.VERSION.SDK_INT >= 30) {
             runCatching { getSystemService(android.os.PowerManager::class.java)?.getThermalHeadroom(10) }.getOrNull()
         } else null

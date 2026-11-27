@@ -98,6 +98,8 @@ done
 "$build/wave6_onda4a_rt_quirks_test" "$cpp"
 "${cxx[@]}" "${flags[@]}" "$test/wave6_onda4b_wx_a64_test.cc" -o "$build/wave6_onda4b_wx_a64_test"
 "$build/wave6_onda4b_wx_a64_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -I "$cpp/xenia/third_party/Vulkan-Headers/include" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/wave6_onda4c_platform_test.cc" -o "$build/wave6_onda4c_platform_test"
+"$build/wave6_onda4c_platform_test" "$cpp"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then

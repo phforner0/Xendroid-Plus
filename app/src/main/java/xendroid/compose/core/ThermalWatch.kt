@@ -13,6 +13,22 @@ class ThermalWatch(private val enterAt: Float = 0.85f, private val leaveBelow: F
     var level: Level = Level.OK
         private set
 
+    var lastCpuHeadroom: Float? = null
+        private set
+
+    var lastGpuHeadroom: Float? = null
+        private set
+
+    /** Sanitizes Android 16 SystemHealthManager CPU/GPU headroom ([0..100]) for the native JNI
+     *  bridge (-1f when unavailable) without altering the advisory thermal UI level. */
+    fun recordSystemHeadroom(cpuHeadroom: Float?, gpuHeadroom: Float?): Pair<Float, Float> {
+        val cpu = SystemHeadroomReader.sanitizeHeadroom(cpuHeadroom)
+        val gpu = SystemHeadroomReader.sanitizeHeadroom(gpuHeadroom)
+        lastCpuHeadroom = cpu
+        lastGpuHeadroom = gpu
+        return (cpu ?: SystemHeadroomReader.UNAVAILABLE) to (gpu ?: SystemHeadroomReader.UNAVAILABLE)
+    }
+
     /** [headroom]: PowerManager.getThermalHeadroom (null when the device has none); [status]:
      *  PowerManager.THERMAL_STATUS_* (-1 unknown). The new level when it changed, else null. */
     fun sample(headroom: Float?, status: Int): Level? {

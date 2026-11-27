@@ -12,6 +12,7 @@
 #include <string>
 #include <utility>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/frame_stats.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
@@ -20,8 +21,11 @@
 #include <errno.h>
 #include <poll.h>
 #include <sys/resource.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 #endif
+
+DECLARE_bool(vulkan_present_timing_ext);
 
 namespace xe {
 namespace ui {
@@ -34,6 +38,17 @@ uint64_t EgressMonotonicTimeNs() {
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count());
 }
+
+#if (XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid)
+bool IsZeroFGPresentTimingExtEnabled() {
+  bool enabled = cvars::vulkan_present_timing_ext;
+  char prop[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.xendroid.present_timing_ext", prop) > 0) {
+    ParseStrictBoolProperty(prop, enabled);
+  }
+  return enabled;
+}
+#endif
 
 }  // namespace
 
@@ -178,7 +193,10 @@ ZeroFGMainSurfaceEgress::ZeroFGMainSurfaceEgress(
       queue_family_(device->queue_family_graphics_compute()),
       queue_index_(device->queue_index_zerofg_main_surface_present()),
       timing_available_(device->vkGetPastPresentationTimingGOOGLE() !=
-                        nullptr),
+                            nullptr ||
+                        (device->extensions().ext_EXT_present_timing &&
+                         device->properties().presentTiming &&
+                         device->HasPresentTimingExtPfns())),
       apocalypse_guard_(apocalypse_guard && timing_available_),
       free_output_(free_output),
       vsync_quantizer_(vsync_quantizer && timing_available_),
@@ -535,8 +553,76 @@ bool ZeroFGMainSurfaceEgress::CreateSwapchain() {
   if (capabilities.maxImageCount) {
     image_count = std::min(image_count, capabilities.maxImageCount);
   }
+  active_timing_backend_ = PresentTimingBackend::kNone;
+  ext_timing_properties_counter_ = 0;
+  ext_time_domains_counter_ = 0;
+  ext_time_domain_ = {};
+  ext_stage_query_mask_ = 0;
+  ext_target_stage_ = 0;
+  ext_present_at_absolute_time_ = false;
+  ext_use_present_id2_ = false;
+  ext_use_present_id1_ = false;
+
+  const bool google_timing_supported =
+      device_->vkGetPastPresentationTimingGOOGLE() != nullptr;
+  bool ext_surface_supported = false;
+#ifdef VK_EXT_present_timing
+  bool ext_surface_present_at_absolute = false;
+  uint32_t ext_surface_stage_queries = 0;
+  bool surface_present_id2_supported = false;
+  if (device_->extensions().ext_EXT_present_timing &&
+      device_->properties().presentTiming &&
+      device_->HasPresentTimingExtPfns() &&
+      device_->vkGetPhysicalDeviceSurfaceCapabilities2KHR()) {
+    VkPhysicalDeviceSurfaceInfo2KHR surface_info = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR};
+    surface_info.surface = surface_;
+    VkSurfaceCapabilities2KHR surface_caps2 = {
+        VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
+    VkPresentTimingSurfaceCapabilitiesEXT timing_surface_caps = {
+        VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT};
+    surface_caps2.pNext = &timing_surface_caps;
+#ifdef VK_KHR_present_id2
+    VkSurfaceCapabilitiesPresentId2KHR id2_surface_caps = {
+        VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR};
+    if (device_->properties().presentId2) {
+      timing_surface_caps.pNext = &id2_surface_caps;
+    }
+#endif
+    if (device_->vkGetPhysicalDeviceSurfaceCapabilities2KHR()(
+            physical_device, &surface_info, &surface_caps2) == VK_SUCCESS) {
+      ext_surface_supported =
+          timing_surface_caps.presentTimingSupported != VK_FALSE;
+      ext_surface_present_at_absolute =
+          timing_surface_caps.presentAtAbsoluteTimeSupported != VK_FALSE;
+      ext_surface_stage_queries =
+          static_cast<uint32_t>(timing_surface_caps.presentStageQueries);
+#ifdef VK_KHR_present_id2
+      if (device_->properties().presentId2) {
+        surface_present_id2_supported =
+            id2_surface_caps.presentId2Supported != VK_FALSE;
+      }
+#endif
+    }
+  }
+#endif
+  active_timing_backend_ = SelectPresentTimingBackend(
+      IsZeroFGPresentTimingExtEnabled(), device_->properties().presentTiming,
+      ext_surface_supported, device_->HasPresentTimingExtPfns(),
+      google_timing_supported);
+
   VkSwapchainCreateInfoKHR create_info = {
       VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+#ifdef VK_EXT_present_timing
+  if (active_timing_backend_ == PresentTimingBackend::kExtPresentTiming) {
+    create_info.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+#ifdef VK_KHR_present_id2
+    if (device_->properties().presentId2 && surface_present_id2_supported) {
+      create_info.flags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
+    }
+#endif
+  }
+#endif
   create_info.surface = surface_;
   create_info.minImageCount = image_count;
   create_info.imageFormat = format_;
@@ -564,6 +650,23 @@ bool ZeroFGMainSurfaceEgress::CreateSwapchain() {
   create_info.clipped = VK_TRUE;
   create_info.oldSwapchain = VK_NULL_HANDLE;
   result = dfn.vkCreateSwapchainKHR(device, &create_info, nullptr, &swapchain_);
+#ifdef VK_EXT_present_timing
+  if (result != VK_SUCCESS &&
+      active_timing_backend_ == PresentTimingBackend::kExtPresentTiming) {
+    XELOGW(
+        "ZeroFGMainSurface vkCreateSwapchainKHR failed with "
+        "VK_EXT_present_timing ({}), falling back cleanly",
+        int32_t(result));
+    create_info.flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+#ifdef VK_KHR_present_id2
+    create_info.flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
+#endif
+    active_timing_backend_ = SelectPresentTimingBackend(
+        false, false, false, false, google_timing_supported);
+    result =
+        dfn.vkCreateSwapchainKHR(device, &create_info, nullptr, &swapchain_);
+  }
+#endif
   if (result != VK_SUCCESS) {
     swapchain_ = VK_NULL_HANDLE;
     Fail(Failure::kSwapchainCreate, int32_t(result));
@@ -596,7 +699,40 @@ bool ZeroFGMainSurfaceEgress::CreateSwapchain() {
     }
   }
   uint64_t refresh_cycle_ns = 0;
-  if (timing_available_ && device_->vkGetRefreshCycleDurationGOOGLE()) {
+#ifdef VK_EXT_present_timing
+  if (active_timing_backend_ == PresentTimingBackend::kExtPresentTiming) {
+    ext_stage_query_mask_ =
+        SelectPreferredPresentStageQueryMask(ext_surface_stage_queries);
+    ext_target_stage_ = SelectTargetTimePresentStage(ext_surface_stage_queries);
+    ext_present_at_absolute_time_ =
+        device_->properties().presentAtAbsoluteTime &&
+        ext_surface_present_at_absolute;
+    ext_use_present_id2_ =
+        device_->properties().presentId2 && surface_present_id2_supported;
+    ext_use_present_id1_ =
+        !ext_use_present_id2_ && device_->properties().presentId;
+    const VkResult queue_size_result =
+        device_->vkSetSwapchainPresentTimingQueueSizeEXT()(
+            device, swapchain_, kPresentTimingQueueSize);
+    RefreshExtSwapchainTimingMetadata();
+    if (queue_size_result != VK_SUCCESS || ext_stage_query_mask_ == 0 ||
+        !ext_time_domain_.valid || !ext_time_domain_.is_monotonic_clock ||
+        (!ext_use_present_id2_ && !ext_use_present_id1_)) {
+      XELOGW(
+          "ZeroFGMainSurface VK_EXT_present_timing swapchain setup incomplete "
+          "(queue_size_result={} monotonic={} id2={} id1={}), falling back",
+          int32_t(queue_size_result), ext_time_domain_.is_monotonic_clock,
+          ext_use_present_id2_, ext_use_present_id1_);
+      active_timing_backend_ = SelectPresentTimingBackend(
+          false, false, false, false, google_timing_supported);
+    } else {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      refresh_cycle_ns = counters_.refresh_cycle_now_ns;
+    }
+  }
+#endif
+  if (active_timing_backend_ == PresentTimingBackend::kGoogleDisplayTiming &&
+      device_->vkGetRefreshCycleDurationGOOGLE()) {
     VkRefreshCycleDurationGOOGLE refresh = {};
     if (device_->vkGetRefreshCycleDurationGOOGLE()(device, swapchain_,
                                                    &refresh) == VK_SUCCESS) {
@@ -606,6 +742,8 @@ bool ZeroFGMainSurfaceEgress::CreateSwapchain() {
   {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     counters_.swapchain_ready = true;
+    counters_.timing_available =
+        (active_timing_backend_ != PresentTimingBackend::kNone);
     counters_.image_count = uint32_t(images_.size());
     counters_.refresh_cycle_ns = refresh_cycle_ns;
     counters_.refresh_cycle_now_ns = refresh_cycle_ns;
@@ -613,10 +751,11 @@ bool ZeroFGMainSurfaceEgress::CreateSwapchain() {
   XELOGI(
       "ZeroFGMainSurface swapchain created mode=FIFO images={} requested={} "
       "extent={}x{} format={} color_space={} usage=transfer_dst|color "
-      "queue=B:{} timing_available={} refresh_cycle_us={}",
+      "queue=B:{} timing_available={} timing_backend={} refresh_cycle_us={}",
       images_.size(), image_count, extent_.width, extent_.height,
-      int(format_), int(color_space), queue_index_, timing_available_,
-      refresh_cycle_ns / 1000);
+      int(format_), int(color_space), queue_index_,
+      active_timing_backend_ != PresentTimingBackend::kNone,
+      uint32_t(active_timing_backend_), refresh_cycle_ns / 1000);
   return true;
 #else
   return false;
@@ -650,6 +789,8 @@ void ZeroFGMainSurfaceEgress::DestroySwapchainAfterIdle() {
     dfn.vkDestroySwapchainKHR(device, swapchain_, nullptr);
     swapchain_ = VK_NULL_HANDLE;
   }
+  active_timing_backend_ = PresentTimingBackend::kNone;
+  ext_time_domain_ = {};
   for (VkSemaphore semaphore : render_done_) {
     if (semaphore != VK_NULL_HANDLE) {
       dfn.vkDestroySemaphore(device, semaphore, nullptr);
@@ -1004,34 +1145,95 @@ bool ZeroFGMainSurfaceEgress::ServeRequest(const Request& request,
       // -1 is a valid already-signaled sync_file.
       context.copy_done_fd = copy_done_fd;
     }
-    VkPresentTimeGOOGLE present_time = {};
-    present_time.presentID = uint32_t(request.sequence_id);
     // The Apocalypse Guard may raise it; request.desired_present_ns stays the
-    // target-vs-actual telemetry reference.
-    present_time.desiredPresentTime =
+    // target-vs-actual telemetry reference. Late-swap is strictly disabled
+    // under ZeroFG so QuantizeToVsync preserves Real/Synthetic spacing.
+    uint64_t desired_present_ns =
         apocalypse_guard_ ? ShapeDesiredPresent(request, EgressMonotonicTimeNs())
                           : request.desired_present_ns;
     context.assigned_vsync_ns = 0;
     last_quantize_tight_only_ = false;
     if (vsync_quantizer_) {
-      present_time.desiredPresentTime =
-          QuantizeToVsync(present_time.desiredPresentTime,
-                          EgressMonotonicTimeNs(), context.assigned_vsync_ns);
+      desired_present_ns =
+          QuantizeToVsync(desired_present_ns, EgressMonotonicTimeNs(),
+                          context.assigned_vsync_ns);
     }
+    VkPresentTimeGOOGLE present_time = {};
+    present_time.presentID = uint32_t(request.sequence_id);
+    present_time.desiredPresentTime = desired_present_ns;
     VkPresentTimesInfoGOOGLE present_times = {
         VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
     present_times.swapchainCount = 1;
     present_times.pTimes = &present_time;
+#ifdef VK_EXT_present_timing
+    VkPresentTimingInfoEXT present_timing_ext = {
+        VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT};
+    VkPresentTimingsInfoEXT present_timings_ext = {
+        VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT};
+    const uint64_t present_id_64 = request.sequence_id;
+#ifdef VK_KHR_present_id2
+    VkPresentId2KHR present_id2 = {VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR};
+#endif
+#ifdef VK_KHR_present_id
+    VkPresentIdKHR present_id1 = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+#endif
+#endif
     VkPresentInfoKHR present_info = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-    present_info.pNext = timing_available_ ? &present_times : nullptr;
+    const PresentInfoTimingChain timing_chain =
+        SelectPresentInfoTimingChain(active_timing_backend_, true);
+#ifdef VK_EXT_present_timing
+    if (timing_chain == PresentInfoTimingChain::kExtOnly) {
+      const uint64_t ext_target_ns =
+          (ext_present_at_absolute_time_ &&
+           ext_time_domain_.is_monotonic_clock)
+              ? desired_present_ns
+              : 0ull;
+      present_timing_ext.flags = 0;
+      present_timing_ext.targetTime = ext_target_ns;
+      present_timing_ext.timeDomainId = ext_time_domain_.time_domain_id;
+      present_timing_ext.presentStageQueries = ext_stage_query_mask_;
+      present_timing_ext.targetTimeDomainPresentStage =
+          ext_target_ns ? ext_target_stage_ : 0u;
+      present_timings_ext.swapchainCount = 1;
+      present_timings_ext.pTimingInfos = &present_timing_ext;
+#ifdef VK_KHR_present_id2
+      if (ext_use_present_id2_) {
+        present_id2.swapchainCount = 1;
+        present_id2.pPresentIds = &present_id_64;
+        present_timings_ext.pNext = &present_id2;
+      }
+#endif
+#ifdef VK_KHR_present_id
+      if (!present_timings_ext.pNext && ext_use_present_id1_) {
+        present_id1.swapchainCount = 1;
+        present_id1.pPresentIds = &present_id_64;
+        present_timings_ext.pNext = &present_id1;
+      }
+#endif
+      present_info.pNext = &present_timings_ext;
+    } else
+#endif
+    if (timing_chain == PresentInfoTimingChain::kGoogleOnly) {
+      present_info.pNext = &present_times;
+    } else {
+      present_info.pNext = nullptr;
+    }
     present_info.waitSemaphoreCount = 1;
     present_info.pWaitSemaphores = &render_done_[image_index];
     present_info.swapchainCount = 1;
     present_info.pSwapchains = &swapchain_;
     present_info.pImageIndices = &image_index;
     present_call_ns = EgressMonotonicTimeNs();
-    const VkResult present_result =
+    VkResult present_result =
         dfn.vkQueuePresentKHR(queue.queue(), &present_info);
+#ifdef VK_EXT_present_timing
+    if (present_result == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT) {
+      MaybePollTimings(true);
+      RefreshExtSwapchainTimingMetadata();
+      present_info.pNext = nullptr;
+      present_result = dfn.vkQueuePresentKHR(queue.queue(), &present_info);
+    }
+#endif
     present_ns = EgressMonotonicTimeNs();
     if (present_result == VK_SUCCESS ||
         present_result == VK_SUBOPTIMAL_KHR) {
@@ -1070,7 +1272,8 @@ bool ZeroFGMainSurfaceEgress::ServeRequest(const Request& request,
       ++latency_batch_.invalid;
     }
     TimingRecord& record = timing_records_[timing_record_next_];
-    if (timing_available_ && record.used && !record.resolved) {
+    if (active_timing_backend_ != PresentTimingBackend::kNone && record.used &&
+        !record.resolved) {
       // Android keeps a short timing history; a record overwritten before
       // its timing came back is counted, never invented.
       ++counters_.timings_missing;
@@ -1744,30 +1947,24 @@ void ZeroFGMainSurfaceEgress::PollCopyCompletions() {
 #endif
 }
 
-void ZeroFGMainSurfaceEgress::MaybePollTimings(bool force) {
-  const uint64_t now_ns = EgressMonotonicTimeNs();
-  // The window partitions observations, not the overlapping SampleWindows in
-  // Stats. Raw batches can therefore be pooled without averaging percentiles.
-  MaybeLogLatencyBatch(now_ns);
-  if (!timing_available_ || swapchain_ == VK_NULL_HANDLE) {
+void ZeroFGMainSurfaceEgress::RefreshExtSwapchainTimingMetadata() {
+#ifdef VK_EXT_present_timing
+  if (swapchain_ == VK_NULL_HANDLE ||
+      active_timing_backend_ != PresentTimingBackend::kExtPresentTiming ||
+      !device_->HasPresentTimingExtPfns()) {
     return;
   }
-  if (!force && now_ns < next_timing_poll_ns_) {
-    return;
-  }
-  next_timing_poll_ns_ = now_ns + 4000000ull;
-  if (now_ns >= next_refresh_poll_ns_ &&
-      device_->vkGetRefreshCycleDurationGOOGLE()) {
-    // The display mode can change under us (60 <-> 120): sample it twice a
-    // second so the intervals can be read against the live refresh.
-    next_refresh_poll_ns_ = now_ns + 500000000ull;
-    VkRefreshCycleDurationGOOGLE refresh = {};
-    if (device_->vkGetRefreshCycleDurationGOOGLE()(
-            device_->device(), swapchain_, &refresh) == VK_SUCCESS &&
-        refresh.refreshDuration) {
+  const VkDevice device = device_->device();
+  VkSwapchainTimingPropertiesEXT timing_props = {
+      VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT};
+  uint64_t timing_counter = ext_timing_properties_counter_;
+  if (device_->vkGetSwapchainTimingPropertiesEXT()(
+          device, swapchain_, &timing_props, &timing_counter) == VK_SUCCESS) {
+    ext_timing_properties_counter_ = timing_counter;
+    if (timing_props.refreshDuration) {
       std::lock_guard<std::mutex> lock(stats_mutex_);
       const uint64_t previous_ns = counters_.refresh_cycle_now_ns;
-      const uint64_t current_ns = refresh.refreshDuration;
+      const uint64_t current_ns = timing_props.refreshDuration;
       const uint64_t change_ns = current_ns > previous_ns
                                      ? current_ns - previous_ns
                                      : previous_ns - current_ns;
@@ -1777,11 +1974,158 @@ void ZeroFGMainSurfaceEgress::MaybePollTimings(bool force) {
       counters_.refresh_cycle_now_ns = current_ns;
     }
   }
-  std::array<VkPastPresentationTimingGOOGLE, 16> timings = {};
-  uint32_t count = uint32_t(timings.size());
-  const VkResult result = device_->vkGetPastPresentationTimingGOOGLE()(
-      device_->device(), swapchain_, &count, timings.data());
+  VkSwapchainTimeDomainPropertiesEXT domain_props = {
+      VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT};
+  uint64_t domains_counter = ext_time_domains_counter_;
+  VkResult domain_result = device_->vkGetSwapchainTimeDomainPropertiesEXT()(
+      device, swapchain_, &domain_props, &domains_counter);
+  if ((domain_result != VK_SUCCESS && domain_result != VK_INCOMPLETE) ||
+      domain_props.timeDomainCount == 0) {
+    ext_time_domain_ = {};
+    return;
+  }
+  std::vector<VkTimeDomainKHR> domains(domain_props.timeDomainCount);
+  std::vector<uint64_t> domain_ids(domain_props.timeDomainCount);
+  domain_props.pTimeDomains = domains.data();
+  domain_props.pTimeDomainIds = domain_ids.data();
+  domain_result = device_->vkGetSwapchainTimeDomainPropertiesEXT()(
+      device, swapchain_, &domain_props, &domains_counter);
+  if (domain_result != VK_SUCCESS && domain_result != VK_INCOMPLETE) {
+    ext_time_domain_ = {};
+    return;
+  }
+  const size_t count =
+      std::min<size_t>(domain_props.timeDomainCount, domains.size());
+  ext_time_domain_ =
+      SelectPreferredVkTimeDomain(domains.data(), domain_ids.data(), count);
+  if (ext_time_domain_.valid) {
+    ext_time_domains_counter_ = domains_counter;
+  }
+#endif
+}
+
+void ZeroFGMainSurfaceEgress::MaybePollTimings(bool force) {
+  const uint64_t now_ns = EgressMonotonicTimeNs();
+  // The window partitions observations, not the overlapping SampleWindows in
+  // Stats. Raw batches can therefore be pooled without averaging percentiles.
+  MaybeLogLatencyBatch(now_ns);
+  if (active_timing_backend_ == PresentTimingBackend::kNone ||
+      swapchain_ == VK_NULL_HANDLE) {
+    return;
+  }
+  if (!force && now_ns < next_timing_poll_ns_) {
+    return;
+  }
+  next_timing_poll_ns_ = now_ns + 4000000ull;
+  if (now_ns >= next_refresh_poll_ns_) {
+    // The display mode can change under us (60 <-> 120): sample it twice a
+    // second so the intervals can be read against the live refresh.
+    next_refresh_poll_ns_ = now_ns + 500000000ull;
+#ifdef VK_EXT_present_timing
+    if (active_timing_backend_ == PresentTimingBackend::kExtPresentTiming) {
+      RefreshExtSwapchainTimingMetadata();
+    } else
+#endif
+    if (active_timing_backend_ == PresentTimingBackend::kGoogleDisplayTiming &&
+        device_->vkGetRefreshCycleDurationGOOGLE()) {
+      VkRefreshCycleDurationGOOGLE refresh = {};
+      if (device_->vkGetRefreshCycleDurationGOOGLE()(
+              device_->device(), swapchain_, &refresh) == VK_SUCCESS &&
+          refresh.refreshDuration) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        const uint64_t previous_ns = counters_.refresh_cycle_now_ns;
+        const uint64_t current_ns = refresh.refreshDuration;
+        const uint64_t change_ns = current_ns > previous_ns
+                                       ? current_ns - previous_ns
+                                       : previous_ns - current_ns;
+        if (previous_ns && change_ns * 8 > previous_ns) {
+          ++counters_.refresh_mode_changes;
+        }
+        counters_.refresh_cycle_now_ns = current_ns;
+      }
+    }
+  }
+  struct ObservedPastTiming {
+    uint32_t present_id = 0;
+    uint64_t actual_ns = 0;
+    uint64_t earliest_ns = 0;
+    int64_t margin_ns = 0;
+    bool has_margin = false;
+  };
+  std::array<ObservedPastTiming, 16> observed = {};
+  uint32_t observed_count = 0;
+  VkResult result = VK_SUCCESS;
+  bool need_ext_refresh = false;
+#ifdef VK_EXT_present_timing
+  if (active_timing_backend_ == PresentTimingBackend::kExtPresentTiming) {
+    std::array<std::array<VkPresentStageTimeEXT, 4>, 16> stage_storage = {};
+    std::array<VkPastPresentationTimingEXT, 16> ext_timings = {};
+    for (size_t i = 0; i < ext_timings.size(); ++i) {
+      ext_timings[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
+      ext_timings[i].presentStageCount = uint32_t(stage_storage[i].size());
+      ext_timings[i].pPresentStages = stage_storage[i].data();
+    }
+    VkPastPresentationTimingInfoEXT query_info = {
+        VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT};
+    query_info.flags =
+        VK_PAST_PRESENTATION_TIMING_ALLOW_PARTIAL_RESULTS_BIT_EXT |
+        VK_PAST_PRESENTATION_TIMING_ALLOW_OUT_OF_ORDER_RESULTS_BIT_EXT;
+    query_info.swapchain = swapchain_;
+    VkPastPresentationTimingPropertiesEXT past_props = {
+        VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT};
+    past_props.presentationTimingCount = uint32_t(ext_timings.size());
+    past_props.pPresentationTimings = ext_timings.data();
+    result = device_->vkGetPastPresentationTimingEXT()(
+        device_->device(), &query_info, &past_props);
+    const bool queue_full = result == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT;
+    need_ext_refresh = ShouldRefreshSwapchainTimingMetadata(
+        ext_timing_properties_counter_, past_props.timingPropertiesCounter,
+        ext_time_domains_counter_, past_props.timeDomainsCounter, queue_full);
+    if (result == VK_SUCCESS || result == VK_INCOMPLETE || queue_full) {
+      const uint32_t raw_count = std::min(past_props.presentationTimingCount,
+                                          uint32_t(ext_timings.size()));
+      uint64_t refresh_now = 0;
+      {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        refresh_now = counters_.refresh_cycle_now_ns;
+      }
+      for (uint32_t i = 0; i < raw_count; ++i) {
+        const UnifiedPastPresentationTiming conv =
+            ConvertVkPastPresentationTimingEXT(ext_timings[i], refresh_now);
+        if (conv.valid) {
+          observed[observed_count++] = {
+              uint32_t(conv.present_id), conv.actual_present_time_ns,
+              conv.earliest_present_time_ns, 0, false};
+        }
+      }
+      if (queue_full) {
+        result = VK_SUCCESS;
+      }
+    }
+  } else
+#endif
+  {
+    if (!device_->vkGetPastPresentationTimingGOOGLE()) {
+      return;
+    }
+    std::array<VkPastPresentationTimingGOOGLE, 16> timings = {};
+    uint32_t count = uint32_t(timings.size());
+    result = device_->vkGetPastPresentationTimingGOOGLE()(
+        device_->device(), swapchain_, &count, timings.data());
+    if (result == VK_SUCCESS || result == VK_INCOMPLETE) {
+      count = std::min(count, uint32_t(timings.size()));
+      for (uint32_t i = 0; i < count; ++i) {
+        observed[observed_count++] = {
+            timings[i].presentID, timings[i].actualPresentTime,
+            timings[i].earliestPresentTime, int64_t(timings[i].presentMargin),
+            true};
+      }
+    }
+  }
   const uint64_t timing_observation_ns = EgressMonotonicTimeNs();
+  if (need_ext_refresh) {
+    RefreshExtSwapchainTimingMetadata();
+  }
   std::lock_guard<std::mutex> lock(stats_mutex_);
   if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
     ++counters_.timing_query_errors;
@@ -1790,9 +2134,8 @@ void ZeroFGMainSurfaceEgress::MaybePollTimings(bool force) {
     }
     return;
   }
-  count = std::min(count, uint32_t(timings.size()));
-  for (uint32_t i = 0; i < count; ++i) {
-    const VkPastPresentationTimingGOOGLE& timing = timings[i];
+  for (uint32_t i = 0; i < observed_count; ++i) {
+    const ObservedPastTiming& timing = observed[i];
     TimingRecord* record = nullptr;
     for (size_t offset = 1; offset <= timing_records_.size(); ++offset) {
       TimingRecord& candidate =
@@ -1800,7 +2143,7 @@ void ZeroFGMainSurfaceEgress::MaybePollTimings(bool force) {
                            offset) %
                           timing_records_.size()];
       if (candidate.used && !candidate.resolved &&
-          candidate.present_id == timing.presentID) {
+          candidate.present_id == timing.present_id) {
         record = &candidate;
         break;
       }
@@ -1816,7 +2159,7 @@ void ZeroFGMainSurfaceEgress::MaybePollTimings(bool force) {
     // reported, most likely dropped by the compositor.
     for (TimingRecord& older : timing_records_) {
       if (older.used && !older.resolved &&
-          int32_t(older.present_id - timing.presentID) < 0) {
+          int32_t(older.present_id - timing.present_id) < 0) {
         older.resolved = true;
         ++counters_.overtaken;
         if (!older.synthetic) {
@@ -1826,15 +2169,17 @@ void ZeroFGMainSurfaceEgress::MaybePollTimings(bool force) {
     }
     // Observation only: the actual time never moves a target, a floor or
     // the next desired time.
-    const uint64_t actual_ns = timing.actualPresentTime;
+    const uint64_t actual_ns = timing.actual_ns;
     if (record->synthetic) {
       ++latency_batch_.synthetic_timed;
     } else {
       ObserveRealLatency(*record, actual_ns, timing_observation_ns);
     }
-    present_margin_ns_.Add(BiasSigned(int64_t(timing.presentMargin)));
-    if (timing.earliestPresentTime && actual_ns >= timing.earliestPresentTime) {
-      const uint64_t earliest_gap_ns = actual_ns - timing.earliestPresentTime;
+    if (timing.has_margin) {
+      present_margin_ns_.Add(BiasSigned(timing.margin_ns));
+    }
+    if (timing.earliest_ns && actual_ns >= timing.earliest_ns) {
+      const uint64_t earliest_gap_ns = actual_ns - timing.earliest_ns;
       earliest_gap_ns_.Add(earliest_gap_ns);
       if (counters_.refresh_cycle_now_ns &&
           earliest_gap_ns * 2 >= counters_.refresh_cycle_now_ns) {

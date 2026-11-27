@@ -14,6 +14,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/gpu/vulkan/vulkan_driver_quirks.h"
+#include "xenia/ui/vulkan/vulkan_present_timing.h"
 #include "xenia/ui/vulkan/zerofg_config.h"
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
 #include <dirent.h>
+#include <sys/system_properties.h>
 #include "third_party/libadrenotools/include/adrenotools/bcenabler.h"
 #include "third_party/libadrenotools/include/adrenotools/driver.h"
 #endif
@@ -63,11 +65,29 @@ DEFINE_bool(
     "startup.",
     "Vulkan");
 
+DEFINE_bool(
+    vulkan_present_timing_ext, false,
+    "Prefer VK_EXT_present_timing (spec v3) over VK_GOOGLE_display_timing "
+    "when advertised by the device and surface, with clean automatic fallback "
+    "to VK_GOOGLE_display_timing and untimed presentation.",
+    "Vulkan");
+
 namespace xe {
 namespace ui {
 namespace vulkan {
 
 namespace {
+
+bool IsPresentTimingExtRequested() {
+  bool enabled = cvars::vulkan_present_timing_ext;
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  char prop[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.xendroid.present_timing_ext", prop) > 0) {
+    ParseStrictBoolProperty(prop, enabled);
+  }
+#endif
+  return enabled;
+}
 
 bool ReadBoolCvarOrDefault(const char* name, bool default_value) {
   if (!cvar::ConfigVars) {
@@ -407,6 +427,29 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
     requested_extensions.emplace(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
                                  &ext_GOOGLE_display_timing);
+#ifdef VK_EXT_present_timing
+    const bool present_timing_ext_requested =
+        get_physical_device_properties2_supported &&
+        IsPresentTimingExtRequested();
+    if (present_timing_ext_requested &&
+        vulkan_instance->extensions().ext_KHR_get_surface_capabilities2) {
+      requested_extensions.emplace(VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
+                                   &device->extensions_.ext_EXT_present_timing);
+#ifdef VK_KHR_calibrated_timestamps
+      requested_extensions.emplace(
+          VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+          &device->extensions_.ext_KHR_calibrated_timestamps);
+#endif
+#ifdef VK_KHR_present_id2
+      requested_extensions.emplace(VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+                                   &device->extensions_.ext_KHR_present_id2);
+#endif
+#ifdef VK_KHR_present_id
+      requested_extensions.emplace(VK_KHR_PRESENT_ID_EXTENSION_NAME,
+                                   &device->extensions_.ext_KHR_present_id);
+#endif
+    }
+#endif
 #if XE_PLATFORM_WIN32
     // #256. Windows-only extension to control fullscreen exclusive behavior.
     // Used to prevent HDR state corruption during fullscreen transitions.
@@ -676,6 +719,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     device->extensions_.ext_EXT_graphics_pipeline_library = false;
     erase_enabled_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
   }
+#ifdef VK_EXT_present_timing
+  // VK_EXT_present_timing (spec v3) requires VK_KHR_calibrated_timestamps and
+  // VK_KHR_present_id2 (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
+  if (device->extensions_.ext_EXT_present_timing &&
+      (!device->extensions_.ext_KHR_calibrated_timestamps ||
+       !device->extensions_.ext_KHR_present_id2)) {
+    device->extensions_.ext_EXT_present_timing = false;
+    erase_enabled_extension(VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
+  }
+#endif
   // VK_EXT_shader_object requires VK_KHR_dynamic_rendering (or Vulkan 1.3).
   if (device->extensions_.ext_EXT_shader_object &&
       properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0) &&
@@ -854,6 +907,21 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VkPhysicalDevicePushDescriptorPropertiesKHR
       properties_KHR_push_descriptor = {
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+#ifdef VK_EXT_present_timing
+  VulkanFeatures<VkPhysicalDevicePresentTimingFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT>
+      features_EXT_present_timing;
+#endif
+#ifdef VK_KHR_present_id2
+  VulkanFeatures<VkPhysicalDevicePresentId2FeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR>
+      features_KHR_present_id2;
+#endif
+#ifdef VK_KHR_present_id
+  VulkanFeatures<VkPhysicalDevicePresentIdFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR>
+      features_KHR_present_id;
+#endif
 
   // All QCOM probe structures are linked for supported queries only. v2,
   // cubic weights/clamp are never linked to device creation in this batch.
@@ -1043,6 +1111,22 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       properties_KHR_push_descriptor.pNext = properties_2.pNext;
       properties_2.pNext = &properties_KHR_push_descriptor;
     }
+#ifdef VK_EXT_present_timing
+    if (device->extensions_.ext_EXT_present_timing) {
+      features_EXT_present_timing.Link(supported_features_2,
+                                       device_create_info);
+    }
+#endif
+#ifdef VK_KHR_present_id2
+    if (device->extensions_.ext_KHR_present_id2) {
+      features_KHR_present_id2.Link(supported_features_2, device_create_info);
+    }
+#endif
+#ifdef VK_KHR_present_id
+    if (device->extensions_.ext_KHR_present_id) {
+      features_KHR_present_id.Link(supported_features_2, device_create_info);
+    }
+#endif
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
     if (device->extensions_.ext_KHR_fragment_shading_rate) {
@@ -1102,6 +1186,58 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     features_EXT_device_fault.enabled.deviceFault =
         features_EXT_device_fault.supported.deviceFault;
+    [[maybe_unused]] const bool ext_present_id2_enabled =
+        device->extensions_.ext_KHR_present_id2;
+#ifdef VK_KHR_present_id2
+    if (device->extensions_.ext_KHR_present_id2) {
+      features_KHR_present_id2.enabled.presentId2 =
+          features_KHR_present_id2.supported.presentId2;
+      device->properties_.presentId2 =
+          features_KHR_present_id2.enabled.presentId2 != VK_FALSE;
+      if (!device->properties_.presentId2) {
+        device->extensions_.ext_KHR_present_id2 = false;
+      }
+    }
+#endif
+#ifdef VK_KHR_present_id
+    if (device->extensions_.ext_KHR_present_id) {
+      features_KHR_present_id.enabled.presentId =
+          features_KHR_present_id.supported.presentId;
+      device->properties_.presentId =
+          features_KHR_present_id.enabled.presentId != VK_FALSE;
+      if (!device->properties_.presentId) {
+        device->extensions_.ext_KHR_present_id = false;
+      }
+    }
+#endif
+#ifdef VK_EXT_present_timing
+    if (device->extensions_.ext_EXT_present_timing) {
+      if (CanEnablePresentTimingExtOnDevice(
+              device->extensions_.ext_EXT_present_timing,
+              device->extensions_.ext_KHR_calibrated_timestamps,
+              ext_present_id2_enabled,
+              features_EXT_present_timing.supported.presentTiming != VK_FALSE,
+              device->properties_.presentId2, device->properties_.presentId)) {
+        features_EXT_present_timing.enabled.presentTiming = VK_TRUE;
+        features_EXT_present_timing.enabled.presentAtAbsoluteTime =
+            features_EXT_present_timing.supported.presentAtAbsoluteTime;
+        features_EXT_present_timing.enabled.presentAtRelativeTime =
+            features_EXT_present_timing.supported.presentAtRelativeTime;
+        device->properties_.presentTiming = true;
+        device->properties_.presentAtAbsoluteTime =
+            features_EXT_present_timing.enabled.presentAtAbsoluteTime !=
+            VK_FALSE;
+        device->properties_.presentAtRelativeTime =
+            features_EXT_present_timing.enabled.presentAtRelativeTime !=
+            VK_FALSE;
+      } else {
+        device->extensions_.ext_EXT_present_timing = false;
+        device->properties_.presentTiming = false;
+        device->properties_.presentAtAbsoluteTime = false;
+        device->properties_.presentAtRelativeTime = false;
+      }
+    }
+#endif
   }
 
   uint32_t queue_family_count = 0;
@@ -2430,6 +2566,45 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       device->vkGetPastPresentationTimingGOOGLE_ = nullptr;
     }
   }
+  if (vulkan_instance->extensions().ext_KHR_get_surface_capabilities2) {
+    device->vkGetPhysicalDeviceSurfaceCapabilities2KHR_ =
+        PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR(
+            ifn.vkGetInstanceProcAddr(
+                vulkan_instance->instance(),
+                "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
+  }
+#ifdef VK_EXT_present_timing
+  if (device->extensions_.ext_EXT_present_timing &&
+      device->properties_.presentTiming) {
+    device->vkSetSwapchainPresentTimingQueueSizeEXT_ =
+        PFN_vkSetSwapchainPresentTimingQueueSizeEXT(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkSetSwapchainPresentTimingQueueSizeEXT"));
+    device->vkGetSwapchainTimingPropertiesEXT_ =
+        PFN_vkGetSwapchainTimingPropertiesEXT(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetSwapchainTimingPropertiesEXT"));
+    device->vkGetSwapchainTimeDomainPropertiesEXT_ =
+        PFN_vkGetSwapchainTimeDomainPropertiesEXT(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetSwapchainTimeDomainPropertiesEXT"));
+    device->vkGetPastPresentationTimingEXT_ =
+        PFN_vkGetPastPresentationTimingEXT(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetPastPresentationTimingEXT"));
+    if (!device->HasPresentTimingExtPfns()) {
+      device->vkSetSwapchainPresentTimingQueueSizeEXT_ = nullptr;
+      device->vkGetSwapchainTimingPropertiesEXT_ = nullptr;
+      device->vkGetSwapchainTimeDomainPropertiesEXT_ = nullptr;
+      device->vkGetPastPresentationTimingEXT_ = nullptr;
+      device->extensions_.ext_EXT_present_timing = false;
+      device->properties_.presentTiming = false;
+    } else {
+      XELOGI(
+          "VulkanDevice: VK_EXT_present_timing enabled (abs={} rel={} id2={} "
+          "id1={})",
+          device->properties_.presentAtAbsoluteTime,
+          device->properties_.presentAtRelativeTime,
+          device->properties_.presentId2, device->properties_.presentId);
+    }
+  }
+#endif
 
   // Optional diagnostic entry points. Failure here disables statistics only:
   // it must not join the generic device function-loading failure authority.
