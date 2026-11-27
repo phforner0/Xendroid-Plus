@@ -101,4 +101,37 @@ class DriverSourcesTest {
         assertNull(DriverSuggestion.suggest(list, "Mali-G715"))
         assertNull(DriverSuggestion.suggest(listOf(a8), "Adreno (TM) 740"))
     }
+
+    @Test fun optionalCommunitySourcesCoverArmsx2TurnipAndMalisx2() {
+        assertEquals("K11MCH1/AdrenoToolsDrivers", DriverSources.DEFAULT)
+        assertEquals(listOf(DriverSources.ARMSX2_TURNIP, DriverSources.MALISX2), DriverSources.SUGGESTED.map { it.repo })
+        assertEquals(DriverSources.ARMSX2_TURNIP, DriverSources.parse(DriverSources.ARMSX2_TURNIP))
+        assertEquals(DriverSources.MALISX2, DriverSources.parse(DriverSources.MALISX2))
+        assertEquals(listOf(DriverSources.ARMSX2_TURNIP), DriverSources.suggestedForGpu("Adreno (TM) 825").map { it.repo })
+        assertEquals(listOf(DriverSources.MALISX2), DriverSources.suggestedForGpu("Immortalis-G720").map { it.repo })
+        assertEquals(2, DriverSources.suggestedForGpu(null).size)
+
+        val genericTurnip = DriverInfo("Turnip_v25.2.0.zip", "Turnip 25.2 (v25.2)", "u1", publishedAt = "2026-10-10")
+        val armsx2 = DriverInfo(
+            "armsx2-turnip-25.2.zip",
+            "armsx2-turnip (v25.2)",
+            "u2",
+            source = DriverSources.ARMSX2_TURNIP,
+            publishedAt = "2026-10-05",
+        )
+        val malisx2 = DriverInfo(
+            "malisx2-v25.2.zip",
+            "malisx2 (v25.2)",
+            "u3",
+            source = DriverSources.MALISX2,
+            publishedAt = "2026-10-08",
+        )
+        assertEquals(DriverSuggestion.Fit.FAMILY, DriverSuggestion.fit(armsx2, 740))
+        assertEquals(DriverSuggestion.Fit.FAMILY, DriverSuggestion.fit(armsx2, 825))
+        assertEquals(DriverSuggestion.Fit.ANY, DriverSuggestion.fit(armsx2, 650))
+        assertEquals(DriverSuggestion.Fit.OTHER_FAMILY, DriverSuggestion.fit(malisx2, 825))
+        assertEquals(armsx2, DriverSuggestion.suggest(listOf(genericTurnip, armsx2, malisx2), "Adreno (TM) 740"))
+        assertEquals(armsx2, DriverSuggestion.suggest(listOf(genericTurnip, armsx2, malisx2), "Turnip Adreno (TM) 830"))
+        assertEquals(malisx2, DriverSuggestion.suggest(listOf(genericTurnip, armsx2, malisx2), "Mali-G715"))
+    }
 }

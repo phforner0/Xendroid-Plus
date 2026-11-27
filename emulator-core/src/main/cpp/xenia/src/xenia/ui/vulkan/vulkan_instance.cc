@@ -24,6 +24,7 @@
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
+#include "xenia/gpu/vulkan/vulkan_driver_quirks.h"
 #include "xenia/ui/redist_installer_wx.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
@@ -168,6 +169,27 @@ DEFINE_string(turnip_perf_sampler_file, "",
               "Report path for turnip_perf_sampler. Empty writes to the app's "
               "files directory as tu_perf.log.",
               "Vulkan");
+
+DEFINE_bool(
+    vulkan_turnip_swapchain_ubwc, false,
+    "Opt-in (KGSL + custom Turnip only): export TU_SWAPCHAIN_UBWC=1 before "
+    "loading the custom Turnip driver. Boot property override: "
+    "debug.xendroid.turnip_swapchain_ubwc ('0'|'1').",
+    "Vulkan");
+DEFINE_bool(
+    vulkan_turnip_cached_coherent, false,
+    "Opt-in (KGSL + custom Turnip only): append "
+    "tu_override_uncached_as_cache_coherent=1 to FD_DEV_FEATURES (preserving "
+    "enable_tp_ubwc_flag_hint=1). Boot property override: "
+    "debug.xendroid.turnip_cached_coherent ('0'|'1').",
+    "Vulkan");
+DEFINE_string(
+    vulkan_turnip_autotune_algo, "",
+    "Opt-in diagnostic (KGSL + custom Turnip only): export TU_AUTOTUNE_ALGO "
+    "(whitelisted: 'gmem', 'sysmem', 'auto'; empty leaves unset). Boot "
+    "property override: debug.xendroid.turnip_autotune_algo. Does not change "
+    "turnip_debug='sysmem' default.",
+    "Vulkan");
 #endif
 
 DEFINE_bool(
@@ -287,6 +309,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
       setenv("TU_DEBUG", tu_debug.c_str(), 1);
       XELOGI("Set TU_DEBUG={} for the Turnip Vulkan driver", tu_debug);
     }
+    std::string custom_lib_path = cvars::vulkan_lib_path;
+    const bool has_kgsl = HasKgslDevice();
+    bool custom_lib_exists =
+        !custom_lib_path.empty() && std::filesystem::exists(custom_lib_path);
+
     // One UI and HyperOS/MIUI: their framebuffer stack needs the UBWC flag hint for
     // Turnip to sample rendered images correctly.
     // Probed unconditionally: the log has to show what the device reported even when the
@@ -295,6 +322,58 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
     std::string fd_features = cvars::fd_dev_features;
     if (fd_features.empty() && needs_ubwc_flag_hint) {
       fd_features = "enable_tp_ubwc_flag_hint=1";
+    }
+    // Opt-in armsx2-turnip env vars: strictly gated on KGSL + custom driver.
+    if (has_kgsl && custom_lib_exists) {
+      bool turnip_swapchain_ubwc = cvars::vulkan_turnip_swapchain_ubwc;
+      {
+        std::string prop = SystemProperty("debug.xendroid.turnip_swapchain_ubwc");
+        if (!prop.empty()) {
+          xe::gpu::vulkan::ParseStrictBinaryBoolProp(prop.c_str(),
+                                                     turnip_swapchain_ubwc);
+        }
+      }
+      if (turnip_swapchain_ubwc) {
+        setenv("TU_SWAPCHAIN_UBWC", "1", 0);
+        XELOGI("Set TU_SWAPCHAIN_UBWC=1 for custom Turnip driver (KGSL opt-in)");
+      }
+
+      bool turnip_cached_coherent = cvars::vulkan_turnip_cached_coherent;
+      {
+        std::string prop = SystemProperty("debug.xendroid.turnip_cached_coherent");
+        if (!prop.empty()) {
+          xe::gpu::vulkan::ParseStrictBinaryBoolProp(prop.c_str(),
+                                                     turnip_cached_coherent);
+        }
+      }
+      if (turnip_cached_coherent) {
+        fd_features = xe::gpu::vulkan::AppendFdDevFeature(
+            fd_features, "tu_override_uncached_as_cache_coherent=1");
+        XELOGI(
+            "Enabled tu_override_uncached_as_cache_coherent=1 in "
+            "FD_DEV_FEATURES for custom Turnip driver (KGSL opt-in)");
+      }
+
+      std::string autotune_algo = cvars::vulkan_turnip_autotune_algo;
+      {
+        std::string prop = SystemProperty("debug.xendroid.turnip_autotune_algo");
+        if (!prop.empty()) {
+          autotune_algo = prop;
+        }
+      }
+      if (!autotune_algo.empty()) {
+        if (xe::gpu::vulkan::IsValidTurnipAutotuneAlgo(autotune_algo.c_str())) {
+          setenv("TU_AUTOTUNE_ALGO", autotune_algo.c_str(), 0);
+          XELOGI(
+              "Set TU_AUTOTUNE_ALGO={} for custom Turnip driver (KGSL opt-in)",
+              autotune_algo);
+        } else {
+          XELOGW(
+              "Ignoring unsupported vulkan_turnip_autotune_algo='{}' "
+              "(allowed: gmem, sysmem, auto)",
+              autotune_algo);
+        }
+      }
     }
     if (!fd_features.empty() && fd_features != "none") {
       setenv("FD_DEV_FEATURES", fd_features.c_str(), 1);
@@ -323,10 +402,6 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
              cvars::turnip_perf_sampler,
              cvars::turnip_perf_sampler_period_ms);
     }
-    std::string custom_lib_path = cvars::vulkan_lib_path;
-    const bool has_kgsl = HasKgslDevice();
-    bool custom_lib_exists =
-        !custom_lib_path.empty() && std::filesystem::exists(custom_lib_path);
     if (custom_lib_exists) {
       std::string hook_dir = g_native_lib_dir + '/';
       const size_t slash_pos = custom_lib_path.find_last_of('/');
