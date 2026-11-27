@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "xenia/cpu/backend/a64/a64_direct_call.h"
 #include "xenia/cpu/backend/code_cache_base.h"
 
 namespace xe {
@@ -36,6 +37,7 @@ class A64CodeCache : public CodeCacheBase<A64CodeCache> {
   void FillCode(void* write_address, size_t size);
   void FlushCodeRange(void* write_address, void* execute_address, size_t size);
   void FlushPatchedInstruction(void* write_address, void* execute_address);
+  size_t PreferredEntryAlignment(size_t code_size) const;
 
   // Direct call site registry for atomic bl/b <rel26> back-patching and
   // rollback on InvalidateCodeRange / ForgetSymbol.
@@ -55,6 +57,16 @@ class A64CodeCache : public CodeCacheBase<A64CodeCache> {
                               uintptr_t call_site_rx,
                               void* target_execute_address);
   void RevertDirectCallSitesInRange(uint32_t guest_start, uint32_t guest_end);
+
+  // 1-slot monomorphic PIC registry for CallIndirect (bctrl) with 2-stage
+  // 1-word atomic CMODX publication and safe fallback rollback.
+  void RegisterIndirectCallPicSite(uintptr_t gate_rx, uintptr_t cmp_lo_rx,
+                                   uintptr_t cmp_hi_rx, uintptr_t call_op_rx,
+                                   uintptr_t fallback_rx, bool is_tail);
+  bool TryPatchIndirectCallPicSite(uintptr_t gate_rx,
+                                   uint32_t target_guest_addr,
+                                   void* target_execute_address);
+  bool FallbackIndirectCallPicSite(uintptr_t gate_rx);
 
   // Writes one simpleperf "generic JIT symbols" map entry per placed
   // function (perf-<pid>.map) so profilers can attribute guest code by name
@@ -84,6 +96,10 @@ class A64CodeCache : public CodeCacheBase<A64CodeCache> {
       pending_direct_call_sites_;
   std::unordered_map<uint32_t, std::vector<DirectCallSite>>
       patched_direct_call_sites_;
+
+  std::mutex pic_sites_mutex_;
+  std::unordered_map<uintptr_t, IndirectCallPicSite> pic_sites_by_gate_;
+  std::unordered_map<uint32_t, std::vector<uintptr_t>> patched_pic_sites_;
 };
 
 }  // namespace a64

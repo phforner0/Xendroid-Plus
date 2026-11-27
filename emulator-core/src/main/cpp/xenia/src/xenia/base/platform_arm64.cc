@@ -11,6 +11,13 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/auxv.h>
+#ifndef HWCAP_LRCPC
+#define HWCAP_LRCPC (1UL << 26)
+#endif
+#endif
+
 #include "xenia/base/cvar.h"
 #include "xenia/base/platform.h"
 #define XBYAK_NO_OP_NAMES
@@ -22,6 +29,7 @@ DEFINE_int64(a64_extension_mask, -1LL,
              "    0 = armv8.0\n"
              "    1 = Large System Extensions(LSE) atomic operations\n"
              "    2 = FPCR.FZ flushes denormal inputs (skip software flush)\n"
+             "    4 = FEAT_LRCPC (ldapr/ldaprh/ldaprb) for TSO scalar loads\n"
              "   -1 = Detect and utilize all possible processor features\n",
              "a64");
 namespace xe {
@@ -48,6 +56,19 @@ void InitFeatureFlags() {
                       Xbyak_aarch64::util::XBYAK_AARCH64_HWCAP_ATOMIC);
 #undef TEST_EMIT_FEATURE
   }
+
+#if defined(__linux__) || defined(__ANDROID__)
+  // Read AT_HWCAP bit 26 (HWCAP_LRCPC) at runtime so builds stay -march=armv8-a.
+  const uint64_t hwcap = static_cast<uint64_t>(getauxval(AT_HWCAP));
+  static_assert(HWCAP_LRCPC == kArm64HwcapLrcpcBit,
+                "HWCAP_LRCPC must match bit 26");
+  feature_flags_ |= DetectLrcpcFeatureFlag(hwcap, cvars::a64_extension_mask);
+#elif XE_PLATFORM_MAC
+  if ((static_cast<uint64_t>(cvars::a64_extension_mask) & kA64EmitLRCPC) ==
+      kA64EmitLRCPC) {
+    feature_flags_ |= kA64EmitLRCPC;
+  }
+#endif
 
   // Detect whether FPCR.FZ flushes denormal float32 inputs to zero.
   // The ARM spec says input flushing is implementation-defined.

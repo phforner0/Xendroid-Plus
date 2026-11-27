@@ -21,6 +21,7 @@
 #include "xenia/base/profiling.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_code_cache.h"
+#include "xenia/cpu/backend/a64/a64_direct_call.h"
 #include "xenia/cpu/backend/a64/a64_function.h"
 #include "xenia/cpu/backend/a64/a64_hle_sync_layout.h"
 #include "xenia/cpu/backend/a64/a64_sequences.h"
@@ -40,6 +41,28 @@ DECLARE_bool(a64_enable_host_guest_stack_synchronization);
 DECLARE_bool(a64_near_branches);
 DECLARE_bool(a64_direct_calls);
 DECLARE_bool(a64_skip_stack_skew_fixup);
+DECLARE_bool(a64_align_hot_code);
+
+DEFINE_bool(
+    a64_indirect_call_pic, false,
+    "Enable 1-slot monomorphic PIC for indirect guest calls (bctrl) using "
+    "2-stage 1-word atomic CMODX patching. Overridable on Android via "
+    "debug.xendroid.a64_indirect_call_pic=0|1.",
+    "CPU");
+
+DEFINE_bool(
+    a64_lrcpc_tso, false,
+    "Use ARMv8.3-A FEAT_LRCPC (ldaprb/ldaprh/ldapr) for scalar LOAD and "
+    "LOAD_OFFSET when a64_guest_memory_tso is enabled and HWCAP_LRCPC is "
+    "present. Overridable on Android via debug.xendroid.a64_lrcpc_tso=0|1.",
+    "CPU");
+
+DEFINE_bool(
+    a64_skip_low_addr_skew_fixup, false,
+    "Extend 16 KB host physical-skew fixup elision to proven < 0xA0000000 "
+    "constant/lis and SDA (r13) addresses. Overridable on Android via "
+    "debug.xendroid.a64_low_addr_skew=0|1.",
+    "CPU");
 
 DEFINE_bool(
     log_safepoint_pc, false,
@@ -148,6 +171,15 @@ A64Emitter::A64Emitter(A64Backend* backend, XbyakA64Allocator* allocator)
 
 A64Emitter::~A64Emitter() = default;
 
+bool A64Emitter::UseLrcpcForTsoLoad(const hir::Instr* instr) const {
+  if (!instr || !instr->dest) {
+    return false;
+  }
+  return ShouldUseLrcpcForTsoLoad(cvars::a64_guest_memory_tso,
+                                  cvars::a64_lrcpc_tso, feature_flags_,
+                                  instr->GetOpcodeNum(), instr->dest->type);
+}
+
 bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
                       uint32_t debug_info_flags, FunctionDebugInfo* debug_info,
                       void** out_code_address, size_t* out_code_size,
@@ -188,6 +220,18 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
     uses_no_skew = false;
   }
   uses_stack_skew_skip_ = allow_skew_skip && uses_no_skew;
+  uses_r13_skew_guard_ = false;
+  r13_skew_guard_needs_low_bound_ = false;
+  if (xe::memory::allocation_granularity() > 0x1000 &&
+      cvars::a64_skip_low_addr_skew_fixup && !forbid_skew_skip) {
+    LowAddrSkewSummary low_addr_summary{};
+    MarkLowAddrNoPhysicalSkew(builder, &low_addr_summary);
+    if (low_addr_summary.marked_r13_ops > 0) {
+      uses_r13_skew_guard_ = true;
+      r13_skew_guard_needs_low_bound_ =
+          low_addr_summary.r13_requires_negative_headroom;
+    }
+  }
   uses_stackpoints_ = MakesCall(builder);
 
   EmitFunctionInfo func_info = {};
@@ -202,6 +246,11 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
     source_map_arena_.Reset();
     tail_code_.clear();
     pending_direct_calls_.clear();
+    pending_indirect_call_pics_.clear();
+    entry_offset_mod_4k_ =
+        cvars::a64_align_hot_code
+            ? (code_cache_->predicted_next_code_offset(64u) & 0xFFFu)
+            : 0u;
     fpcr_mode_ = FPCRMode::Unknown;
     func_info = {};
     try {
@@ -223,6 +272,9 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   }
   near_branches_ = false;
   uses_stack_skew_skip_ = false;
+  uses_r13_skew_guard_ = false;
+  r13_skew_guard_needs_low_bound_ = false;
+  entry_offset_mod_4k_ = 0;
   uses_stackpoints_ = true;
   if (!emitted) {
     // Emplace only runs on success, so a failed compile has to reset too.
@@ -303,12 +355,11 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
   // Record stackpoint for longjmp recovery.
   PushStackpoint();
 
-  if (uses_stack_skew_skip_) {
-    // Guard entry r1 against [0x70000000, 0x7F000000). On a 16 KB host, any
-    // call entering with r1 outside the guest stack window pops the frame and
-    // re-emits this function without LOAD_STORE_NO_PHYSICAL_SKEW.
-    static_assert(kR1ContextOffset < 16380,
-                  "r[1] offset must fit A64 ldr unsigned imm12");
+  if (uses_stack_skew_skip_ || uses_r13_skew_guard_) {
+    // Guard entry r1 against [0x70000000, 0x7F000000) and/or entry r13 (SDA)
+    // against < 0x90000000 (with >= 0x00100000 when negative offsets exist).
+    // On a 16 KB host, any call entering outside the safe range pops the frame
+    // and re-emits this function without LOAD_STORE_NO_PHYSICAL_SKEW.
     auto& fallback_label = AddToTail([](A64Emitter& e, Label&) {
       e.PopStackpoint();
       e.ldr(e.x0,
@@ -326,12 +377,32 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
                       e.backend()->reemit_without_stack_skew_thunk()));
       e.br(e.x9);
     });
-    ldr(w17, ptr(x20, static_cast<uint32_t>(kR1ContextOffset)));
-    mov(w16, ppc::kGuestStackRangeBegin);
-    sub(w17, w17, w16);
-    mov(w16, ppc::kGuestStackRangeEnd - ppc::kGuestStackRangeBegin);
-    cmp(w17, w16);
-    b(HS, fallback_label);
+    if (uses_stack_skew_skip_) {
+      static_assert(kR1ContextOffset < 16380,
+                    "r[1] offset must fit A64 ldr unsigned imm12");
+      ldr(w17, ptr(x20, static_cast<uint32_t>(kR1ContextOffset)));
+      mov(w16, ppc::kGuestStackRangeBegin);
+      sub(w17, w17, w16);
+      mov(w16, ppc::kGuestStackRangeEnd - ppc::kGuestStackRangeBegin);
+      cmp(w17, w16);
+      b(HS, fallback_label);
+    }
+    if (uses_r13_skew_guard_) {
+      static_assert(kR13ContextOffset < 16380,
+                    "r[13] offset must fit A64 ldr unsigned imm12");
+      ldr(w17, ptr(x20, static_cast<uint32_t>(kR13ContextOffset)));
+      if (r13_skew_guard_needs_low_bound_) {
+        mov(w16, kLowAddrSdaMinWithNegOffset);
+        sub(w17, w17, w16);
+        mov(w16, kLowAddrSdaCeiling - kLowAddrSdaMinWithNegOffset);
+        cmp(w17, w16);
+        b(HS, fallback_label);
+      } else {
+        mov(w16, kLowAddrSdaCeiling);
+        cmp(w17, w16);
+        b(HS, fallback_label);
+      }
+    }
   }
 
   // ========================================================================
@@ -408,6 +479,57 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
     EmitLoadPinnedSlots(*region);
   }
 
+  // Identify loop header blocks (targets of HIR back-edges or loop_promotion_plan
+  // headers) when hot-code alignment is active so we can align them to 32 B and
+  // nudge headers landing in the last 64 B of a 4 KB page across the boundary.
+  std::unordered_set<const hir::Block*> loop_header_blocks;
+  if (cvars::a64_align_hot_code) {
+    if (!loop_plan.empty()) {
+      for (const auto& region : loop_plan.regions) {
+        if (region.header) {
+          loop_header_blocks.insert(region.header);
+        }
+      }
+    }
+    std::unordered_map<const hir::Block*, size_t> block_order;
+    size_t idx = 0;
+    for (const hir::Block* b = builder->first_block(); b; b = b->next) {
+      block_order.emplace(b, idx++);
+    }
+    idx = 0;
+    for (const hir::Block* b = builder->first_block(); b; b = b->next, ++idx) {
+      for (const hir::Edge* e = b->outgoing_edge_head; e;
+           e = e->outgoing_next) {
+        if (e->dest) {
+          auto it = block_order.find(e->dest);
+          if (it != block_order.end() && it->second <= idx) {
+            loop_header_blocks.insert(e->dest);
+          }
+        }
+      }
+      for (const hir::Instr* bi = b->instr_tail; bi; bi = bi->prev) {
+        const hir::Opcode bop = bi->GetOpcodeNum();
+        const hir::Block* target_block = nullptr;
+        if (bop == hir::OPCODE_BRANCH && bi->src1.label) {
+          target_block = bi->src1.label->block;
+        } else if ((bop == hir::OPCODE_BRANCH_TRUE ||
+                    bop == hir::OPCODE_BRANCH_FALSE) &&
+                   bi->src2.label) {
+          target_block = bi->src2.label->block;
+        } else if (bop != hir::OPCODE_COMMENT &&
+                   bop != hir::OPCODE_SOURCE_OFFSET) {
+          break;
+        }
+        if (target_block) {
+          auto it = block_order.find(target_block);
+          if (it != block_order.end() && it->second <= idx) {
+            loop_header_blocks.insert(target_block);
+          }
+        }
+      }
+    }
+  }
+
   // Walk HIR blocks and emit ARM64 instructions.
   auto block = builder->first_block();
   synchronize_stack_on_next_instruction_ = false;
@@ -415,6 +537,16 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
     // Reset FPCR tracking on each block entry (we don't know which
     // predecessor ran, so mode is unknown).
     ForgetFpcrMode();
+
+    // Align loop headers BEFORE binding labels so back-edges land on the
+    // aligned instruction and fall-through entries slide cleanly over NOPs.
+    if (!loop_header_blocks.empty() && loop_header_blocks.count(block) != 0) {
+      const size_t pad_bytes = ComputeLoopHeaderAlignmentPaddingBytes(
+          getSize(), entry_offset_mod_4k_);
+      for (size_t i = 0; i < pad_bytes; i += sizeof(uint32_t)) {
+        nop();
+      }
+    }
 
     // Bind all labels targeting this block.
     auto label = block->label_head;
@@ -474,8 +606,9 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
       bool selected = false;
       const bool handoff_pending = sequence_handoff_pending();
       const hir::Opcode opcode = instr->GetOpcodeNum();
+      const bool use_lrcpc_tso = UseLrcpcForTsoLoad(instr);
       const bool tso_load =
-          cvars::a64_guest_memory_tso &&
+          cvars::a64_guest_memory_tso && !use_lrcpc_tso &&
           (opcode == hir::OPCODE_LOAD || opcode == hir::OPCODE_LOAD_OFFSET ||
            opcode == hir::OPCODE_LVL || opcode == hir::OPCODE_LVR ||
            opcode == hir::OPCODE_RESERVED_LOAD);
@@ -672,6 +805,21 @@ void* A64Emitter::Emplace(const EmitFunctionInfo& func_info,
     }
   }
 
+  if (function && !pending_indirect_call_pics_.empty()) {
+    const uintptr_t base_rx = reinterpret_cast<uintptr_t>(new_execute_address);
+    for (const auto& entry : pending_indirect_call_pics_) {
+      if (entry.fallback_code_offset == SIZE_MAX) {
+        continue;
+      }
+      code_cache_->RegisterIndirectCallPicSite(
+          base_rx + entry.gate_code_offset,
+          base_rx + entry.cmp_lo_code_offset,
+          base_rx + entry.cmp_hi_code_offset,
+          base_rx + entry.call_op_code_offset,
+          base_rx + entry.fallback_code_offset, entry.is_tail);
+    }
+  }
+
   // In xbyak_aarch64, labels are resolved at define time (backpatching),
   // so all relative offsets are already correct. We just need to reset
   // the codegen state for the next function.
@@ -684,6 +832,7 @@ void A64Emitter::ResetPerFunctionState() {
   reset();
   tail_code_.clear();
   pending_direct_calls_.clear();
+  pending_indirect_call_pics_.clear();
 
   // Clean up cached labels.
   epilog_label_ = nullptr;
@@ -1045,6 +1194,178 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     ldr(w0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
     cmp(target_w, w0);
     b(EQ, epilog_label());
+  }
+
+  // 1-slot monomorphic PIC for virtual/indirect calls (bctrl) using 2-stage
+  // 1-word atomic CMODX publication (gate: b pic_miss_stub -> NOP).
+  const bool is_tail_call = (instr->flags & hir::CALL_TAIL) != 0;
+  if (cvars::a64_indirect_call_pic &&
+      !(instr->flags & hir::CALL_POSSIBLE_RETURN) &&
+      code_cache_->has_indirection_table() && near_branches_ &&
+      (!is_tail_call || !processor()->dynamic_code_enabled())) {
+    if (target_w.getIdx() != w16.getIdx()) {
+      mov(w16, target_w);
+    }
+    Label& gate_label = NewCachedLabel();
+    Label& pic_done = NewCachedLabel();
+    const size_t pic_idx = pending_indirect_call_pics_.size();
+    const bool dynamic_code = processor()->dynamic_code_enabled();
+    const bool encoded_indirection = code_cache_->encoded_indirection();
+    const uint64_t patch_pic_thunk =
+        reinterpret_cast<uint64_t>(backend()->patch_indirect_call_pic_thunk());
+    const uint64_t resolve_thunk =
+        reinterpret_cast<uint64_t>(backend()->resolve_function_thunk());
+
+    Label& pic_fallback_lookup = AddToTail(
+        [pic_idx, &pic_done, is_tail_call, dynamic_code, encoded_indirection,
+         resolve_thunk](A64Emitter& e, Label&) {
+          e.SetPendingIndirectCallPicFallbackOffset(pic_idx, e.getSize());
+          Label* target_ready = nullptr;
+          if (dynamic_code) {
+            target_ready = &e.NewCachedLabel();
+            Label& resolve_natively = e.NewCachedLabel();
+            e.mov(e.w14, e.code_cache_->indirection_guest_base());
+            e.sub(e.w14, e.w16, e.w14);
+            e.mov(e.w15, e.code_cache_->indirection_guest_size());
+            e.cmp(e.w14, e.w15);
+            e.b(HS, resolve_natively);
+
+            if (!encoded_indirection) {
+              e.ldr(e.w9, ptr(e.x16, static_cast<uint32_t>(0)));
+            } else {
+              Label external_target;
+              Label indirection_ready;
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   indirection_table_base_bias))));
+              e.add(e.x14, e.x14, e.w16, UXTW);
+              e.ldr(e.w9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.tbnz(e.w9, 31, external_target);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   code_cache_execute_base))));
+              e.add(e.x9, e.x14, e.w9, UXTW);
+              e.CodeGenerator::b(indirection_ready);
+              e.L(external_target);
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   external_indirection_table_base))));
+              e.lsl(e.x15, e.x15, 3);
+              e.add(e.x14, e.x14, e.x15);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.L(indirection_ready);
+            }
+            e.CodeGenerator::b(*target_ready);
+
+            e.L(resolve_natively);
+            e.EmitDynamicCallLookup(is_tail_call);
+            e.L(*target_ready);
+          } else {
+            Label uncovered;
+            Label slot_ready;
+            if (e.code_cache_->indirection_guest_base() == 0x80000000u &&
+                e.code_cache_->indirection_guest_size() == 0x1FFFFFFFu) {
+              e.eor(e.w14, e.w16, 0x80000000u);
+              e.tst(e.w14, 0xE0000000u);
+              e.b_near(NE, uncovered);
+            } else {
+              e.mov(e.w14, e.code_cache_->indirection_guest_base());
+              e.sub(e.w14, e.w16, e.w14);
+              e.mov(e.w15, e.code_cache_->indirection_guest_size());
+              e.cmp(e.w14, e.w15);
+              e.b_near(HS, uncovered);
+            }
+            if (!encoded_indirection) {
+              e.ldr(e.w9, ptr(e.x16, static_cast<uint32_t>(0)));
+            } else {
+              Label external_target;
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   indirection_table_base_bias))));
+              e.add(e.x14, e.x14, e.w16, UXTW);
+              e.ldr(e.w9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.tbnz(e.w9, 31, external_target);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   code_cache_execute_base))));
+              e.add(e.x9, e.x14, e.w9, UXTW);
+              e.CodeGenerator::b(slot_ready);
+              e.L(external_target);
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   external_indirection_table_base))));
+              e.lsl(e.x15, e.x15, 3);
+              e.add(e.x14, e.x14, e.x15);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+            }
+            e.CodeGenerator::b(slot_ready);
+            e.L(uncovered);
+            e.mov(e.x9, resolve_thunk);
+            e.L(slot_ready);
+          }
+          if (!is_tail_call) {
+            e.ldr(e.x0, ptr(e.sp, static_cast<uint32_t>(
+                                      StackLayout::GUEST_CALL_RET_ADDR)));
+            e.adr(e.x30, pic_done);
+          }
+          e.br(e.x9);
+        });
+
+    Label& pic_miss_stub = AddToTail(
+        [&gate_label, &pic_done, is_tail_call, patch_pic_thunk](A64Emitter& e,
+                                                                Label&) {
+          if (!is_tail_call) {
+            e.adr(e.x30, pic_done);
+          }
+          e.adr(e.x17, gate_label);
+          e.mov(e.x9, patch_pic_thunk);
+          e.br(e.x9);
+        });
+
+    if (is_tail_call) {
+      PopStackpoint();
+      ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+      ldr(x30, ptr(sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
+      if (stack_size() <= 4095) {
+        add(sp, sp, static_cast<uint32_t>(stack_size()));
+      } else {
+        mov(x17, static_cast<uint64_t>(stack_size()));
+        add(sp, sp, x17, UXTX);
+      }
+    } else {
+      ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
+    }
+
+    L(gate_label);
+    const size_t gate_code_offset = getSize();
+    CodeGenerator::b(pic_miss_stub);
+    const size_t cmp_lo_code_offset = getSize();
+    movz(w14, 0);
+    const size_t cmp_hi_code_offset = getSize();
+    movk(w14, 0, 16);
+    cmp(w16, w14);
+    b_near(NE, pic_fallback_lookup);
+    const size_t call_op_code_offset = getSize();
+    if (is_tail_call) {
+      CodeGenerator::b(pic_fallback_lookup);
+    } else {
+      CodeGenerator::bl(pic_fallback_lookup);
+      L(pic_done);
+      synchronize_stack_on_next_instruction_ = true;
+    }
+
+    pending_indirect_call_pics_.push_back(
+        {gate_code_offset, cmp_lo_code_offset, cmp_hi_code_offset,
+         call_op_code_offset, SIZE_MAX, is_tail_call});
+    return;
   }
 
   // Load host code address from indirection table.

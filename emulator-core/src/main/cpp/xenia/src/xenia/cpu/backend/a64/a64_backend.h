@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -19,6 +20,7 @@
 
 #include "xenia/base/bit_map.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/mutex.h"
 #include "xenia/cpu/backend/backend.h"
 
@@ -199,6 +201,9 @@ class A64Backend : public Backend {
     return resolve_function_thunk_;
   }
   void* patch_direct_call_thunk() const { return patch_direct_call_thunk_; }
+  void* patch_indirect_call_pic_thunk() const {
+    return patch_indirect_call_pic_thunk_;
+  }
   void* reemit_without_stack_skew_thunk() const {
     return reemit_without_stack_skew_thunk_;
   }
@@ -289,6 +294,7 @@ class A64Backend : public Backend {
   GuestToHostThunk guest_to_host_thunk_no_vec_ = nullptr;
   ResolveFunctionThunk resolve_function_thunk_ = nullptr;
   void* patch_direct_call_thunk_ = nullptr;
+  void* patch_indirect_call_pic_thunk_ = nullptr;
   void* reemit_without_stack_skew_thunk_ = nullptr;
   void* synchronize_guest_and_host_stack_helper_ = nullptr;
   void* return_to_host_helper_ = nullptr;
@@ -307,7 +313,12 @@ class A64Backend : public Backend {
  private:
   alignas(64) ReserveHelper reserve_helper_;
   BitMap guest_trampoline_address_bitmap_;
-  uint8_t* guest_trampoline_memory_ = nullptr;
+  xe::memory::FileMappingHandle guest_trampoline_mapping_ =
+      xe::memory::kFileMappingHandleInvalid;
+  std::filesystem::path guest_trampoline_mapping_name_;
+  size_t guest_trampoline_mapping_size_ = 0;
+  uint8_t* guest_trampoline_execute_memory_ = nullptr;
+  uint8_t* guest_trampoline_write_memory_ = nullptr;
   bool guest_trampolines_sub4gb_ = false;
   mutable std::mutex stack_skew_forbid_mutex_;
   std::unordered_set<uint32_t> forbid_stack_skew_skip_addresses_;

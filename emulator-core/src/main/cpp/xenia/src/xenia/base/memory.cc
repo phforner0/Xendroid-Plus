@@ -8,9 +8,16 @@
  */
 
 #include "xenia/base/memory.h"
+
+#include <mutex>
+
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
+
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 #if XE_ARCH_ARM64
 #include <arm_neon.h>
@@ -22,12 +29,58 @@ DEFINE_bool(
     "behavior on platforms where that's not supported",
     "Memory");
 
+DEFINE_bool(
+    a64_wx_dual_mapping, false,
+    "Use W^X dual-mapping (r-xs + rw-s via memfd_create/ASharedMemory) for JIT "
+    "code cache and guest trampolines after live SELinux probe. Overridable on "
+    "Android via debug.xendroid.jit_wx=0|1.",
+    "Memory");
+
 namespace xe {
 namespace memory {
 
+namespace {
+bool IsWxDualMappingRequested() {
+  static std::once_flag prop_once;
+  std::call_once(prop_once, []() {
+#if defined(__ANDROID__)
+    char prop_value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.jit_wx", prop_value) > 0) {
+      bool parsed = false;
+      if (ParseStrictBoolProp(prop_value, &parsed)) {
+        cvars::a64_wx_dual_mapping = parsed;
+        XELOGI("debug.xendroid.jit_wx: a64_wx_dual_mapping = {}",
+               parsed ? "true" : "false");
+      }
+    }
+#endif
+  });
+  return cvars::a64_wx_dual_mapping;
+}
+}  // namespace
+
+#if XE_PLATFORM_WIN32
+DualMappingWxBackend ProbeDualMappingWxSupport() {
+  return DualMappingWxBackend::kUnsupported;
+}
+#endif
+
 bool IsWritableExecutableMemoryPreferred() {
-  return IsWritableExecutableMemorySupported() &&
-         cvars::writable_executable_memory;
+  if (!IsWritableExecutableMemorySupported()) {
+    (void)ProbeDualMappingWxSupport();
+    return false;
+  }
+  const bool wx_requested =
+      IsWxDualMappingRequested() || !cvars::writable_executable_memory;
+  if (wx_requested) {
+    const DualMappingWxBackend backend = ProbeDualMappingWxSupport();
+    if (ShouldActivateWxDualMapping(true, backend)) {
+      return false;
+    }
+    // Live probe failed (e.g., SELinux blocked r-xs + rw-s): clean RWX fallback.
+    return true;
+  }
+  return true;
 }
 
 using xe::swcache::CacheLine;

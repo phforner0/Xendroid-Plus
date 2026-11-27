@@ -168,6 +168,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   bool IsFeatureEnabled(uint64_t feature_flag) const {
     return (feature_flags_ & feature_flag) == feature_flag;
   }
+  bool UseLrcpcForTsoLoad(const hir::Instr* instr) const;
 
   Xbyak_aarch64::Label& AddToTail(TailEmitCallback callback,
                                   uint32_t alignment = 0);
@@ -340,8 +341,23 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     }
   }
 
+  struct PendingIndirectCallPic {
+    size_t gate_code_offset = 0;
+    size_t cmp_lo_code_offset = 0;
+    size_t cmp_hi_code_offset = 0;
+    size_t call_op_code_offset = 0;
+    size_t fallback_code_offset = SIZE_MAX;
+    bool is_tail = false;
+  };
+  void SetPendingIndirectCallPicFallbackOffset(size_t index, size_t offset) {
+    if (index < pending_indirect_call_pics_.size()) {
+      pending_indirect_call_pics_[index].fallback_code_offset = offset;
+    }
+  }
+
   std::vector<TailEmitter> tail_code_;
   std::vector<PendingDirectCall> pending_direct_calls_;
+  std::vector<PendingIndirectCallPic> pending_indirect_call_pics_;
   std::vector<Xbyak_aarch64::Label*> label_cache_;
 
   // v128 constants needing a literal, with labels owned by label_cache_.
@@ -365,7 +381,10 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // the long-range form).
   bool near_branches_ = false;
   bool uses_stack_skew_skip_ = false;
+  bool uses_r13_skew_guard_ = false;
+  bool r13_skew_guard_needs_low_bound_ = false;
   bool uses_stackpoints_ = true;
+  size_t entry_offset_mod_4k_ = 0;
 };
 
 }  // namespace a64

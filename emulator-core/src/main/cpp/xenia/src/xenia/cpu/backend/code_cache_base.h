@@ -157,17 +157,20 @@ class CodeCacheBase : public CodeCache {
   }
 
   uint32_t* WriteSlotForExecuteAddress(uintptr_t execute_address) const {
-    if (!generated_code_write_base_ || !IsInExecuteRange(execute_address)) {
-      return nullptr;
-    }
-    const uintptr_t offset =
-        execute_address -
-        reinterpret_cast<uintptr_t>(generated_code_execute_base_);
-    if (offset + sizeof(uint32_t) >
-        generated_code_commit_mark_.load(std::memory_order_acquire)) {
-      return nullptr;
-    }
-    return reinterpret_cast<uint32_t*>(generated_code_write_base_ + offset);
+    return xe::memory::TranslateCodeCacheWriteSlot(
+        execute_address,
+        reinterpret_cast<uintptr_t>(generated_code_execute_base_),
+        reinterpret_cast<uintptr_t>(generated_code_write_base_),
+        kGeneratedCodeSize,
+        generated_code_commit_mark_.load(std::memory_order_acquire));
+  }
+
+  // Approximate next code-cache offset aligned to |alignment| (for predicting
+  // entry_offset mod 4096 during emission before PlaceGuestCode runs).
+  size_t predicted_next_code_offset(size_t alignment) const {
+    const size_t hint =
+        generated_code_offset_hint_.load(std::memory_order_relaxed);
+    return alignment ? xe::round_up(hint, alignment) : hint;
   }
 
   bool has_indirection_table() { return indirection_table_base_ != nullptr; }
@@ -511,6 +514,15 @@ class CodeCacheBase : public CodeCache {
     {
       auto global_lock = global_critical_region_.Acquire();
 
+      const size_t entry_alignment =
+          self().PreferredEntryAlignment(func_info.code_size.total);
+      const size_t pad_start_offset = generated_code_offset_;
+      const size_t aligned_entry_offset =
+          entry_alignment > 16
+              ? xe::round_up(pad_start_offset, entry_alignment)
+              : pad_start_offset;
+      generated_code_offset_ = aligned_entry_offset;
+
       code_execute_address =
           generated_code_execute_base_ + generated_code_offset_;
       code_execute_address_out = code_execute_address;
@@ -531,6 +543,7 @@ class CodeCacheBase : public CodeCache {
 
       size_t high_mark = generated_code_offset_;
       CheckCapacity(high_mark);
+      generated_code_offset_hint_.store(high_mark, std::memory_order_relaxed);
 
       generated_code_map_.emplace_back(
           (uint64_t(code_execute_address - generated_code_execute_base_)
@@ -552,6 +565,12 @@ class CodeCacheBase : public CodeCache {
       }
 #endif
 
+      // Fill any pre-entry alignment gap with arch-specific trap instructions.
+      if (aligned_entry_offset > pad_start_offset) {
+        self().FillCode(generated_code_write_base_ + pad_start_offset,
+                        aligned_entry_offset - pad_start_offset);
+      }
+
       // Copy code.
       std::memcpy(code_write_address, machine_code, func_info.code_size.total);
 
@@ -571,7 +590,22 @@ class CodeCacheBase : public CodeCache {
       }
 #endif
 
-      // Flush I-cache for code and fill regions.
+      // Flush I-cache for any alignment padding, code, and fill regions.
+      if (aligned_entry_offset > pad_start_offset) {
+        auto pad_write_address = generated_code_write_base_ + pad_start_offset;
+        auto pad_execute_address =
+            generated_code_execute_base_ + pad_start_offset;
+        const size_t pad_size = aligned_entry_offset - pad_start_offset;
+        if constexpr (requires {
+                        self().FlushCodeRange(pad_write_address,
+                                              pad_execute_address, pad_size);
+                      }) {
+          self().FlushCodeRange(pad_write_address, pad_execute_address,
+                                pad_size);
+        } else {
+          self().FlushCodeRange(pad_write_address, pad_size);
+        }
+      }
       if constexpr (requires {
                       self().FlushCodeRange(code_write_address,
                                             code_execute_address,
@@ -611,13 +645,17 @@ class CodeCacheBase : public CodeCache {
 
   uint32_t PlaceData(const void* data, size_t length) {
     size_t high_mark;
-    uint8_t* data_address = nullptr;
+    uint8_t* data_write_address = nullptr;
+    uint8_t* data_execute_address = nullptr;
     {
       auto global_lock = global_critical_region_.Acquire();
-      data_address = generated_code_write_base_ + generated_code_offset_;
+      data_write_address = generated_code_write_base_ + generated_code_offset_;
+      data_execute_address =
+          generated_code_execute_base_ + generated_code_offset_;
       generated_code_offset_ += xe::round_up(length, 16);
       high_mark = generated_code_offset_;
       CheckCapacity(high_mark);
+      generated_code_offset_hint_.store(high_mark, std::memory_order_relaxed);
     }
     EnsureCommitted(high_mark);
 #if XE_PLATFORM_MAC && XE_ARCH_ARM64
@@ -627,13 +665,13 @@ class CodeCacheBase : public CodeCache {
       pthread_jit_write_protect_np(0);
     }
 #endif
-    std::memcpy(data_address, data, length);
+    std::memcpy(data_write_address, data, length);
 #if XE_PLATFORM_MAC && XE_ARCH_ARM64
     if (jit_write_toggle) {
       pthread_jit_write_protect_np(1);
     }
 #endif
-    return uint32_t(uintptr_t(data_address));
+    return uint32_t(uintptr_t(data_execute_address));
   }
 
   GuestFunction* LookupFunction(uint64_t host_pc) override {
@@ -706,6 +744,9 @@ class CodeCacheBase : public CodeCache {
   // Default no-op for the OnCodePlaced hook.
   void OnCodePlaced(uint32_t guest_address, GuestFunction* function_info,
                     void* code_execute_address, size_t code_size) {}
+  // Default function entry alignment (16 B). Derived caches (e.g. A64CodeCache)
+  // can override to 64 B for hot functions when a64_align_hot_code is active.
+  size_t PreferredEntryAlignment(size_t /*code_size*/) const { return 16; }
 
   std::filesystem::path file_name_;
   xe::memory::FileMappingHandle mapping_ =
@@ -716,6 +757,7 @@ class CodeCacheBase : public CodeCache {
   uint8_t* generated_code_execute_base_ = nullptr;
   uint8_t* generated_code_write_base_ = nullptr;
   size_t generated_code_offset_ = 0;
+  std::atomic<size_t> generated_code_offset_hint_ = {0};
   // Last 64 MiB step logged by CheckCapacity.
   size_t capacity_log_mark_ = 0;
   std::atomic<size_t> generated_code_commit_mark_ = {0};
@@ -753,13 +795,14 @@ class CodeCacheBase : public CodeCache {
 
   void EnsureCommitted(size_t high_mark) {
     using namespace xe::literals;
-    size_t old_commit_mark, new_commit_mark;
-    do {
-      old_commit_mark = generated_code_commit_mark_;
-      if (high_mark <= old_commit_mark) {
-        break;
-      }
-      new_commit_mark = old_commit_mark + 16_MiB;
+    size_t old_commit_mark =
+        generated_code_commit_mark_.load(std::memory_order_acquire);
+    while (high_mark > old_commit_mark) {
+      const size_t new_commit_mark =
+          xe::memory::ComputeCodeCacheNextCommitMark(
+              old_commit_mark, high_mark, static_cast<size_t>(16_MiB),
+              kGeneratedCodeSize);
+#if XE_PLATFORM_WIN32
       if (generated_code_execute_base_ == generated_code_write_base_) {
         xe::memory::AllocFixed(generated_code_execute_base_, new_commit_mark,
                                xe::memory::AllocationType::kCommit,
@@ -772,8 +815,19 @@ class CodeCacheBase : public CodeCache {
                                xe::memory::AllocationType::kCommit,
                                xe::memory::PageAccess::kReadWrite);
       }
-    } while (generated_code_commit_mark_.compare_exchange_weak(
-        old_commit_mark, new_commit_mark));
+#else
+      // On POSIX/Android, MapFileView (MAP_SHARED) and AllocFixed (MAP_JIT)
+      // already set the final PROT_READ|PROT_EXEC and PROT_READ|PROT_WRITE
+      // permissions on the full mapping; calling mprotect([0, new_commit_mark))
+      // every 16 MiB is redundant and causes VMA churn while guest threads
+      // execute concurrently.
+#endif
+      if (generated_code_commit_mark_.compare_exchange_weak(
+              old_commit_mark, new_commit_mark, std::memory_order_release,
+              std::memory_order_acquire)) {
+        break;
+      }
+    }
   }
 };
 
