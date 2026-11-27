@@ -7443,18 +7443,22 @@ bool VulkanRenderTargetCache::EnsureTransferRenderTargetsHeight(
     if (!rt) {
       return;
     }
+    auto* vulkan_rt = static_cast<VulkanRenderTarget*>(rt);
     const RenderTargetKey key = rt->key();
     const uint32_t needed_height =
         resolve_opts::ComputeTransferNeededGuestHeight(
             transfer.start_tiles, transfer.end_tiles, key.base_tiles,
             key.GetPitchTiles(), uint32_t(key.msaa_samples));
-    if (needed_height >
-        static_cast<VulkanRenderTarget*>(rt)->allocated_guest_height()) {
-      if (!EnsureRenderTargetHeight(rt, needed_height)) {
+    if (!resolve_opts::RenderTargetHeightCoversNeeded(
+            vulkan_rt->allocated_guest_height(), vulkan_rt->max_guest_height(),
+            needed_height)) {
+      const uint32_t clamped_needed =
+          std::min(needed_height, vulkan_rt->max_guest_height());
+      if (!EnsureRenderTargetHeight(rt, clamped_needed)) {
         XELOGW(
             "EnsureTransferRenderTargetsHeight: failed to grow {} RT {} to {} "
             "rows (OOM)",
-            role, key.GetDebugName(), needed_height);
+            role, key.GetDebugName(), clamped_needed);
         all_succeeded = false;
       }
     }
@@ -7465,16 +7469,20 @@ bool VulkanRenderTargetCache::EnsureTransferRenderTargetsHeight(
       continue;
     }
     if (resolve_clear_rectangle && resolve_clear_rectangle->height_pixels) {
+      auto* dest_vulkan_rt = static_cast<VulkanRenderTarget*>(dest_rt);
       const uint32_t clear_needed_height =
           resolve_clear_rectangle->y_pixels +
           resolve_clear_rectangle->height_pixels;
-      if (clear_needed_height >
-          static_cast<VulkanRenderTarget*>(dest_rt)->allocated_guest_height()) {
-        if (!EnsureRenderTargetHeight(dest_rt, clear_needed_height)) {
+      if (!resolve_opts::RenderTargetHeightCoversNeeded(
+              dest_vulkan_rt->allocated_guest_height(),
+              dest_vulkan_rt->max_guest_height(), clear_needed_height)) {
+        const uint32_t clamped_clear_height =
+            std::min(clear_needed_height, dest_vulkan_rt->max_guest_height());
+        if (!EnsureRenderTargetHeight(dest_rt, clamped_clear_height)) {
           XELOGW(
               "EnsureTransferRenderTargetsHeight: failed to grow clear dest RT "
               "{} to {} rows (OOM)",
-              dest_rt->key().GetDebugName(), clear_needed_height);
+              dest_rt->key().GetDebugName(), clamped_clear_height);
           all_succeeded = false;
         }
       }
@@ -10932,12 +10940,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       if (!rt) {
         return true;
       }
+      const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rt);
       const RenderTargetKey key = rt->key();
       const uint32_t needed = resolve_opts::ComputeTransferNeededGuestHeight(
           transfer.start_tiles, transfer.end_tiles, key.base_tiles,
           key.GetPitchTiles(), uint32_t(key.msaa_samples));
-      return static_cast<const VulkanRenderTarget*>(rt)
-                 ->allocated_guest_height() >= needed;
+      return resolve_opts::RenderTargetHeightCoversNeeded(
+          vulkan_rt->allocated_guest_height(), vulkan_rt->max_guest_height(),
+          needed);
     };
     return rt_covers(dest) && rt_covers(transfer.source) &&
            rt_covers(transfer.host_depth_source);

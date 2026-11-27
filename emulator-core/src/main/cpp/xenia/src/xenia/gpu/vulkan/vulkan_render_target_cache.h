@@ -445,6 +445,19 @@ inline uint32_t ComputeTransferNeededGuestHeight(uint32_t start_tiles,
   return tile_rows * tile_height_px;
 }
 
+// Returns whether a render target with `allocated_guest_height` and legal cap
+// `max_guest_height` covers `needed_guest_height` (clamped to max_guest_height
+// to match EnsureRenderTargetHeight(), preventing narrow or wrapped RTs already
+// at max_guest_height from being mistakenly dropped as OOM-undersized).
+constexpr bool RenderTargetHeightCoversNeeded(uint32_t allocated_guest_height,
+                                              uint32_t max_guest_height,
+                                              uint32_t needed_guest_height) {
+  const uint32_t clamped_needed =
+      max_guest_height ? std::min(needed_guest_height, max_guest_height)
+                       : needed_guest_height;
+  return allocated_guest_height >= clamped_needed;
+}
+
 // Vulkan stage/access bitmask constants mirrored for pure-logic unit tests
 // (static_asserted against Vulkan headers in vulkan_render_target_cache.cc).
 constexpr uint32_t kVkStageTopOfPipeBit = 0x00000001u;

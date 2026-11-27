@@ -458,6 +458,23 @@ void TestRtRowsOnDemandAndGrowBarriers(const fs::path& xenia_gpu) {
            0u);
   W7_CHECK(ro::ComputeTransferNeededGuestHeight(0, 16, 0, 0, ro::kMsaa1X) == 0u);
 
+  // Regression (#173): RenderTargetHeightCoversNeeded clamps needed_guest_height
+  // to max_guest_height so narrow/wrapped RTs already at max_guest_height are
+  // NEVER dropped silently, while genuine OOM-undersized RTs are still skipped.
+  const uint32_t narrow_wrap_needed =
+      ro::ComputeTransferNeededGuestHeight(0, 16, 100, 1, ro::kMsaa1X);
+  W7_CHECK(narrow_wrap_needed == 31424u);  // (2048 - 100 + 16) * 16 > 8192!
+  // 1x scale cap (max_guest_height = 8192): allocated == max -> accepted.
+  W7_CHECK(ro::RenderTargetHeightCoversNeeded(8192u, 8192u, narrow_wrap_needed));
+  // 2x scale cap (max_guest_height = 4096): allocated == max -> accepted.
+  W7_CHECK(ro::RenderTargetHeightCoversNeeded(4096u, 4096u, narrow_wrap_needed));
+  // Genuine OOM on narrow/wrapped RT (allocated < min(needed, max)) -> skipped.
+  W7_CHECK(!ro::RenderTargetHeightCoversNeeded(512u, 8192u, narrow_wrap_needed));
+  W7_CHECK(!ro::RenderTargetHeightCoversNeeded(2048u, 4096u, narrow_wrap_needed));
+  // Normal RT (needed < max): exact threshold check.
+  W7_CHECK(ro::RenderTargetHeightCoversNeeded(720u, 8192u, 720u));
+  W7_CHECK(!ro::RenderTargetHeightCoversNeeded(704u, 8192u, 720u));
+
   // 3d. ResolveGrowBarrierStates VUID-03900 & stage/access invariants.
   constexpr uint32_t kTop = ro::kVkStageTopOfPipeBit;
   constexpr uint32_t kAll = ro::kVkStageAllCommandsBit;
@@ -547,12 +564,16 @@ void TestRtRowsOnDemandAndGrowBarriers(const fs::path& xenia_gpu) {
            std::string::npos);
   W7_CHECK(ptrc_body.find("transfer_targets_tall_enough(") !=
            std::string::npos);
+  W7_CHECK(ptrc_body.find("RenderTargetHeightCoversNeeded(") !=
+           std::string::npos);
 
   const std::string ensure_body = ExtractFunctionBody(
       rtc_cc,
       "bool VulkanRenderTargetCache::EnsureTransferRenderTargetsHeight(");
   W7_CHECK(ensure_body.find("transfer.source") != std::string::npos);
   W7_CHECK(ensure_body.find("transfer.host_depth_source") != std::string::npos);
+  W7_CHECK(ensure_body.find("RenderTargetHeightCoversNeeded(") !=
+           std::string::npos);
   W7_CHECK(ensure_body.find("EnsureRenderTargetHeight(") != std::string::npos);
 
   // GrowRenderTarget uses ResolveGrowBarrierStates and flushes post-copy barrier.
