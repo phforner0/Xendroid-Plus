@@ -10,7 +10,7 @@
 //   3. Hot Code Alignment: 64 B function entry alignment (>= 64 B), 32 B loop
 //      header alignment + 4 KB anti-page-split nudge (strictly <= 64 B NOPs,
 //      never blind 4092 B alignment).
-//   4. FEAT_LRCPC in a64_guest_memory_tso: AT_HWCAP bit 26 detection honoring
+//   4. FEAT_LRCPC in a64_guest_memory_tso: AT_HWCAP bit 15 detection honoring
 //      a64_extension_mask, scalar LOAD/LOAD_OFFSET selection, exclusion of
 //      V128/LVL/LVR/RESERVED_LOAD, preserving -march=armv8-a.
 //   5. 16 KB Skew < 0xA0000000 analysis in a64_stack_skew_analysis.h:
@@ -374,7 +374,7 @@ void TestHotCodeAndLoopAlignment() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. FEAT_LRCPC HWCAP bit 26 & TSO load eligibility
+// 4. FEAT_LRCPC HWCAP bit 15 & TSO load eligibility
 // ---------------------------------------------------------------------------
 void TestLrcpcFeatureAndTsoSelection() {
   using xe::arm64::DetectLrcpcFeatureFlag;
@@ -384,9 +384,9 @@ void TestLrcpcFeatureAndTsoSelection() {
   using xe::arm64::kArm64HwcapLrcpcBit;
 
   WAVE6_4B_CHECK(kA64EmitLRCPC == (1ULL << 2));
-  WAVE6_4B_CHECK(kArm64HwcapLrcpcBit == (1ULL << 26));
+  WAVE6_4B_CHECK(kArm64HwcapLrcpcBit == (1ULL << 15));
 
-  // HWCAP bit 26 + extension mask interactions.
+  // HWCAP bit 15 (HWCAP_LRCPC) + extension mask interactions.
   WAVE6_4B_CHECK(DetectLrcpcFeatureFlag(kArm64HwcapLrcpcBit, -1LL) ==
                  kA64EmitLRCPC);
   WAVE6_4B_CHECK(DetectLrcpcFeatureFlag(0ULL, -1LL) == 0ULL);
@@ -398,7 +398,8 @@ void TestLrcpcFeatureAndTsoSelection() {
   WAVE6_4B_CHECK(DetectLrcpcFeatureFlag(
                      kArm64HwcapLrcpcBit, static_cast<int64_t>(kA64EmitLRCPC)) ==
                  kA64EmitLRCPC);
-  WAVE6_4B_CHECK(DetectLrcpcFeatureFlag(1ULL << 25, -1LL) == 0ULL);
+  WAVE6_4B_CHECK(DetectLrcpcFeatureFlag(1ULL << 14, -1LL) == 0ULL);
+  WAVE6_4B_CHECK(DetectLrcpcFeatureFlag(1ULL << 26, -1LL) == 0ULL);
 
   // Scalar LOAD and LOAD_OFFSET eligible when TSO + cvar + HWCAP all active.
   for (hir::Opcode op : {hir::OPCODE_LOAD, hir::OPCODE_LOAD_OFFSET}) {

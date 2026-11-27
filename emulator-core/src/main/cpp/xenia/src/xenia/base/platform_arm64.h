@@ -19,8 +19,9 @@ enum A64FeatureFlags : uint64_t {
   kA64EmitLRCPC = 1 << 2,
 };
 
-// Linux/Android AT_HWCAP bit 26 (HWCAP_LRCPC) for ARMv8.3-A FEAT_LRCPC.
-inline constexpr uint64_t kArm64HwcapLrcpcBit = 1ULL << 26;
+// Linux/Android AT_HWCAP bit 15 (HWCAP_LRCPC) for ARMv8.3-A FEAT_LRCPC.
+// (Bit 26 is HWCAP_ILRCPC / ARMv8.4-A FEAT_LRCPC2.)
+inline constexpr uint64_t kArm64HwcapLrcpcBit = 1ULL << 15;
 
 inline constexpr uint64_t DetectLrcpcFeatureFlag(uint64_t hwcap,
                                                  int64_t extension_mask) {

@@ -14,7 +14,7 @@
 #if defined(__linux__) || defined(__ANDROID__)
 #include <sys/auxv.h>
 #ifndef HWCAP_LRCPC
-#define HWCAP_LRCPC (1UL << 26)
+#define HWCAP_LRCPC (1UL << 15)
 #endif
 #endif
 
@@ -58,10 +58,10 @@ void InitFeatureFlags() {
   }
 
 #if defined(__linux__) || defined(__ANDROID__)
-  // Read AT_HWCAP bit 26 (HWCAP_LRCPC) at runtime so builds stay -march=armv8-a.
+  // Read AT_HWCAP bit 15 (HWCAP_LRCPC) at runtime so builds stay -march=armv8-a.
   const uint64_t hwcap = static_cast<uint64_t>(getauxval(AT_HWCAP));
   static_assert(HWCAP_LRCPC == kArm64HwcapLrcpcBit,
-                "HWCAP_LRCPC must match bit 26");
+                "HWCAP_LRCPC must match bit 15");
   feature_flags_ |= DetectLrcpcFeatureFlag(hwcap, cvars::a64_extension_mask);
 #elif XE_PLATFORM_MAC
   if ((static_cast<uint64_t>(cvars::a64_extension_mask) & kA64EmitLRCPC) ==
