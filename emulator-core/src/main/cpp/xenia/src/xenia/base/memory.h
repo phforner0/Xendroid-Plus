@@ -79,6 +79,79 @@ enum class DeallocationType {
   kDecommit = 1 << 1,
 };
 
+// Strict '0' | '1' parser for debug.xendroid.* boolean system properties.
+// Leaves |out_bool| untouched and returns false for any other string.
+inline bool ParseStrictBoolProp(const char* value, bool* out_bool) {
+  if (!value || !out_bool) {
+    return false;
+  }
+  if (value[0] == '0' && value[1] == '\0') {
+    *out_bool = false;
+    return true;
+  }
+  if (value[0] == '1' && value[1] == '\0') {
+    *out_bool = true;
+    return true;
+  }
+  return false;
+}
+
+// Backing shared-memory mechanism verified by ProbeDualMappingWxSupport().
+enum class DualMappingWxBackend : uint32_t {
+  kUnsupported = 0,
+  kMemfd = 1,
+  kAshmem = 2,
+  kPosixShm = 3,
+};
+
+// Sentinel word (ARM64 NOP) written through rw-s and read back through r-xs
+// during the live W^X dual-mapping probe.
+inline constexpr uint32_t kDualMappingWxProbeSentinel = 0xD503201Fu;
+
+inline constexpr bool ShouldActivateWxDualMapping(
+    bool wx_requested, DualMappingWxBackend probed_backend) {
+  return wx_requested &&
+         probed_backend != DualMappingWxBackend::kUnsupported;
+}
+
+// Performs a cached live 1-page probe verifying that an r-xs + rw-s shared
+// dual-mapping succeeds and reflects writes across views under the active
+// kernel/SELinux policy.
+DualMappingWxBackend ProbeDualMappingWxSupport();
+
+// Translates a 4-byte-aligned RX execute address in a (potentially dual-mapped)
+// code cache to its writable RW slot, verifying total_size and commit_mark.
+inline uint32_t* TranslateCodeCacheWriteSlot(uintptr_t execute_address,
+                                             uintptr_t execute_base,
+                                             uintptr_t write_base,
+                                             size_t total_size,
+                                             size_t commit_mark) {
+  if (!execute_base || !write_base || execute_address < execute_base ||
+      (execute_address & 3u) != 0) {
+    return nullptr;
+  }
+  const uintptr_t offset = execute_address - execute_base;
+  if (offset + sizeof(uint32_t) > total_size ||
+      offset + sizeof(uint32_t) > commit_mark) {
+    return nullptr;
+  }
+  return reinterpret_cast<uint32_t*>(write_base + offset);
+}
+
+// Computes the next code-cache commit high-water mark rounded up to |chunk_size|
+// and clamped to |total_size|.
+inline constexpr size_t ComputeCodeCacheNextCommitMark(size_t current_commit,
+                                                       size_t high_mark,
+                                                       size_t chunk_size,
+                                                       size_t total_size) {
+  if (high_mark <= current_commit || chunk_size == 0) {
+    return current_commit;
+  }
+  const size_t rounded =
+      ((high_mark + chunk_size - 1u) / chunk_size) * chunk_size;
+  return rounded > total_size ? total_size : rounded;
+}
+
 // Whether the host allows the pages to be allocated or mapped with
 // PageAccess::kExecuteReadWrite - if not, separate mappings backed by the same
 // memory-mapped file must be used to write to executable pages.

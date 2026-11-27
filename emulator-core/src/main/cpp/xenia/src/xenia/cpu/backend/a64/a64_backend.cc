@@ -37,6 +37,7 @@
 #endif
 #include "xenia/cpu/backend/a64/a64_assembler.h"
 #include "xenia/cpu/backend/a64/a64_code_cache.h"
+#include "xenia/cpu/backend/a64/a64_direct_call.h"
 #include "xenia/cpu/backend/a64/a64_emitter.h"
 #include "xenia/cpu/backend/a64/a64_function.h"
 #include "xenia/cpu/backend/a64/a64_sequences.h"
@@ -62,6 +63,10 @@ DEFINE_bool(a64_enable_host_guest_stack_synchronization, true,
             "a64");
 
 DECLARE_bool(a64_inline_hle_sync);
+DECLARE_bool(a64_indirect_call_pic);
+DECLARE_bool(a64_align_hot_code);
+DECLARE_bool(a64_lrcpc_tso);
+DECLARE_bool(a64_skip_low_addr_skew_fixup);
 
 DECLARE_bool(record_mmio_access_exceptions);
 
@@ -125,8 +130,12 @@ namespace a64 {
 uint64_t ResolveFunction(void* raw_context, uint64_t target_address);
 uint64_t PatchAndResolveDirectCall(void* raw_context, uint64_t target_address,
                                    uintptr_t call_site_rx);
+uint64_t PatchAndResolveIndirectCallPic(void* raw_context,
+                                        uint64_t target_address,
+                                        uintptr_t gate_rx);
 uint64_t ResolveFunctionWithoutStackSkewSkip(void* raw_context,
                                              uint64_t target_address);
+uint64_t ResolveDynamicCall(void* raw_context, uint64_t target_address);
 
 uint32_t FindStackpointSyncDepth(const A64BackendStackpoint* stackpoints,
                                  uint32_t current_depth, uint32_t guest_sp) {
@@ -160,6 +169,7 @@ class A64HelperEmitter : public A64Emitter {
   GuestToHostThunk EmitGuestToHostThunkNoVec();
   ResolveFunctionThunk EmitResolveFunctionThunk();
   void* EmitPatchDirectCallThunk();
+  void* EmitPatchIndirectCallPicThunk();
   void* EmitReemitWithoutStackSkewThunk();
   void* EmitGuestAndHostSynchronizeStackHelper();
   void* EmitReturnToHostHelper();
@@ -622,6 +632,73 @@ void* A64HelperEmitter::EmitPatchDirectCallThunk() {
   code_offsets.epilog = getSize();
 
   // Restore x0 (guest return address) and saved regs (preserving x30).
+  ldp(x0, x19, ptr(sp, 0x00));
+  ldp(x29, x30, ptr(sp, 0x50));
+  add(sp, sp, static_cast<uint32_t>(thunk_stack));
+
+  cbz(x9, 8);
+  br(x9);
+  brk(0xF000);
+
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = thunk_stack;
+  func_info.lr_save_offset = 0x058;  // stp x29, x30, [sp, #0x50]
+
+  return Emplace(func_info);
+}
+
+// --------------------------------------------------------------------------
+// PatchIndirectCallPicThunk
+// --------------------------------------------------------------------------
+// Called from an uninitialized CallIndirect PIC miss stub:
+//   w16 = guest PPC target address
+//   x17 = gate_rx of the PIC site
+//   x20 = PPCContext*
+//   x0  = guest return address (GUEST_CALL_RET_ADDR or caller's GUEST_RET_ADDR)
+//   x30 = host return address (pic_done or caller's HOST_RET_ADDR)
+// Resolves the target and populates the 1-slot monomorphic PIC via 2-stage
+// 1-word atomic CMODX publication (or retires gate to fallback if out of range).
+void* A64HelperEmitter::EmitPatchIndirectCallPicThunk() {
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  code_offsets.prolog = getSize();
+
+  const size_t thunk_stack = StackLayout::THUNK_STACK_SIZE;
+  sub(sp, sp, static_cast<uint32_t>(thunk_stack));
+  code_offsets.prolog_stack_alloc = getSize();
+
+  stp(x29, x30, ptr(sp, 0x50));
+  stp(x0, x19, ptr(sp, 0x00));
+
+  code_offsets.body = getSize();
+
+  EmitEnterHostFpcr();
+  // PatchAndResolveIndirectCallPic(context, target_address, gate_rx).
+  mov(x0, x20);  // x0 = PPCContext*
+  mov(w1, w16);  // x1 = guest address (zero-extended 32->64)
+  mov(x2, x17);  // x2 = gate_rx
+  mov(x9, reinterpret_cast<uint64_t>(&PatchAndResolveIndirectCallPic));
+  blr(x9);
+  mov(x9, x0);
+  EmitRestoreGuestFpcr();
+
+  code_offsets.epilog = getSize();
+
   ldp(x0, x19, ptr(sp, 0x00));
   ldp(x29, x30, ptr(sp, 0x50));
   add(sp, sp, static_cast<uint32_t>(thunk_stack));
@@ -1641,6 +1718,69 @@ uint64_t PatchAndResolveDirectCall(void* raw_context, uint64_t target_address,
   return reinterpret_cast<uint64_t>(code);
 }
 
+uint64_t PatchAndResolveIndirectCallPic(void* raw_context,
+                                        uint64_t target_address,
+                                        uintptr_t gate_rx) {
+  auto guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  auto thread_state = guest_context->thread_state;
+  assert_not_zero(target_address);
+
+  auto* processor = thread_state->processor();
+  auto* backend = static_cast<A64Backend*>(processor->backend());
+  auto* code_cache = backend ? backend->code_cache() : nullptr;
+
+  if (cvars::a64_enable_host_guest_stack_synchronization &&
+      target_address <= 0xFFFFFFFFu) {
+    auto* module_for_address =
+        processor->LookupModule(static_cast<uint32_t>(target_address));
+    auto* xexmod = dynamic_cast<XexModule*>(module_for_address);
+    if (xexmod) {
+      InfoCacheFlags* flags = xexmod->GetInstructionAddressFlags(
+          static_cast<uint32_t>(target_address));
+      if (flags && flags->is_return_site) {
+        if (uint64_t host_address = ResolveLongjmp(
+                guest_context, static_cast<uint32_t>(target_address), 0)) {
+          // Do not patch a PIC site for a mid-body longjmp reentry.
+          return host_address;
+        }
+      }
+    }
+  }
+
+  const uint32_t requested_address = static_cast<uint32_t>(target_address);
+  if (processor->dynamic_code_enabled() && code_cache &&
+      !code_cache->HasIndirectionSlot(requested_address)) {
+    code_cache->FallbackIndirectCallPicSite(gate_rx);
+    return ResolveDynamicCall(raw_context, target_address);
+  }
+
+  const uint64_t sweep_count = processor->code_sweep_count();
+  uint32_t address = requested_address;
+  auto fn = processor->ResolveCallTarget(guest_context, &address);
+  if (!fn) {
+    XELOGE("No guest code at {:08X} for an indirect call PIC", address);
+    return 0;
+  }
+
+  auto guest_fn = static_cast<GuestFunction*>(fn);
+  auto code = guest_fn->machine_code();
+  if (!code) {
+    return 0;
+  }
+
+  if (cvars::a64_indirect_call_pic && code_cache) {
+    if (address != requested_address) {
+      code_cache->FallbackIndirectCallPicSite(gate_rx);
+    } else {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (processor->code_sweep_count() == sweep_count) {
+        code_cache->TryPatchIndirectCallPicSite(gate_rx, address, code);
+      }
+    }
+  }
+  return reinterpret_cast<uint64_t>(code);
+}
+
 uint64_t ResolveFunctionWithoutStackSkewSkip(void* raw_context,
                                              uint64_t target_address) {
   auto* guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
@@ -2020,32 +2160,93 @@ static void BuildGuestTrampoline(uint8_t* buf, void* proc, void* userdata1,
 A64Backend::A64Backend() {
   code_cache_ = A64CodeCache::Create();
 
-  // Prefer a sub-2GB slot so fast indirection (rel32) is usable; fall back
-  // to an OS-chosen address if none is available. macOS rejects fixed
-  // PROT_EXEC mappings in this range, so skip the scan entirely there.
-  void* buf = nullptr;
+  const size_t trampoline_total_size =
+      xe::round_up(kGuestTrampolineSize * MAX_GUEST_TRAMPOLINES,
+                   memory::allocation_granularity());
+  guest_trampoline_mapping_size_ = trampoline_total_size;
+
+  const bool wx_preferred = memory::IsWritableExecutableMemoryPreferred();
+  void* exec_buf = nullptr;
+  void* write_buf = nullptr;
+
+  if (!wx_preferred) {
+    guest_trampoline_mapping_name_ =
+        fmt::format("xenia_trampolines_{}", Clock::QueryHostTickCount());
+    guest_trampoline_mapping_ = memory::CreateFileMappingHandle(
+        guest_trampoline_mapping_name_, trampoline_total_size,
+        memory::PageAccess::kExecuteReadWrite, false);
+    if (guest_trampoline_mapping_ != memory::kFileMappingHandleInvalid) {
 #if !XE_PLATFORM_MAC
-  for (uint32_t base_address = 0x10000; base_address < 0x80000000;
-       base_address += 65536) {
-    buf = memory::AllocFixed(
-        reinterpret_cast<void*>(static_cast<uintptr_t>(base_address)),
-        kGuestTrampolineSize * MAX_GUEST_TRAMPOLINES,
-        xe::memory::AllocationType::kReserveCommit,
-        xe::memory::PageAccess::kExecuteReadWrite);
-    if (buf) {
-      break;
+      if (A64CodeCache::execute_address_high() == 0) {
+        for (uint32_t base_address = 0x10000; base_address < 0x80000000;
+             base_address += 65536) {
+          exec_buf = memory::MapFileView(
+              guest_trampoline_mapping_,
+              reinterpret_cast<void*>(static_cast<uintptr_t>(base_address)),
+              trampoline_total_size, memory::PageAccess::kExecuteReadOnly, 0);
+          if (exec_buf) {
+            break;
+          }
+        }
+      }
+#endif
+      if (!exec_buf) {
+        exec_buf = memory::MapFileView(
+            guest_trampoline_mapping_, nullptr, trampoline_total_size,
+            memory::PageAccess::kExecuteReadOnly, 0);
+      }
+      if (exec_buf) {
+        write_buf = memory::MapFileView(guest_trampoline_mapping_, nullptr,
+                                        trampoline_total_size,
+                                        memory::PageAccess::kReadWrite, 0);
+      }
+      if (!exec_buf || !write_buf) {
+        if (write_buf) {
+          memory::UnmapFileView(guest_trampoline_mapping_, write_buf,
+                                trampoline_total_size);
+        }
+        if (exec_buf) {
+          memory::UnmapFileView(guest_trampoline_mapping_, exec_buf,
+                                trampoline_total_size);
+        }
+        memory::CloseFileMappingHandle(guest_trampoline_mapping_,
+                                       guest_trampoline_mapping_name_);
+        guest_trampoline_mapping_ = memory::kFileMappingHandleInvalid;
+        exec_buf = nullptr;
+        write_buf = nullptr;
+      }
     }
   }
+
+  if (!exec_buf) {
+    // Prefer a sub-2GB slot so fast indirection (rel32) is usable; fall back
+    // to an OS-chosen address if none is available. macOS rejects fixed
+    // PROT_EXEC mappings in this range, so skip the scan entirely there.
+#if !XE_PLATFORM_MAC
+    for (uint32_t base_address = 0x10000; base_address < 0x80000000;
+         base_address += 65536) {
+      exec_buf = memory::AllocFixed(
+          reinterpret_cast<void*>(static_cast<uintptr_t>(base_address)),
+          trampoline_total_size, xe::memory::AllocationType::kReserveCommit,
+          xe::memory::PageAccess::kExecuteReadWrite);
+      if (exec_buf) {
+        break;
+      }
+    }
 #endif
-  if (!buf) {
-    buf = memory::AllocFixed(nullptr,
-                             kGuestTrampolineSize * MAX_GUEST_TRAMPOLINES,
-                             xe::memory::AllocationType::kReserveCommit,
-                             xe::memory::PageAccess::kExecuteReadWrite);
+    if (!exec_buf) {
+      exec_buf = memory::AllocFixed(nullptr, trampoline_total_size,
+                                    xe::memory::AllocationType::kReserveCommit,
+                                    xe::memory::PageAccess::kExecuteReadWrite);
+    }
+    write_buf = exec_buf;
   }
-  xenia_assert(buf);
-  guest_trampoline_memory_ = reinterpret_cast<uint8_t*>(buf);
-  guest_trampolines_sub4gb_ = reinterpret_cast<uintptr_t>(buf) < 0x100000000ull;
+
+  xenia_assert(exec_buf && write_buf);
+  guest_trampoline_execute_memory_ = reinterpret_cast<uint8_t*>(exec_buf);
+  guest_trampoline_write_memory_ = reinterpret_cast<uint8_t*>(write_buf);
+  guest_trampolines_sub4gb_ =
+      reinterpret_cast<uintptr_t>(exec_buf) < 0x100000000ull;
   guest_trampoline_address_bitmap_.Resize(MAX_GUEST_TRAMPOLINES);
 }
 
@@ -2055,11 +2256,29 @@ A64Backend::~A64Backend() {
   if (auto mmio_handler = MMIOHandler::global_handler()) {
     mmio_handler->SetReservedStoreFaultCallback(nullptr, nullptr, nullptr);
   }
-  if (guest_trampoline_memory_) {
-    memory::DeallocFixed(guest_trampoline_memory_,
-                         kGuestTrampolineSize * MAX_GUEST_TRAMPOLINES,
+  if (guest_trampoline_mapping_ != memory::kFileMappingHandleInvalid) {
+    if (guest_trampoline_write_memory_ &&
+        guest_trampoline_write_memory_ != guest_trampoline_execute_memory_) {
+      memory::UnmapFileView(guest_trampoline_mapping_,
+                            guest_trampoline_write_memory_,
+                            guest_trampoline_mapping_size_);
+    }
+    if (guest_trampoline_execute_memory_) {
+      memory::UnmapFileView(guest_trampoline_mapping_,
+                            guest_trampoline_execute_memory_,
+                            guest_trampoline_mapping_size_);
+    }
+    memory::CloseFileMappingHandle(guest_trampoline_mapping_,
+                                   guest_trampoline_mapping_name_);
+    guest_trampoline_mapping_ = memory::kFileMappingHandleInvalid;
+    guest_trampoline_execute_memory_ = nullptr;
+    guest_trampoline_write_memory_ = nullptr;
+  } else if (guest_trampoline_execute_memory_) {
+    memory::DeallocFixed(guest_trampoline_execute_memory_,
+                         guest_trampoline_mapping_size_,
                          memory::DeallocationType::kRelease);
-    guest_trampoline_memory_ = nullptr;
+    guest_trampoline_execute_memory_ = nullptr;
+    guest_trampoline_write_memory_ = nullptr;
   }
 }
 
@@ -2088,6 +2307,28 @@ bool A64Backend::Initialize(Processor* processor) {
         XELOGI("debug.xendroid.inline_hle_sync: a64_inline_hle_sync = true");
       }
     }
+    auto apply_strict_bool_prop = [](const char* prop_name, bool& target,
+                                     const char* cvar_name) {
+      char prop_val[PROP_VALUE_MAX] = {};
+      if (__system_property_get(prop_name, prop_val) > 0) {
+        bool parsed = false;
+        if (xe::memory::ParseStrictBoolProp(prop_val, &parsed)) {
+          target = parsed;
+          XELOGI("{}: {} = {}", prop_name, cvar_name,
+                 parsed ? "true" : "false");
+        }
+      }
+    };
+    apply_strict_bool_prop("debug.xendroid.a64_indirect_call_pic",
+                           cvars::a64_indirect_call_pic,
+                           "a64_indirect_call_pic");
+    apply_strict_bool_prop("debug.xendroid.a64_align_hot_code",
+                           cvars::a64_align_hot_code, "a64_align_hot_code");
+    apply_strict_bool_prop("debug.xendroid.a64_lrcpc_tso",
+                           cvars::a64_lrcpc_tso, "a64_lrcpc_tso");
+    apply_strict_bool_prop("debug.xendroid.a64_low_addr_skew",
+                           cvars::a64_skip_low_addr_skew_fixup,
+                           "a64_skip_low_addr_skew_fixup");
   }
 #endif
 
@@ -2128,6 +2369,8 @@ bool A64Backend::Initialize(Processor* processor) {
   // writes at run time, which no module commits a range for.
   resolve_function_thunk_ = thunk_emitter.EmitResolveFunctionThunk();
   patch_direct_call_thunk_ = thunk_emitter.EmitPatchDirectCallThunk();
+  patch_indirect_call_pic_thunk_ =
+      thunk_emitter.EmitPatchIndirectCallPicThunk();
   reemit_without_stack_skew_thunk_ =
       thunk_emitter.EmitReemitWithoutStackSkewThunk();
   host_to_guest_thunk_ = thunk_emitter.EmitHostToGuestThunk();
@@ -2136,7 +2379,8 @@ bool A64Backend::Initialize(Processor* processor) {
 
   if (!host_to_guest_thunk_ || !guest_to_host_thunk_ ||
       !guest_to_host_thunk_no_vec_ || !resolve_function_thunk_ ||
-      !patch_direct_call_thunk_ || !reemit_without_stack_skew_thunk_) {
+      !patch_direct_call_thunk_ || !patch_indirect_call_pic_thunk_ ||
+      !reemit_without_stack_skew_thunk_) {
     XELOGE("A64Backend: Failed to generate thunks");
     return false;
   }
@@ -2248,12 +2492,25 @@ uint64_t A64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
 static constexpr uint32_t kArm64Brk0 = 0xD4200000;
 
 void A64Backend::InstallBreakpoint(Breakpoint* breakpoint) {
-  breakpoint->ForEachHostAddress([breakpoint](uint64_t host_address) {
-    auto ptr = reinterpret_cast<void*>(host_address);
-    auto original_bytes = xe::load<uint32_t>(ptr);
+  breakpoint->ForEachHostAddress([this, breakpoint](uint64_t host_address) {
+    uint32_t* rw_slot =
+        code_cache_
+            ? code_cache_->WriteSlotForExecuteAddress(
+                  static_cast<uintptr_t>(host_address))
+            : nullptr;
+    if (!rw_slot) {
+      XELOGE(
+          "A64Backend: cannot install breakpoint at 0x{:016X} (no RW slot)",
+          host_address);
+      return;
+    }
+    auto original_bytes = xe::load<uint32_t>(rw_slot);
     assert_true(original_bytes != kArm64Brk0);
-    xe::store<uint32_t>(ptr, kArm64Brk0);
-    breakpoint->backend_data().emplace_back(host_address, original_bytes);
+    if (PatchA64InstructionAtomic(rw_slot, kArm64Brk0)) {
+      code_cache_->FlushPatchedInstruction(
+          rw_slot, reinterpret_cast<void*>(host_address));
+      breakpoint->backend_data().emplace_back(host_address, original_bytes);
+    }
   });
 }
 
@@ -2268,19 +2525,41 @@ void A64Backend::InstallBreakpoint(Breakpoint* breakpoint, Function* fn) {
     return;
   }
 
-  auto ptr = reinterpret_cast<void*>(host_address);
-  auto original_bytes = xe::load<uint32_t>(ptr);
+  uint32_t* rw_slot =
+      code_cache_
+          ? code_cache_->WriteSlotForExecuteAddress(
+                static_cast<uintptr_t>(host_address))
+          : nullptr;
+  if (!rw_slot) {
+    XELOGE("A64Backend: cannot install breakpoint at 0x{:016X} (no RW slot)",
+           host_address);
+    return;
+  }
+  auto original_bytes = xe::load<uint32_t>(rw_slot);
   assert_true(original_bytes != kArm64Brk0);
-  xe::store<uint32_t>(ptr, kArm64Brk0);
-  breakpoint->backend_data().emplace_back(host_address, original_bytes);
+  if (PatchA64InstructionAtomic(rw_slot, kArm64Brk0)) {
+    code_cache_->FlushPatchedInstruction(
+        rw_slot, reinterpret_cast<void*>(host_address));
+    breakpoint->backend_data().emplace_back(host_address, original_bytes);
+  }
 }
 
 void A64Backend::UninstallBreakpoint(Breakpoint* breakpoint) {
   for (auto& pair : breakpoint->backend_data()) {
-    auto ptr = reinterpret_cast<uint8_t*>(pair.first);
-    auto instruction_bytes = xe::load<uint32_t>(ptr);
+    uint32_t* rw_slot =
+        code_cache_
+            ? code_cache_->WriteSlotForExecuteAddress(
+                  static_cast<uintptr_t>(pair.first))
+            : nullptr;
+    if (!rw_slot) {
+      continue;
+    }
+    auto instruction_bytes = xe::load<uint32_t>(rw_slot);
     assert_true(instruction_bytes == kArm64Brk0);
-    xe::store<uint32_t>(ptr, static_cast<uint32_t>(pair.second));
+    if (PatchA64InstructionAtomic(rw_slot, static_cast<uint32_t>(pair.second))) {
+      code_cache_->FlushPatchedInstruction(
+          rw_slot, reinterpret_cast<void*>(pair.first));
+    }
   }
   breakpoint->backend_data().clear();
 }
@@ -2432,34 +2711,35 @@ uint32_t A64Backend::CreateGuestTrampoline(GuestTrampolineProc proc,
   }
   xenia_assert(new_index != static_cast<size_t>(-1));
 
-  uint8_t* write_pos =
-      &guest_trampoline_memory_[kGuestTrampolineSize * new_index];
+  const size_t offset = kGuestTrampolineSize * new_index;
+  uint8_t* write_pos = &guest_trampoline_write_memory_[offset];
+  uint8_t* exec_pos = &guest_trampoline_execute_memory_[offset];
 
 #if XE_PLATFORM_MAC
-  pthread_jit_write_protect_np(0);
+  const bool jit_write_toggle =
+      guest_trampoline_execute_memory_ == guest_trampoline_write_memory_;
+  if (jit_write_toggle) {
+    pthread_jit_write_protect_np(0);
+  }
 #endif
   BuildGuestTrampoline(write_pos, reinterpret_cast<void*>(proc), userdata1,
                        userdata2,
                        reinterpret_cast<void*>(guest_to_host_thunk_));
 #if XE_PLATFORM_MAC
-  pthread_jit_write_protect_np(1);
+  if (jit_write_toggle) {
+    pthread_jit_write_protect_np(1);
+  }
 #endif
 
-  // Flush instruction cache for the new trampoline code.
-#if XE_PLATFORM_WIN32
-  FlushInstructionCache(GetCurrentProcess(), write_pos, kGuestTrampolineSize);
-#else
-  __builtin___clear_cache(
-      reinterpret_cast<char*>(write_pos),
-      reinterpret_cast<char*>(write_pos + kGuestTrampolineSize));
-#endif
+  // Flush D-cache on RW view and I-cache on RX view (W^X-safe).
+  code_cache()->FlushCodeRange(write_pos, exec_pos, kGuestTrampolineSize);
 
   uint32_t indirection_guest_addr =
       GUEST_TRAMPOLINE_BASE +
       (static_cast<uint32_t>(new_index) * GUEST_TRAMPOLINE_MIN_LEN);
 
   code_cache()->AddIndirection64(indirection_guest_addr,
-                                 reinterpret_cast<uint64_t>(write_pos));
+                                 reinterpret_cast<uint64_t>(exec_pos));
 
   return indirection_guest_addr;
 }

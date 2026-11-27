@@ -104,7 +104,8 @@ foreach ($Pair in @(
   @("audio_adpf_logic_test", $Cpp),
   @("gpu_resolve_opts_test", $Cpp),
   @("gpu_submit_worker_test", $Cpp),
-  @("gpu_pm4_ib_cache_test", $Cpp)
+  @("gpu_pm4_ib_cache_test", $Cpp),
+  @("wave6_onda4b_wx_a64_test", $Cpp)
 )) {
   $TName = $Pair[0]
   $TArg = $Pair[1]

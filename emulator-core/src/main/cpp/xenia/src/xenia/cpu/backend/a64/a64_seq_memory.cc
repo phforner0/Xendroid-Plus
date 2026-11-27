@@ -611,12 +611,52 @@ static T MMIOAwareLoad(void* _ctx, unsigned int guestaddr) {
 // ============================================================================
 // OPCODE_LOAD
 // ============================================================================
+static void EmitLrcpcScalarLoadW(A64Emitter& e, const XReg& addr,
+                                 const WReg& dst, uint32_t bytes) {
+  // Runtime-gated ARMv8.3-A FEAT_LRCPC (kA64EmitLRCPC; distinct from
+  // ARMv8.1 kA64EmitLSE). Uses base-only [x16] addressing.
+  if (e.IsFeatureEnabled(kA64EmitLRCPC)) {
+    e.add(e.x16, e.GetMembaseReg(), addr);
+    if (bytes == 1) {
+      e.ldaprb(dst, ptr(e.x16));
+    } else if (bytes == 2) {
+      e.ldaprh(dst, ptr(e.x16));
+    } else {
+      e.ldapr(dst, ptr(e.x16));
+    }
+    return;
+  }
+  if (bytes == 1) {
+    e.ldrb(dst, ptr(e.GetMembaseReg(), addr));
+  } else if (bytes == 2) {
+    e.ldrh(dst, ptr(e.GetMembaseReg(), addr));
+  } else {
+    e.ldr(dst, ptr(e.GetMembaseReg(), addr));
+  }
+}
+
+static void EmitLrcpcScalarLoadX(A64Emitter& e, const XReg& addr,
+                                 const XReg& dst) {
+  // Runtime-gated ARMv8.3-A FEAT_LRCPC (kA64EmitLRCPC; distinct from
+  // ARMv8.1 kA64EmitLSE). Uses base-only [x16] addressing.
+  if (e.IsFeatureEnabled(kA64EmitLRCPC)) {
+    e.add(e.x16, e.GetMembaseReg(), addr);
+    e.ldapr(dst, ptr(e.x16));
+    return;
+  }
+  e.ldr(dst, ptr(e.GetMembaseReg(), addr));
+}
+
 struct LOAD_I8 : Sequence<LOAD_I8, I<OPCODE_LOAD, I8Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
-    e.ldrb(i.dest, ptr(e.GetMembaseReg(), addr));
+    if (e.UseLrcpcForTsoLoad(i.instr)) {
+      EmitLrcpcScalarLoadW(e, addr, i.dest, 1);
+    } else {
+      e.ldrb(i.dest, ptr(e.GetMembaseReg(), addr));
+    }
     if (IsTracingData()) {
       addr = ComputeMemoryAddress(e, i.src1, skip_skew);
       e.mov(e.w2, i.dest);
@@ -630,7 +670,11 @@ struct LOAD_I16 : Sequence<LOAD_I16, I<OPCODE_LOAD, I16Op, I64Op>> {
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
-    e.ldrh(i.dest, ptr(e.GetMembaseReg(), addr));
+    if (e.UseLrcpcForTsoLoad(i.instr)) {
+      EmitLrcpcScalarLoadW(e, addr, i.dest, 2);
+    } else {
+      e.ldrh(i.dest, ptr(e.GetMembaseReg(), addr));
+    }
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev16(i.dest, i.dest);
     }
@@ -646,6 +690,7 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    const bool use_lrcpc = e.UseLrcpcForTsoLoad(i.instr);
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -659,6 +704,9 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       }
       e.CallNativeSafe(mmio_fn);
       e.mov(i.dest, e.w0);
+      if (use_lrcpc) {
+        e.dmb(Xbyak_aarch64::ISHLD);
+      }
       return;
     }
     if (cvars::emit_inline_mmio_checks && !IsTracingData()) {
@@ -684,11 +732,18 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       e.mov(e.w1, e.w17);
       e.CallNativeSafe(mmio_fn);
       e.mov(i.dest, e.w0);
+      if (use_lrcpc) {
+        e.dmb(Xbyak_aarch64::ISHLD);
+      }
       e.b(done);
       e.L(normal_access);
       {
         auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
-        e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+        if (use_lrcpc) {
+          EmitLrcpcScalarLoadW(e, addr, i.dest, 4);
+        } else {
+          e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+        }
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           e.rev(i.dest, i.dest);
         }
@@ -696,7 +751,11 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       e.L(done);
     } else {
       auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
-      e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+      if (use_lrcpc) {
+        EmitLrcpcScalarLoadW(e, addr, i.dest, 4);
+      } else {
+        e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+      }
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.rev(i.dest, i.dest);
       }
@@ -714,7 +773,11 @@ struct LOAD_I64 : Sequence<LOAD_I64, I<OPCODE_LOAD, I64Op, I64Op>> {
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
-    e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+    if (e.UseLrcpcForTsoLoad(i.instr)) {
+      EmitLrcpcScalarLoadX(e, addr, i.dest);
+    } else {
+      e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
+    }
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev(i.dest, i.dest);
     }
@@ -731,7 +794,13 @@ struct LOAD_F32 : Sequence<LOAD_F32, I<OPCODE_LOAD, F32Op, I64Op>> {
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
-    if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
+    if (e.UseLrcpcForTsoLoad(i.instr)) {
+      EmitLrcpcScalarLoadW(e, addr, e.w0, 4);
+      if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
+        e.rev(e.w0, e.w0);
+      }
+      e.fmov(i.dest, e.w0);
+    } else if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.ldr(e.w0, ptr(e.GetMembaseReg(), addr));
       e.rev(e.w0, e.w0);
       e.fmov(i.dest, e.w0);
@@ -751,7 +820,13 @@ struct LOAD_F64 : Sequence<LOAD_F64, I<OPCODE_LOAD, F64Op, I64Op>> {
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     auto addr = ComputeMemoryAddress(e, i.src1, skip_skew);
-    if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
+    if (e.UseLrcpcForTsoLoad(i.instr)) {
+      EmitLrcpcScalarLoadX(e, addr, e.x0);
+      if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
+        e.rev(e.x0, e.x0);
+      }
+      e.fmov(i.dest, e.x0);
+    } else if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.ldr(e.x0, ptr(e.GetMembaseReg(), addr));
       e.rev(e.x0, e.x0);
       e.fmov(i.dest, e.x0);
@@ -1091,7 +1166,11 @@ struct LOAD_OFFSET_I8
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
-    e.ldrb(i.dest, ptr(e.GetMembaseReg(), e.x0));
+    if (e.UseLrcpcForTsoLoad(i.instr)) {
+      EmitLrcpcScalarLoadW(e, e.x0, i.dest, 1);
+    } else {
+      e.ldrb(i.dest, ptr(e.GetMembaseReg(), e.x0));
+    }
     if (IsTracingData()) {
       ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
       e.mov(e.w2, i.dest);
@@ -1106,7 +1185,11 @@ struct LOAD_OFFSET_I16
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
-    e.ldrh(i.dest, ptr(e.GetMembaseReg(), e.x0));
+    if (e.UseLrcpcForTsoLoad(i.instr)) {
+      EmitLrcpcScalarLoadW(e, e.x0, i.dest, 2);
+    } else {
+      e.ldrh(i.dest, ptr(e.GetMembaseReg(), e.x0));
+    }
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev16(i.dest, i.dest);
     }
@@ -1123,6 +1206,7 @@ struct LOAD_OFFSET_I32
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
+    const bool use_lrcpc = e.UseLrcpcForTsoLoad(i.instr);
     if (IsPossibleMMIOInstruction(e, i.instr)) {
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -1143,6 +1227,9 @@ struct LOAD_OFFSET_I32
       e.add(e.w1, e.w1, e.w17);
       e.CallNativeSafe(mmio_fn);
       e.mov(i.dest, e.w0);
+      if (use_lrcpc) {
+        e.dmb(Xbyak_aarch64::ISHLD);
+      }
       return;
     }
     if (cvars::emit_inline_mmio_checks && !IsTracingData()) {
@@ -1178,11 +1265,18 @@ struct LOAD_OFFSET_I32
       e.mov(e.w1, e.w17);
       e.CallNativeSafe(mmio_fn);
       e.mov(i.dest, e.w0);
+      if (use_lrcpc) {
+        e.dmb(Xbyak_aarch64::ISHLD);
+      }
       e.b(done);
       e.L(normal_access);
       {
         ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
-        e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
+        if (use_lrcpc) {
+          EmitLrcpcScalarLoadW(e, e.x0, i.dest, 4);
+        } else {
+          e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
+        }
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           e.rev(i.dest, i.dest);
         }
@@ -1190,7 +1284,11 @@ struct LOAD_OFFSET_I32
       e.L(done);
     } else {
       ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
-      e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
+      if (use_lrcpc) {
+        EmitLrcpcScalarLoadW(e, e.x0, i.dest, 4);
+      } else {
+        e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
+      }
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.rev(i.dest, i.dest);
       }
@@ -1209,7 +1307,11 @@ struct LOAD_OFFSET_I64
     const bool skip_skew =
         (i.instr->flags & LoadStoreFlags::LOAD_STORE_NO_PHYSICAL_SKEW) != 0;
     ComputeMemoryAddressOffset(e, i.src1, i.src2, skip_skew);
-    e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
+    if (e.UseLrcpcForTsoLoad(i.instr)) {
+      EmitLrcpcScalarLoadX(e, e.x0, i.dest);
+    } else {
+      e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
+    }
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev(i.dest, i.dest);
     }

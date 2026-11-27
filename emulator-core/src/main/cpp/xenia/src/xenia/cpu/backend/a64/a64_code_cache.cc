@@ -34,6 +34,12 @@ DEFINE_bool(a64_perf_map, true,
             "names, so profilers can attribute JIT samples.",
             "CPU");
 
+DEFINE_bool(a64_align_hot_code, false,
+            "Align hot A64 function entries (>= 64 B) to 64 B and loop headers "
+            "to 32 B with a bounded 4 KB anti-page-split nudge (<= 64 B NOPs). "
+            "Overridable on Android via debug.xendroid.a64_align_hot_code=0|1.",
+            "CPU");
+
 namespace xe {
 namespace cpu {
 namespace backend {
@@ -161,6 +167,10 @@ void A64CodeCache::FlushCodeRange(void* write_address, void* execute_address,
 void A64CodeCache::FlushPatchedInstruction(void* write_address,
                                            void* execute_address) {
   FlushCodeRange(write_address, execute_address, sizeof(uint32_t));
+}
+
+size_t A64CodeCache::PreferredEntryAlignment(size_t code_size) const {
+  return ComputeFunctionEntryAlignment(cvars::a64_align_hot_code, code_size);
 }
 
 void A64CodeCache::RegisterDirectCallSite(uint32_t target_guest_addr,
@@ -302,30 +312,176 @@ bool A64CodeCache::TryPatchDirectCallSite(uint32_t target_guest_addr,
   return false;
 }
 
+void A64CodeCache::RegisterIndirectCallPicSite(uintptr_t gate_rx,
+                                               uintptr_t cmp_lo_rx,
+                                               uintptr_t cmp_hi_rx,
+                                               uintptr_t call_op_rx,
+                                               uintptr_t fallback_rx,
+                                               bool is_tail) {
+  if (!IsInExecuteRange(gate_rx) || !IsInExecuteRange(cmp_lo_rx) ||
+      !IsInExecuteRange(cmp_hi_rx) || !IsInExecuteRange(call_op_rx) ||
+      !IsInExecuteRange(fallback_rx)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(pic_sites_mutex_);
+  if (pic_sites_by_gate_.find(gate_rx) != pic_sites_by_gate_.end()) {
+    return;
+  }
+  IndirectCallPicSite site{};
+  site.gate_rx = gate_rx;
+  site.cmp_lo_rx = cmp_lo_rx;
+  site.cmp_hi_rx = cmp_hi_rx;
+  site.call_op_rx = call_op_rx;
+  site.fallback_rx = fallback_rx;
+  site.is_tail = is_tail;
+  site.state = IndirectCallPicState::kUninitialized;
+  pic_sites_by_gate_.emplace(gate_rx, site);
+}
+
+bool A64CodeCache::FallbackIndirectCallPicSite(uintptr_t gate_rx) {
+  if (!IsInExecuteRange(gate_rx)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(pic_sites_mutex_);
+  auto it = pic_sites_by_gate_.find(gate_rx);
+  if (it == pic_sites_by_gate_.end() ||
+      it->second.state == IndirectCallPicState::kFallback) {
+    return false;
+  }
+  uint32_t fallback_gate = 0;
+  if (!ComputeIndirectCallPicFallbackGate(it->second, &fallback_gate)) {
+    return false;
+  }
+  uint32_t* gate_rw = WriteSlotForExecuteAddress(gate_rx);
+  if (!gate_rw || !PatchA64InstructionAtomic(gate_rw, fallback_gate)) {
+    return false;
+  }
+  FlushPatchedInstruction(gate_rw, reinterpret_cast<void*>(gate_rx));
+  it->second.state = IndirectCallPicState::kFallback;
+  return true;
+}
+
+bool A64CodeCache::TryPatchIndirectCallPicSite(uintptr_t gate_rx,
+                                               uint32_t target_guest_addr,
+                                               void* target_execute_address) {
+  if (!IsInExecuteRange(gate_rx)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(pic_sites_mutex_);
+  auto it = pic_sites_by_gate_.find(gate_rx);
+  if (it == pic_sites_by_gate_.end() ||
+      it->second.state != IndirectCallPicState::kUninitialized) {
+    return false;
+  }
+  IndirectCallPicSite& site = it->second;
+  const uintptr_t target_rx =
+      reinterpret_cast<uintptr_t>(target_execute_address);
+  IndirectCallPicPatchWords words{};
+  if (!target_execute_address || !IsInExecuteRange(target_rx) ||
+      !ComputeIndirectCallPicPatchWords(site, target_guest_addr, target_rx,
+                                        &words)) {
+    // Target is out of +-128 MiB rel26 reach (or external to code cache):
+    // permanently rewrite gate to `b pic_fallback_lookup` via 1-word CMODX.
+    uint32_t fallback_gate = 0;
+    if (ComputeIndirectCallPicFallbackGate(site, &fallback_gate)) {
+      if (uint32_t* gate_rw = WriteSlotForExecuteAddress(site.gate_rx)) {
+        if (PatchA64InstructionAtomic(gate_rw, fallback_gate)) {
+          FlushPatchedInstruction(gate_rw,
+                                  reinterpret_cast<void*>(site.gate_rx));
+        }
+      }
+    }
+    site.state = IndirectCallPicState::kFallback;
+    return false;
+  }
+
+  uint32_t* gate_rw = WriteSlotForExecuteAddress(site.gate_rx);
+  uint32_t* cmp_lo_rw = WriteSlotForExecuteAddress(site.cmp_lo_rx);
+  uint32_t* cmp_hi_rw = WriteSlotForExecuteAddress(site.cmp_hi_rx);
+  uint32_t* call_op_rw = WriteSlotForExecuteAddress(site.call_op_rx);
+  if (!gate_rw || !cmp_lo_rw || !cmp_hi_rw || !call_op_rw) {
+    return false;
+  }
+
+  // Stage 1: Populate cmp_lo (movz), cmp_hi (movk), and call_op (bl/b rel26)
+  // via RW view while gate still holds `b pic_miss_stub` (unreachable by any
+  // executing core), then clean D-cache + invalidate I-cache + dsb ish.
+  PatchA64InstructionAtomic(cmp_lo_rw, words.cmp_lo_insn);
+  PatchA64InstructionAtomic(cmp_hi_rw, words.cmp_hi_insn);
+  PatchA64InstructionAtomic(call_op_rw, words.call_op_insn);
+  FlushCodeRange(cmp_lo_rw, reinterpret_cast<void*>(site.cmp_lo_rx),
+                 words.payload_flush_bytes);
+  std::atomic_thread_fence(std::memory_order_release);
+
+  // Stage 2: Publish by atomically rewriting gate from `b pic_miss_stub` to
+  // NOP (0xD503201F) — strictly 1-word ARM64 CMODX-safe transition.
+  if (!PatchA64InstructionAtomic(gate_rw, words.gate_nop_insn)) {
+    return false;
+  }
+  FlushPatchedInstruction(gate_rw, reinterpret_cast<void*>(site.gate_rx));
+
+  site.cached_guest_target = target_guest_addr;
+  site.state = IndirectCallPicState::kPatched;
+  patched_pic_sites_[target_guest_addr].push_back(gate_rx);
+  return true;
+}
+
 void A64CodeCache::RevertDirectCallSitesInRange(uint32_t guest_start,
                                                 uint32_t guest_end) {
   if (guest_start > guest_end) {
     return;
   }
-  std::lock_guard<std::mutex> lock(direct_call_sites_mutex_);
-  for (auto it = patched_direct_call_sites_.begin();
-       it != patched_direct_call_sites_.end();) {
-    const uint32_t target_addr = it->first;
-    if (target_addr < guest_start || target_addr > guest_end) {
-      ++it;
-      continue;
-    }
-    auto& pending = pending_direct_call_sites_[target_addr];
-    for (const auto& site : it->second) {
-      uint32_t* rw_slot = WriteSlotForExecuteAddress(site.call_site_rx);
-      if (rw_slot &&
-          PatchA64InstructionAtomic(rw_slot, site.original_stub_insn)) {
-        FlushPatchedInstruction(rw_slot,
-                                reinterpret_cast<void*>(site.call_site_rx));
+  {
+    std::lock_guard<std::mutex> lock(direct_call_sites_mutex_);
+    for (auto it = patched_direct_call_sites_.begin();
+         it != patched_direct_call_sites_.end();) {
+      const uint32_t target_addr = it->first;
+      if (target_addr < guest_start || target_addr > guest_end) {
+        ++it;
+        continue;
       }
-      pending.push_back(site);
+      auto& pending = pending_direct_call_sites_[target_addr];
+      for (const auto& site : it->second) {
+        uint32_t* rw_slot = WriteSlotForExecuteAddress(site.call_site_rx);
+        if (rw_slot &&
+            PatchA64InstructionAtomic(rw_slot, site.original_stub_insn)) {
+          FlushPatchedInstruction(rw_slot,
+                                  reinterpret_cast<void*>(site.call_site_rx));
+        }
+        pending.push_back(site);
+      }
+      it = patched_direct_call_sites_.erase(it);
     }
-    it = patched_direct_call_sites_.erase(it);
+  }
+  {
+    std::lock_guard<std::mutex> lock(pic_sites_mutex_);
+    for (auto it = patched_pic_sites_.begin();
+         it != patched_pic_sites_.end();) {
+      const uint32_t target_addr = it->first;
+      if (target_addr < guest_start || target_addr > guest_end) {
+        ++it;
+        continue;
+      }
+      for (uintptr_t gate_rx : it->second) {
+        auto site_it = pic_sites_by_gate_.find(gate_rx);
+        if (site_it == pic_sites_by_gate_.end() ||
+            site_it->second.state != IndirectCallPicState::kPatched) {
+          continue;
+        }
+        uint32_t fallback_gate = 0;
+        if (ComputeIndirectCallPicFallbackGate(site_it->second,
+                                               &fallback_gate)) {
+          uint32_t* gate_rw = WriteSlotForExecuteAddress(gate_rx);
+          if (gate_rw && PatchA64InstructionAtomic(gate_rw, fallback_gate)) {
+            FlushPatchedInstruction(gate_rw, reinterpret_cast<void*>(gate_rx));
+          }
+        }
+        // Never overwrite cmp_lo/cmp_hi/call_op while other cores may be in
+        // flight past the gate; permanently retire to fallback lookup.
+        site_it->second.state = IndirectCallPicState::kFallback;
+      }
+      it = patched_pic_sites_.erase(it);
+    }
   }
 }
 

@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -24,6 +25,18 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+
+#if XE_PLATFORM_LINUX || XE_PLATFORM_xendroid || XE_PLATFORM_ANDROID
+#include <sys/syscall.h>
+#if defined(__has_include)
+#if __has_include(<linux/memfd.h>)
+#include <linux/memfd.h>
+#endif
+#endif
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001u
+#endif
+#endif
 
 #if XE_PLATFORM_MAC
 #include <mach/mach.h>
@@ -38,6 +51,7 @@
 #include "xenia/base/string.h"
 
 #if XE_PLATFORM_xendroid
+#include <android/api-level.h>
 #include <android/sharedmem.h>
 #endif
 // Both ANDROID and xendroid are defined on the fork; the allocation path below is
@@ -154,8 +168,156 @@ bool IsWritableExecutableMemorySupported() {
   }();
   return supported;
 }
+
+DualMappingWxBackend ProbeDualMappingWxSupport() {
+  return DualMappingWxBackend::kUnsupported;
+}
 #else
-bool IsWritableExecutableMemorySupported() { return true; }
+namespace {
+int CreateMemfd(const char* name, size_t length) {
+#if defined(__NR_memfd_create)
+  const char* safe_name = (name && name[0] != '\0') ? name : "xenia_jit";
+  int fd = static_cast<int>(syscall(__NR_memfd_create, safe_name, MFD_CLOEXEC));
+  if (fd < 0) {
+    return -1;
+  }
+  const size_t aligned_length = xe::round_up(length, page_size());
+  if (ftruncate(fd, static_cast<off_t>(aligned_length)) < 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+#else
+  (void)name;
+  (void)length;
+  return -1;
+#endif
+}
+
+bool TestDualMappingFd(int fd, size_t probe_size) {
+  if (fd < 0 || probe_size < sizeof(uint32_t)) {
+    return false;
+  }
+  void* rx_view =
+      mmap(nullptr, probe_size, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+  if (rx_view == MAP_FAILED) {
+    return false;
+  }
+  void* rw_view =
+      mmap(nullptr, probe_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (rw_view == MAP_FAILED) {
+    munmap(rx_view, probe_size);
+    return false;
+  }
+  *reinterpret_cast<volatile uint32_t*>(rw_view) = kDualMappingWxProbeSentinel;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  const uint32_t readback =
+      *reinterpret_cast<const volatile uint32_t*>(rx_view);
+  munmap(rw_view, probe_size);
+  munmap(rx_view, probe_size);
+  return readback == kDualMappingWxProbeSentinel;
+}
+
+#if XE_PLATFORM_xendroid || XE_PLATFORM_ANDROID
+int32_t GetDeviceAndroidApiLevel() {
+#if XE_PLATFORM_xendroid
+  return android_get_device_api_level();
+#else
+  return xe::GetAndroidApiLevel();
+#endif
+}
+#endif
+}  // namespace
+
+bool IsWritableExecutableMemorySupported() {
+  static const bool supported = []() {
+    const size_t test_size = page_size();
+    void* test_mapping = mmap(nullptr, test_size,
+                              PROT_READ | PROT_WRITE | PROT_EXEC,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (test_mapping == MAP_FAILED) {
+      XELOGW("Anonymous RWX probe failed: {} ({}); W^X dual-mapping required",
+             strerror(errno), errno);
+      return false;
+    }
+    munmap(test_mapping, test_size);
+    return true;
+  }();
+  return supported;
+}
+
+DualMappingWxBackend ProbeDualMappingWxSupport() {
+  static std::once_flag probe_once;
+  static DualMappingWxBackend cached_backend =
+      DualMappingWxBackend::kUnsupported;
+  std::call_once(probe_once, []() {
+    const size_t probe_size = page_size();
+#if XE_PLATFORM_xendroid || XE_PLATFORM_ANDROID
+    // Prefer memfd_create on Android API >= 30 if SELinux permits r-xs + rw-s.
+    if (GetDeviceAndroidApiLevel() >= 30) {
+      int fd = CreateMemfd("xenia_wx_probe", probe_size);
+      if (fd >= 0) {
+        const bool ok = TestDualMappingFd(fd, probe_size);
+        close(fd);
+        if (ok) {
+          cached_backend = DualMappingWxBackend::kMemfd;
+          XELOGI("W^X dual-mapping probe: memfd_create (r-xs + rw-s) OK");
+          return;
+        }
+      }
+    }
+    // Fallback to ASharedMemory_create (ashmem / Android shared memory).
+    int ashmem_fd = -1;
+#if XE_PLATFORM_xendroid
+    ashmem_fd = ASharedMemory_create("xenia_wx_probe", probe_size);
+#elif XE_PLATFORM_ANDROID
+    if (android_ASharedMemory_create_) {
+      ashmem_fd = android_ASharedMemory_create_("xenia_wx_probe", probe_size);
+    }
+#endif
+    if (ashmem_fd >= 0) {
+      const bool ok = TestDualMappingFd(ashmem_fd, probe_size);
+      close(ashmem_fd);
+      if (ok) {
+        cached_backend = DualMappingWxBackend::kAshmem;
+        XELOGI("W^X dual-mapping probe: ASharedMemory (r-xs + rw-s) OK");
+        return;
+      }
+    }
+    XELOGW(
+        "W^X dual-mapping probe failed (SELinux/kernel denied r-xs + rw-s on "
+        "memfd and ASharedMemory); falling back cleanly to RWX");
+#else
+    int fd = CreateMemfd("xenia_wx_probe", probe_size);
+    if (fd >= 0) {
+      const bool ok = TestDualMappingFd(fd, probe_size);
+      close(fd);
+      if (ok) {
+        cached_backend = DualMappingWxBackend::kMemfd;
+        return;
+      }
+    }
+    char shm_name[64];
+    std::snprintf(shm_name, sizeof(shm_name), "/xenia_wx_probe_%d",
+                  static_cast<int>(getpid()));
+    int shm_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (shm_fd >= 0) {
+      shm_unlink(shm_name);
+      bool ok = false;
+      if (ftruncate(shm_fd, static_cast<off_t>(probe_size)) == 0) {
+        ok = TestDualMappingFd(shm_fd, probe_size);
+      }
+      close(shm_fd);
+      if (ok) {
+        cached_backend = DualMappingWxBackend::kPosixShm;
+        return;
+      }
+    }
+    XELOGW("W^X dual-mapping probe failed on POSIX host; falling back to RWX");
+#endif
+  });
+  return cached_backend;
+}
 #endif  // XE_PLATFORM_MAC
 
 struct MappedFileRange {
@@ -492,11 +654,38 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
                                           size_t length, PageAccess access,
                                           bool commit) {
 #if XE_PLATFORM_xendroid
-    //XELOGI("CreateFileMappingHandle: {} 0x{:X}", path.string(), length);
-    int sharedmem_fd = ASharedMemory_create(path.c_str(), length);
-    return sharedmem_fd >= 0 ? sharedmem_fd : kFileMappingHandleInvalid;
+  const bool executable_mapping = (access == PageAccess::kExecuteReadWrite ||
+                                   access == PageAccess::kExecuteReadOnly);
+  if (executable_mapping &&
+      ProbeDualMappingWxSupport() == DualMappingWxBackend::kMemfd) {
+    std::string memfd_name = path.filename().string();
+    if (memfd_name.empty()) {
+      memfd_name = "xenia_jit";
+    }
+    int memfd = CreateMemfd(memfd_name.c_str(), length);
+    if (memfd >= 0) {
+      return memfd;
+    }
+    XELOGW("memfd_create({}, 0x{:X}) failed: {} ({}); falling back to "
+           "ASharedMemory_create",
+           memfd_name, length, strerror(errno), errno);
+  }
+  int sharedmem_fd = ASharedMemory_create(path.c_str(), length);
+  return sharedmem_fd >= 0 ? sharedmem_fd : kFileMappingHandleInvalid;
 #elif XE_PLATFORM_ANDROID
-  // TODO(Triang3l): Check if memfd can be used instead on API 30+.
+  const bool executable_mapping = (access == PageAccess::kExecuteReadWrite ||
+                                   access == PageAccess::kExecuteReadOnly);
+  if (executable_mapping &&
+      ProbeDualMappingWxSupport() == DualMappingWxBackend::kMemfd) {
+    std::string memfd_name = path.filename().string();
+    if (memfd_name.empty()) {
+      memfd_name = "xenia_jit";
+    }
+    int memfd = CreateMemfd(memfd_name.c_str(), length);
+    if (memfd >= 0) {
+      return memfd;
+    }
+  }
   if (android_ASharedMemory_create_) {
     int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
     return sharedmem_fd >= 0 ? sharedmem_fd : kFileMappingHandleInvalid;
