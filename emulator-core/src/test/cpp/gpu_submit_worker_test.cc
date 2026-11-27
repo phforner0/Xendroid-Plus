@@ -494,7 +494,7 @@ void TestSourceInvariants(const fs::path& cpp_root) {
       ReadSourceText(vk_gpu / "vulkan_command_processor.h");
   const std::string cp_cc =
       ReadSourceText(vk_gpu / "vulkan_command_processor.cc");
-  SUBMIT_WORKER_CHECK(cp_cc.find("vulkan_async_submit_worker, false") !=
+  SUBMIT_WORKER_CHECK(cp_cc.find("vulkan_async_submit_worker, true") !=
                       std::string::npos);
   SUBMIT_WORKER_CHECK(cp_cc.find("vulkan_async_submit_worker_nice, -10") !=
                       std::string::npos);

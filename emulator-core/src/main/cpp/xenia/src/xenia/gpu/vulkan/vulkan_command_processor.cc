@@ -185,11 +185,12 @@ DEFINE_bool(
     "Vulkan");
 
 DEFINE_bool(
-    vulkan_async_submit_worker, false,
+    vulkan_async_submit_worker, true,
     "Offload DeferredCommandBuffer replay, sparse binds, command buffer "
     "recording, and vkQueueSubmit to a dedicated Submit & Replay Worker "
-    "thread over a bounded SPSC ring (K=4 chunks). Default false for ABBA "
-    "validation (debug.xendroid.async_submit_worker on Android).",
+    "thread over a bounded SPSC ring (K=4 chunks). Default true after Onda 3 "
+    "ABBA validation (set to false or debug.xendroid.async_submit_worker=0 "
+    "on Android to revert to synchronous submits).",
     "Vulkan");
 
 DEFINE_int32(
