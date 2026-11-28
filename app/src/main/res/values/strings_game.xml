@@ -86,6 +86,7 @@
     <string name="menu_t_winfg_preset">Win-FG preset</string>
     <string name="menu_t_lsfg">Native LSFG</string>
     <string name="menu_t_lsfg_multiplier">LSFG multiplier</string>
+    <string name="menu_t_zerofg_multiplier">ZeroFG multiplier</string>
     <string name="menu_t_lsfg_target">LSFG target</string>
     <string name="menu_t_fps">FPS limit</string>
     <string name="menu_t_sustained">Sustained performance</string>

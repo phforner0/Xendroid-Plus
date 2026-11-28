@@ -16,7 +16,7 @@ class SettingCatalogTest {
 
     @Test fun essential_keeps_player_settings_plus_volume_vibration_and_zerofg() {
         val essential = SettingCatalog.settings(SettingLevel.ESSENTIAL).map { it.key }.toSet()
-        assertEquals(SettingsSchema.playerKeys.toSet() + setOf("APU|volume", "HID|vibration", "Vulkan|zerofg_mode"), essential)
+        assertEquals(SettingsSchema.playerKeys.toSet() + setOf("APU|volume", "HID|vibration", "Vulkan|zerofg_mode", "Vulkan|zerofg_multiplier"), essential)
     }
 
     @Test fun levels_nest() {

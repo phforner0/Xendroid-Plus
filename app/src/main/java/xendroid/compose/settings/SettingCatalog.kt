@@ -49,6 +49,7 @@ object SettingCatalog {
     private val order: Map<SettingGroup, List<Entry>> = mapOf(
         SettingGroup.IMAGE to listOf(
             e("Vulkan|zerofg_mode", E, live = true),
+            e("Vulkan|zerofg_multiplier", E),
             e("Display|postprocess_scaling_and_sharpening", E, live = true),
             e("GPU|draw_resolution_scale_x", E),
             e("GPU|draw_resolution_scale_y", E),

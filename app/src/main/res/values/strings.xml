@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="menu_t_zerofg">ZeroFG</string>
-    <string name="menu_zerofg_reallyzero">ReallyZero</string>
-    <string name="menu_zerofg_zero">Zero</string>
+    <string name="menu_zerofg_reallyzero">On</string>
+    <string name="menu_zerofg_zero">On</string>
     <string name="menu_zerofg_active">ZeroFG output active · requested %1$s</string>
     <string name="menu_zerofg_requested">ZeroFG %1$s · requested</string>
     <string name="hud_zerofg_requested">requested %1$s</string>

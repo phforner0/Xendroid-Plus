@@ -166,7 +166,7 @@ ZeroFGMainSurfaceEgress::ZeroFGMainSurfaceEgress(
     VkSurfaceKHR surface, VkExtent2D extent, VkFormat format,
     uint32_t slot_count, bool elevated_priority, bool apocalypse_guard,
     bool free_output, bool vsync_quantizer, bool vsync_tight_reach,
-    std::function<void()> wake_owner)
+    bool vsync_retire, std::function<void()> wake_owner)
     : device_(device),
       producer_(producer),
       surface_(surface),
@@ -182,8 +182,11 @@ ZeroFGMainSurfaceEgress::ZeroFGMainSurfaceEgress(
       apocalypse_guard_(apocalypse_guard && timing_available_),
       free_output_(free_output),
       vsync_quantizer_(vsync_quantizer && timing_available_),
-      tight_reach_(vsync_tight_reach) {
+      tight_reach_(vsync_tight_reach),
+      vsync_retire_(vsync_retire && free_output && vsync_quantizer &&
+                    timing_available_) {
   counters_.timing_available = timing_available_;
+  counters_.vsync_retire = vsync_retire_;
   counters_.apocalypse_guard = apocalypse_guard_;
   counters_.free_output = free_output_;
   counters_.vsync_quantizer = vsync_quantizer_;
@@ -727,6 +730,18 @@ void ZeroFGMainSurfaceEgress::Serve() {
       DropUnpresented(superseded[i], true);
     }
     superseded_count = 0;
+    if (vsync_retire_ && RetireBehindSynthetic(request)) {
+      DropUnpresented(request, true);
+      continue;
+    }
+    if (vsync_retire_ && YieldToReal(request)) {
+      DropUnpresented(request, true);
+      continue;
+    }
+    if (vsync_retire_ && DrainBacklog(request)) {
+      DropUnpresented(request, true);
+      continue;
+    }
     bool probe = false;
     if (free_output_ && !PaceFreePresent(request, probe)) {
       Abandon(request);
@@ -1014,9 +1029,18 @@ bool ZeroFGMainSurfaceEgress::ServeRequest(const Request& request,
     context.assigned_vsync_ns = 0;
     last_quantize_tight_only_ = false;
     if (vsync_quantizer_) {
+      const uint64_t shadow_previous_slot_ns = vsync_last_slot_ns_;
+      const uint64_t shadow_offset_before = vsync_offset_periods_;
+      const uint64_t shadow_target_ns = present_time.desiredPresentTime;
       present_time.desiredPresentTime =
           QuantizeToVsync(present_time.desiredPresentTime,
                           EgressMonotonicTimeNs(), context.assigned_vsync_ns);
+      if (request.synthetic && context.assigned_vsync_ns) {
+        Request judged = request;
+        judged.desired_present_ns = shadow_target_ns;
+        ShadowReserve(judged, shadow_previous_slot_ns, shadow_offset_before,
+                      context.assigned_vsync_ns);
+      }
     }
     VkPresentTimesInfoGOOGLE present_times = {
         VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE};
@@ -1068,6 +1092,20 @@ bool ZeroFGMainSurfaceEgress::ServeRequest(const Request& request,
     if (latency_mode_ != request.latency_mode ||
         latency_generation_ != request.latency_generation) {
       ++latency_batch_.invalid;
+    }
+    if (request.synthetic) {
+      ++shadow_synthetics_presented_;
+    } else {
+      ++shadow_reals_presented_;
+      shadow_need_p50_ns_ = request.d_need_p50_ns;
+      shadow_need_p95_ns_ = request.d_need_p95_ns;
+      shadow_need_samples_ = request.d_need_samples;
+      shadow_margin_ns_ = request.d_margin_ns;
+      shadow_snaps_ = request.vsync_snaps;
+      shadow_snaps_skipped_ = request.vsync_snaps_skipped;
+    }
+    if (request.operated_depth_ns) {
+      shadow_depth_ns_ = request.operated_depth_ns;
     }
     TimingRecord& record = timing_records_[timing_record_next_];
     if (timing_available_ && record.used && !record.resolved) {
@@ -1581,6 +1619,15 @@ uint64_t ZeroFGMainSurfaceEgress::QuantizeToVsync(uint64_t target_ns,
                                          copy_tail_ns) +
                                 kVsyncLatchMarginNs)
             : sum_reach_ns;
+  // The grid for the presenter's vsync snap (VsyncGrid): the vsync lattice and
+  // the lead an output needs from its present call to its first reachable vsync.
+  grid_anchor_ns_.store(anchor_ns, std::memory_order_relaxed);
+  grid_period_ns_.store(period_ns, std::memory_order_relaxed);
+  grid_lead_ns_.store(
+      (tight ? std::max(period_ns + kCompositorLeadExtraNs, copy_tail_ns)
+             : copy_ns + period_ns) +
+          kVsyncLatchMarginNs,
+      std::memory_order_relaxed);
   uint64_t slot_ns =
       vsync_at_or_after(target_ns) + vsync_offset_periods_ * period_ns;
   bool reanchored = false;
@@ -1633,6 +1680,118 @@ uint64_t ZeroFGMainSurfaceEgress::QuantizeToVsync(uint64_t target_ns,
   }
   // Half a refresh before the vsync: the compositor targets exactly this one.
   return slot_ns - period_ns / 2;
+}
+
+bool ZeroFGMainSurfaceEgress::RetireBehindSynthetic(const Request& request) {
+  // The quantizer's own state, on this thread: the same lattice QuantizeToVsync
+  // will place this output on. Not while a limiter paces the presents (the
+  // quantizer then is not what decides) or before the lattice is known.
+  if (limiter_period_ns_ || limiter_block_streak_ || !vsync_anchor_ns_ ||
+      !vsync_last_slot_ns_) {
+    vsync_behind_streak_ = 0;
+    return false;
+  }
+  uint64_t period_ns = 0;
+  uint64_t copy_ns = 0;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    period_ns = counters_.refresh_cycle_now_ns;
+    if (copy_residence_ns_.count()) {
+      copy_ns = copy_residence_ns_.Quantile(50, 100);
+    }
+  }
+  if (!period_ns) {
+    vsync_behind_streak_ = 0;
+    return false;
+  }
+  const uint64_t anchor_ns = vsync_anchor_ns_;
+  const uint64_t target_ns = request.desired_present_ns;
+  const uint64_t at_or_after_ns =
+      target_ns <= anchor_ns
+          ? anchor_ns - (anchor_ns - target_ns) / period_ns * period_ns
+          : anchor_ns +
+                (target_ns - anchor_ns + period_ns - 1) / period_ns * period_ns;
+  const uint64_t slot_ns = at_or_after_ns + vsync_offset_periods_ * period_ns;
+  // Pushed-phase shed (2026-11-27, ARMSX2 at a 30 lock on 60 Hz): a phase the
+  // reach pushed stays pushed when every vsync has an output (one output per
+  // refresh), since QuantizeToVsync only sheds into a free vsync. The outputs
+  // there were ready ~36 ms before their vsync, holding 1-2 vsyncs of
+  // latency for nothing. When the output after this Synthetic (its target one
+  // quantum later, presented around its target) would reach this Synthetic's
+  // vsync under the tight reach, for kVsyncShedStreak outputs in a row, the
+  // Synthetic is dropped and the phase sheds one refresh into its vsync.
+  if (request.synthetic && vsync_offset_periods_ &&
+      tight_reach_.load(std::memory_order_relaxed) && request.output_quantum_ns &&
+      slot_ns >= vsync_last_slot_ns_ + period_ns / 2) {
+    uint64_t copy_tail_ns = 0;
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      if (copy_residence_ns_.count()) {
+        copy_tail_ns = copy_residence_ns_.Quantile(90, 100);
+      }
+    }
+    const uint64_t next_present_ns = target_ns + request.output_quantum_ns;
+    const uint64_t next_reach_target_ns =
+        next_present_ns +
+        std::max(period_ns + kCompositorLeadExtraNs, copy_tail_ns) +
+        kVsyncLatchMarginNs;
+    const uint64_t next_reach_ns =
+        next_reach_target_ns <= anchor_ns
+            ? anchor_ns - (anchor_ns - next_reach_target_ns) / period_ns * period_ns
+            : anchor_ns + (next_reach_target_ns - anchor_ns + period_ns - 1) /
+                              period_ns * period_ns;
+    if (slot_ns + period_ns / 2 >= next_reach_ns) {
+      if (++vsync_shed_streak_ >= kVsyncShedStreak) {
+        vsync_shed_streak_ = 0;
+        --vsync_offset_periods_;
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++counters_.vsync_retired;
+        return true;
+      }
+    } else {
+      vsync_shed_streak_ = 0;
+    }
+  } else if (!vsync_offset_periods_) {
+    vsync_shed_streak_ = 0;
+  }
+  // Behind: the vsync this output's tick maps to is the previous present's,
+  // or an earlier one; QuantizeToVsync would push it to the next.
+  if (slot_ns >= vsync_last_slot_ns_ + period_ns / 2) {
+    vsync_behind_streak_ = 0;
+    return false;
+  }
+  ++vsync_behind_streak_;
+  const bool pushed = vsync_offset_periods_ != 0;
+  if (!request.synthetic || (!pushed && vsync_behind_streak_ < 2)) {
+    return false;
+  }
+  // Only a schedule that is late, not a copy that is: the vsync this output
+  // leaves free must be within the next output's reach with a refresh to
+  // spare (QuantizeToVsync's sum reach), else the next one would push the
+  // phase forward again and the dropped frame would buy nothing.
+  const uint64_t now_ns = EgressMonotonicTimeNs();
+  const uint64_t reach_target_ns =
+      now_ns + copy_ns + period_ns + kVsyncLatchMarginNs;
+  const uint64_t reach_ns =
+      reach_target_ns <= anchor_ns
+          ? anchor_ns - (anchor_ns - reach_target_ns) / period_ns * period_ns
+          : anchor_ns + (reach_target_ns - anchor_ns + period_ns - 1) /
+                            period_ns * period_ns;
+  if (vsync_last_slot_ns_ + period_ns < reach_ns + period_ns) {
+    return false;
+  }
+  if (pushed) {
+    --vsync_offset_periods_;
+  }
+  vsync_behind_streak_ = 0;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    ++counters_.vsync_retired;
+    if (!pushed) {
+      ++counters_.vsync_retired_unpushed;
+    }
+  }
+  return true;
 }
 
 void ZeroFGMainSurfaceEgress::DropUnpresented(const Request& request,
@@ -1933,6 +2092,45 @@ void ZeroFGMainSurfaceEgress::ObserveRealLatency(const TimingRecord& record,
   latency_last_source_id_ = record.source_id;
   latency_last_issue_ns_ = record.issue_time_ns;
   latency_last_shown_ns_ = actual_ns;
+  // Shadow: B's predicted vsync against the one it got, and the tripwire.
+  bool predicted = false;
+  for (ShadowPrediction& prediction : shadow_predictions_) {
+    if (prediction.source_id && prediction.source_id == record.source_id) {
+      if (shadow_errors_ns_.size() < 4096) {
+        shadow_errors_ns_.push_back(int64_t(actual_ns) -
+                                    int64_t(prediction.predicted_ns));
+      }
+      prediction = {};
+      predicted = true;
+      break;
+    }
+  }
+  if (!predicted && shadow_synthetics_judged_) {
+    ++shadow_error_unmatched_;
+  }
+  if (shadow_depth_ns_ &&
+      actual_ns - record.issue_time_ns > shadow_depth_ns_ + kShadowTripNs) {
+    ++shadow_would_trip_;
+  }
+  // The tripwire (active): the Real's egress lag, target to actualPresentTime.
+  if (vsync_retire_ && record.desired_ns && actual_ns > record.desired_ns) {
+    const uint64_t period_ns = grid_period_ns_.load(std::memory_order_relaxed);
+    if (period_ns && actual_ns - record.desired_ns > kTripPeriods * period_ns) {
+      if (now_ns >= trip_hold_until_ns_) {
+        ++trips_;
+      }
+      trip_hold_until_ns_ = now_ns + kTripHoldPeriods * period_ns;
+    }
+  }
+  if (record.desired_ns && record.assigned_vsync_ns &&
+      shadow_lattice_ns_.size() < 4096) {
+    shadow_lattice_ns_.push_back(int64_t(record.desired_ns) -
+                                 int64_t(record.issue_time_ns));
+    shadow_quantizer_ns_.push_back(int64_t(record.assigned_vsync_ns) -
+                                   int64_t(record.desired_ns));
+    shadow_display_ns_.push_back(int64_t(actual_ns) -
+                                 int64_t(record.assigned_vsync_ns));
+  }
   if (latency_batch_.samples == LatencyBatch::kCapacity) {
     ++latency_batch_.overflow;
     return;
@@ -1947,6 +2145,279 @@ void ZeroFGMainSurfaceEgress::ObserveRealLatency(const TimingRecord& record,
   latency_batch_.shown_last_ns = actual_ns;
   latency_batch_.samples_ns[latency_batch_.samples++] =
       actual_ns - record.issue_time_ns;
+}
+
+bool ZeroFGMainSurfaceEgress::YieldToReal(const Request& request) {
+  if (!request.synthetic) {
+    return false;
+  }
+  if (trip_hold_until_ns_ && EgressMonotonicTimeNs() < trip_hold_until_ns_) {
+    ++trip_held_synthetic_;
+    return true;
+  }
+  if (!request.next_real_offset_ns || !request.output_quantum_ns ||
+      !request.desired_present_ns || limiter_period_ns_ ||
+      limiter_block_streak_ || !vsync_anchor_ns_) {
+    return false;
+  }
+  uint64_t period_ns = 0;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    period_ns = counters_.refresh_cycle_now_ns;
+  }
+  if (!period_ns) {
+    return false;
+  }
+  // Over capacity: outputs spaced closer than a refresh (ARMSX2 at 60 fps
+  // x2 on 60 Hz, 2026-11-27: the S that got through re-formed a chain of Reals
+  // the backlog drain then cut 2-6 Reals a second out of). Below it, only the
+  // last Synthetic before B is judged, by the reserve.
+  const bool over_capacity =
+      request.output_quantum_ns * 20 < period_ns * 19;
+  if (!over_capacity &&
+      request.next_real_offset_ns != request.output_quantum_ns) {
+    return false;
+  }
+  const uint64_t anchor_ns = vsync_anchor_ns_;
+  const auto vsync_at_or_after = [anchor_ns, period_ns](uint64_t t) {
+    if (t <= anchor_ns) {
+      return anchor_ns - (anchor_ns - t) / period_ns * period_ns;
+    }
+    return anchor_ns + (t - anchor_ns + period_ns - 1) / period_ns * period_ns;
+  };
+  const uint64_t offset_ns = vsync_offset_periods_ * period_ns;
+  const auto after = [&](uint64_t own_ns, uint64_t last_ns) {
+    return last_ns && own_ns < last_ns + period_ns / 2 ? last_ns + period_ns
+                                                       : own_ns;
+  };
+  const uint64_t s_slot_ns =
+      after(vsync_at_or_after(request.desired_present_ns) + offset_ns,
+            vsync_last_slot_ns_);
+  const uint64_t b_own_ns =
+      vsync_at_or_after(request.desired_present_ns +
+                        request.next_real_offset_ns) + offset_ns;
+  const uint64_t b_with_ns = after(b_own_ns, s_slot_ns);
+  const uint64_t b_without_ns = after(b_own_ns, vsync_last_slot_ns_);
+  const bool delays_b = b_with_ns > b_without_ns + period_ns / 2;
+  if (over_capacity) {
+    if (!delays_b) {
+      return false;
+    }
+    ++yielded_synthetic_;
+    return true;
+  }
+  if (!delays_b || !request.issue_time_ns || !request.operated_depth_ns ||
+      b_with_ns <= request.issue_time_ns ||
+      b_with_ns - request.issue_time_ns <=
+          request.operated_depth_ns + kShadowReserveNs) {
+    reserve_streak_ = 0;
+    return false;
+  }
+  if (++reserve_streak_ < kReserveStreak) {
+    return false;
+  }
+  reserve_streak_ = 0;
+  ++reserved_synthetic_;
+  return true;
+}
+
+bool ZeroFGMainSurfaceEgress::DrainBacklog(const Request& request) {
+  if (limiter_period_ns_ || limiter_block_streak_ || !vsync_anchor_ns_ ||
+      !vsync_last_slot_ns_ || !request.desired_present_ns) {
+    backlog_streak_ = 0;
+    return false;
+  }
+  uint64_t period_ns = 0;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    period_ns = counters_.refresh_cycle_now_ns;
+  }
+  if (!period_ns) {
+    backlog_streak_ = 0;
+    return false;
+  }
+  const uint64_t anchor_ns = vsync_anchor_ns_;
+  const uint64_t target_ns = request.desired_present_ns;
+  const uint64_t at_or_after_ns =
+      target_ns <= anchor_ns
+          ? anchor_ns - (anchor_ns - target_ns) / period_ns * period_ns
+          : anchor_ns +
+                (target_ns - anchor_ns + period_ns - 1) / period_ns * period_ns;
+  // The output's own vsync (its tick and the quantizer's phase), and how far
+  // the previous present's vsync chains it past that.
+  const uint64_t own_ns = at_or_after_ns + vsync_offset_periods_ * period_ns;
+  const uint64_t chained_ns = vsync_last_slot_ns_ + period_ns;
+  if (chained_ns < own_ns + kBacklogDrainPeriods * period_ns) {
+    backlog_streak_ = 0;
+    return false;
+  }
+  if (++backlog_streak_ < kBacklogDrainStreak) {
+    return false;
+  }
+  backlog_streak_ = 0;
+  if (request.synthetic) {
+    ++backlog_drained_synthetic_;
+  } else {
+    ++backlog_drained_real_;
+  }
+  return true;
+}
+
+void ZeroFGMainSurfaceEgress::ShadowReserve(const Request& request,
+                                            uint64_t previous_slot_ns,
+                                            uint64_t offset_before,
+                                            uint64_t synthetic_slot_ns) {
+  if (!request.next_real_offset_ns || !request.issue_time_ns ||
+      !request.desired_present_ns) {
+    return;
+  }
+  uint64_t period_ns = 0;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    period_ns = counters_.refresh_cycle_now_ns;
+  }
+  const uint64_t anchor_ns = vsync_anchor_ns_;
+  if (!period_ns || !anchor_ns) {
+    return;
+  }
+  const auto vsync_at_or_after = [anchor_ns, period_ns](uint64_t t) {
+    if (t <= anchor_ns) {
+      return anchor_ns - (anchor_ns - t) / period_ns * period_ns;
+    }
+    return anchor_ns + (t - anchor_ns + period_ns - 1) / period_ns * period_ns;
+  };
+  // B's vsync as QuantizeToVsync would place it after a given previous
+  // present (its copy's reach left out: B's copy has not started yet).
+  const uint64_t b_target_ns =
+      request.desired_present_ns + request.next_real_offset_ns;
+  const auto place_b = [&](uint64_t last_slot_ns, uint64_t offset) {
+    uint64_t slot_ns = vsync_at_or_after(b_target_ns) + offset * period_ns;
+    if (last_slot_ns && slot_ns < last_slot_ns + period_ns / 2) {
+      slot_ns = last_slot_ns + period_ns;
+    }
+    return slot_ns;
+  };
+  const uint64_t with_ns = place_b(synthetic_slot_ns, vsync_offset_periods_);
+  const uint64_t without_ns = place_b(previous_slot_ns, offset_before);
+  ++shadow_synthetics_judged_;
+  if (with_ns > without_ns + period_ns / 2) {
+    ++shadow_would_delay_;
+    if (shadow_depth_ns_ && with_ns > request.issue_time_ns &&
+        with_ns - request.issue_time_ns > shadow_depth_ns_ + kShadowReserveNs) {
+      ++shadow_would_cut_;
+    }
+  }
+  // The last Synthetic before B owns the prediction (x3 / x4: k = n - 1).
+  for (ShadowPrediction& prediction : shadow_predictions_) {
+    if (prediction.source_id == request.source_id) {
+      prediction.predicted_ns = with_ns;
+      return;
+    }
+  }
+  shadow_predictions_[shadow_prediction_next_] = {request.source_id, with_ns};
+  shadow_prediction_next_ =
+      (shadow_prediction_next_ + 1) % shadow_predictions_.size();
+}
+
+void ZeroFGMainSurfaceEgress::LogSummary(
+    uint64_t window_ns, uint64_t refresh_ns,
+    const std::array<uint64_t, LatencyBatch::kCapacity>& sorted) {
+  const double seconds = double(window_ns) / 1e9;
+  if (seconds <= 0.5) {
+    return;
+  }
+  const auto ms = [](double ns) { return ns / 1e6; };
+  const size_t samples = latency_batch_.samples;
+  const auto age_ms = [&](size_t percent) -> double {
+    if (!samples) return 0.0;
+    const size_t rank = (samples * percent + 99) / 100;
+    return ms(double(sorted[std::min(samples - 1, rank ? rank - 1 : size_t(0))]));
+  };
+  std::vector<int64_t> errors = shadow_errors_ns_;
+  std::sort(errors.begin(), errors.end());
+  const auto error_ms = [&](size_t percent) -> double {
+    if (errors.empty()) return 0.0;
+    const size_t rank = (errors.size() * percent + 99) / 100;
+    return ms(double(errors[std::min(errors.size() - 1, rank ? rank - 1 : size_t(0))]));
+  };
+  std::string age = samples ? fmt::format("Real age p50/p99 {:.1f}/{:.1f} ms ({} timed)",
+                                          age_ms(50), age_ms(99), samples)
+                            : std::string("Real age not measured (no display timing)");
+  std::string prediction =
+      errors.empty() ? std::string("prediction not measured")
+                     : fmt::format("B prediction error p1/p50/p99 {:+.1f}/{:+.1f}/{:+.1f} ms ({} matched, {} not)",
+                                   error_ms(1), error_ms(50), error_ms(99), errors.size(),
+                                   shadow_error_unmatched_);
+  std::string need =
+      shadow_need_samples_
+          ? fmt::format("D_need p50/p95 {:.1f}/{:.1f} ms ({} samples), F {:.1f} ms", ms(double(shadow_need_p50_ns_)),
+                        ms(double(shadow_need_p95_ns_)), shadow_need_samples_, ms(double(shadow_margin_ns_)))
+          : fmt::format("D_need not learned yet, F {:.1f} ms", ms(double(shadow_margin_ns_)));
+  const auto median_ms = [&](std::vector<int64_t>& values) -> double {
+    if (values.empty()) return 0.0;
+    std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
+    return ms(double(values[values.size() / 2]));
+  };
+  uint64_t retired = 0, reanchor = 0, absorbed = 0, refused = 0;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    retired = counters_.vsync_retired - shadow_last_retired_;
+    reanchor = counters_.vsync_phase_reanchor - shadow_last_reanchor_;
+    absorbed = counters_.vsync_gap_absorbed - shadow_last_absorbed_;
+    refused = counters_.vsync_duplicate_refused - shadow_last_refused_;
+    shadow_last_retired_ = counters_.vsync_retired;
+    shadow_last_reanchor_ = counters_.vsync_phase_reanchor;
+    shadow_last_absorbed_ = counters_.vsync_gap_absorbed;
+    shadow_last_refused_ = counters_.vsync_duplicate_refused;
+  }
+  std::string split =
+      shadow_lattice_ns_.empty()
+          ? std::string("age split not measured")
+          : fmt::format("age split p50: issue->target {:.1f}, target->vsync {:.1f}, vsync->shown {:.1f} ms; "
+                        "quantizer offset {} vsync(s), {} pushed, {} absorbed, {} refused, {} S retired{}; "
+                        "backlog drained {} Real(s) + {} S; {} S yielded to their Real; "
+                        "{} S cut by the reserve; tripwire {} trip(s), {} S held; "
+                        "vsync snap {} of {} reanchors",
+                        median_ms(shadow_lattice_ns_), median_ms(shadow_quantizer_ns_),
+                        median_ms(shadow_display_ns_), vsync_offset_periods_, reanchor, absorbed, refused,
+                        retired, vsync_retire_ ? "" : " (retire off)",
+                        backlog_drained_real_ - shadow_last_drained_real_,
+                        backlog_drained_synthetic_ - shadow_last_drained_synthetic_,
+                        yielded_synthetic_ - shadow_last_yielded_,
+                        reserved_synthetic_ - shadow_last_reserved_,
+                        trips_ - shadow_last_trips_,
+                        trip_held_synthetic_ - shadow_last_trip_held_,
+                        shadow_snaps_ - shadow_last_snaps_,
+                        (shadow_snaps_ - shadow_last_snaps_) +
+                            (shadow_snaps_skipped_ - shadow_last_snaps_skipped_));
+  shadow_last_yielded_ = yielded_synthetic_;
+  shadow_last_reserved_ = reserved_synthetic_;
+  shadow_last_trips_ = trips_;
+  shadow_last_trip_held_ = trip_held_synthetic_;
+  shadow_last_snaps_ = shadow_snaps_;
+  shadow_last_snaps_skipped_ = shadow_snaps_skipped_;
+  shadow_last_drained_real_ = backlog_drained_real_;
+  shadow_last_drained_synthetic_ = backlog_drained_synthetic_;
+  shadow_lattice_ns_.clear();
+  shadow_quantizer_ns_.clear();
+  shadow_display_ns_.clear();
+  XELOGW("ZeroFG summary (quantizer): {}", split);
+  // Warning level on purpose: hosts route the presenter's info lines to their
+  // development logs, and this one line every 5 s is what a user's log must carry.
+  XELOGW(
+      "ZeroFG summary: refresh {:.2f} ms ({:.1f} Hz), D {:.1f} ms ({}), shown {:.1f} Real/s + {:.1f} S/s; {}; {}; "
+      "shadow reserve (D+25 ms): {} of {} S would delay B, {} would be cut; tripwire (D+35 ms): {} Reals past it",
+      ms(double(refresh_ns)), refresh_ns ? 1e9 / double(refresh_ns) : 0.0, ms(double(shadow_depth_ns_)), need,
+      double(shadow_reals_presented_) / seconds, double(shadow_synthetics_presented_) / seconds, age,
+      prediction, shadow_would_delay_, shadow_synthetics_judged_, shadow_would_cut_, shadow_would_trip_);
+  shadow_reals_presented_ = 0;
+  shadow_synthetics_presented_ = 0;
+  shadow_synthetics_judged_ = 0;
+  shadow_would_delay_ = 0;
+  shadow_would_cut_ = 0;
+  shadow_would_trip_ = 0;
+  shadow_error_unmatched_ = 0;
+  shadow_errors_ns_.clear();
 }
 
 void ZeroFGMainSurfaceEgress::MaybeLogLatencyBatch(uint64_t now_ns, bool force) {
@@ -2000,6 +2471,8 @@ void ZeroFGMainSurfaceEgress::MaybeLogLatencyBatch(uint64_t now_ns, bool force) 
       latency_batch_.real_overtaken, latency_batch_.real_timed,
       latency_batch_.synthetic_timed, timing_available_, unmatched, query_errors,
       reliable, samples_us);
+  LogSummary(now_ns - latency_window_start_ns_, counters_.refresh_cycle_now_ns,
+             sorted);
   latency_window_start_ns_ = now_ns;
   latency_last_unmatched_ = counters_.timings_unmatched;
   latency_last_query_errors_ = counters_.timing_query_errors;

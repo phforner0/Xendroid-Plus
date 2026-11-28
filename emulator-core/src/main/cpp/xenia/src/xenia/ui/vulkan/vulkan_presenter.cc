@@ -140,9 +140,9 @@ DEFINE_bool(
     "Vulkan");
 DEFINE_bool(zerofg_frame_generation, false,
             "Enable the independent ZeroFG presenter.", "Vulkan");
-DEFINE_string(zerofg_mode, "off", "ZeroFG: off, zero (RC7), reallyzero (the dense flow).", "Vulkan");
+DEFINE_string(zerofg_mode, "off", "ZeroFG frame generation: off or on (\"reallyzero\"; earlier names that meant on, \"zero\" included, also turn it on).", "Vulkan");
 DEFINE_bool(zerofg_guest_vblank_pull, true, "Use the validated guest vblank pull while ZeroFG is live.", "Vulkan");
-DEFINE_bool(zerofg_vsync_tight_reach, false, "Optional tight reach; disabled by default.", "Vulkan");
+DEFINE_bool(zerofg_tight_reach_on, true, "Tight reach (2026-11-27 pacing test, on): the vsync quantizer reaches a vsync with a refresh and 2 ms of lead or the copy tail, whichever is longer, instead of their sum; it falls back to the sum for the session past 5 % late. Renamed from zerofg_vsync_tight_reach, which shipped off.", "Vulkan");
 DEFINE_bool(
     zerofg_free_output, true,
     "Main Surface: the pipeline never waits for the panel. An output is copied "
@@ -161,6 +161,41 @@ DEFINE_bool(
     "panel cannot make two outputs meet in one compositor latch, which shows "
     "only the newest (~60 of 120 shown for minutes). Off: the logical target "
     "is the desired present time. Startup-only; default on.",
+    "Vulkan");
+DEFINE_bool(
+    zerofg_mfg_tick_retire, true,
+    "MFG (test branch, the owner 2026-11-19): latency wells (120-200 ms at x4). "
+    "Phase recoveries anchor at the oldest pending Real instead of the newest "
+    "(each reanchor added the pending Reals' span to the latency), and with one "
+    "output per refresh (N x the game's rate = the refresh: x4 30 on 120 Hz, x3 "
+    "on 90, x2 30 on 60, x2 60 on 120), where neither the rate drain (off "
+    "there) nor the presentation advance can take a lead back, the lead drains "
+    "in short pairs: N - 1 ticks with one generated frame fewer (at x2 a "
+    "real-only pair), each one tick earlier, every other pair at most. Real "
+    "frames are never dropped.",
+    "Vulkan");
+DEFINE_bool(
+    zerofg_pushed_phase_retire, true,
+    "Main Surface (MFG test branch, the owner 2026-11-19): when every vsync "
+    "already has an output (N x the game's rate = the refresh: x4 30 on "
+    "120 Hz, x3 on 90, x2 30 on 60), a late output pushed the vsync "
+    "quantizer's phase for good (latency wells of 120-216 ms in Gears of War 3 "
+    "at x4). On, a generated frame whose own vsync is already taken while the "
+    "phase is pushed (or for the second output in a row) is not shown, and "
+    "the phase steps one refresh back. Also (2026-11-27) a pushed phase the "
+    "next output could reach one vsync earlier under the tight reach, 8 "
+    "outputs in a row, sheds a refresh the same way. Reals are never "
+    "dropped. Renamed from zerofg_vsync_retire, which shipped off. Read when "
+    "ZeroFG's output starts (switch frame generation off and on to apply).",
+    "Vulkan");
+DEFINE_uint32(
+    zerofg_multiplier, 2,
+    "Frame generation multiplier: 2 (one generated frame per game "
+    "frame), 3 or 4, used as chosen up to what the refresh holds (N "
+    "outputs need N vsyncs per game frame: x4 from 30 is 2 on 60 Hz; no "
+    "step down on lateness; MFG test branch). Even motion needs N x the game's rate to match the "
+    "display (30 fps on 120 Hz: x4, 40 fps: x3). Needs the vsync "
+    "quantizer and free output. Read at each reanchor.",
     "Vulkan");
 DEFINE_bool(
     zerofg_phase_recovery, true,
@@ -2225,6 +2260,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
       zerofg_bound_selection_.load(std::memory_order_acquire)) {
     return PaintResult::kNotPresentedConnectionOutdated;
   }
+  // Zero's switches (zerofg_zero_light, zerofg_zero_quarter_base) are fixed
+  // for an adapter's life: a change rebuilds ZeroFG as a mode change does.
+  if (zerofg_bound_selection_.load(std::memory_order_acquire) ==
+          ZeroFGSelection::kZero &&
+      ZeroFGZeroOptions() !=
+          zerofg_bound_zero_options_.load(std::memory_order_acquire)) {
+    return PaintResult::kNotPresentedConnectionOutdated;
+  }
   if (zerofg_independent_presenter_ &&
       zerofg_independent_presenter_->main_surface_reconnect_requested()) {
     // Main Surface Authority: the Surface went out of date under B. The UI
@@ -3189,6 +3232,8 @@ bool VulkanPresenter::ScheduleGuestOutput() {
 bool VulkanPresenter::EnsureZeroFGSessionForMode() {
   const ZeroFGSelection requested = GetZeroFGSelection();
   zerofg_bound_selection_.store(requested, std::memory_order_release);
+  zerofg_bound_zero_options_.store(ZeroFGZeroOptions(),
+                                   std::memory_order_release);
   if (requested == ZeroFGSelection::kOff || zerofg_independent_presenter_)
     return true;
   const bool baseline_available =
@@ -3939,7 +3984,8 @@ bool VulkanPresenter::PrepareZeroFGGenerationContext(
         zerofg_bound_selection_.load(std::memory_order_acquire) == ZeroFGSelection::kReallyZero ? zerofg::Mode::kDenseFlow
                                 : zerofg::Mode::kRC7,
         backend_fallback ? zerofg::Backend::kCompat : zerofg::Backend::kAuto,
-        capabilities, &adapter_status);
+        capabilities, &adapter_status,
+        zerofg_bound_zero_options_.load(std::memory_order_acquire));
   }
   if (!context->adapter) {
     util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
@@ -4405,7 +4451,7 @@ bool VulkanPresenter::ProcessZeroFGGeneration(
                 request.previous_layout, request.previous_source_id),
       wrap_real(request.current_image, request.current_view,
                 request.current_layout, request.current_source_id),
-      0.5f,
+      request.phase,  // MFG: 0.5 at x2; k / N for a pair's k-th frame
       wrap_internal(*context.outputs[selected]));
   if (interpolate_status != zerofg::Status::kSuccess) {
     dfn.vkResetCommandPool(device, command.command_pool, 0);

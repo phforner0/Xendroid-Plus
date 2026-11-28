@@ -17,11 +17,11 @@ class SettingsSchemaTest {
     // less APU|mute and GPU|readback_memexport, which the core never defined (ajustes-2.md).
     // Display|host_present_from_non_ui_thread is intentionally absent (forced true natively).
     // Plus adds Vulkan|zerofg_mode, System link's Network|systemlink + Network|systemlink_peers (176),
-    // and the 19 Plus Ultra Track A/B/C/D canonical engine cvars: 195.
-    @Test fun total_entry_count_is_195() {
-        assertEquals(195, all.size)
+    // the 19 Plus Ultra Track A/B/C/D canonical engine cvars (195), and the MFG multiplier Vulkan|zerofg_multiplier: 196.
+    @Test fun total_entry_count_is_196() {
+        assertEquals(196, all.size)
         assertEquals(
-            195,
+            196,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
@@ -30,7 +30,7 @@ class SettingsSchemaTest {
     @Test fun counts_by_type_match_verified_inventory() {
         assertEquals(138, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra bool cvars
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
-        assertEquals(32, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start
+        assertEquals(33, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start + zerofg_multiplier
         assertEquals(2, all.count { it is Setting.Action })
         assertEquals(3, all.count { it is Setting.Text })          // launch_module, cl, systemlink_peers
     }
@@ -164,7 +164,8 @@ class SettingsSchemaTest {
 
     @Test fun framerate_limit_offers_20_and_40_fps_options() {
         val s = SettingsSchema.byKey["GPU|framerate_limit"] as Setting.ListChoice
-        assertEquals(listOf("60", "20", "30", "40", "45", "90", "120", "0"), s.options.map { it.value })
+        // 15 is the MFG branch's addition (a source for x4 tests: 15 -> 60).
+        assertEquals(listOf("60", "15", "20", "30", "40", "45", "90", "120", "0"), s.options.map { it.value })
         assertEquals("60", s.default)
         assertTrue(s.key in SettingsSchema.playerKeys)
     }

@@ -80,7 +80,8 @@ class ZeroFGMainSurfaceProducer {
 // back as a completion once the copy that read it has finished.
 class ZeroFGMainSurfaceEgress {
  public:
-  static constexpr uint32_t kMaxSlots = 8;
+  // The presenter's FinalOutput pool: 2 N + 1 (9 at the MFG ceiling of 4). One slot per FinalOutput, so it must hold all of them.
+  static constexpr uint32_t kMaxSlots = 9;
 
   enum class Failure : uint32_t {
     kNone,
@@ -121,6 +122,21 @@ class ZeroFGMainSurfaceEgress {
     // The pacing's output quantum for this output (0 before it is armed). The
     // output shaper engages only while it is at least one 60 Hz period.
     uint64_t output_quantum_ns = 0;
+    // Shadow reservation (observation only, never moves a present): on a
+    // Synthetic, how far after its target its pair's Real B is due
+    // ((n - k) quanta); 0 on a Real. And the presenter's operated depth D
+    // (Better D) when the output was applied, 0 when unknown.
+    uint64_t next_real_offset_ns = 0;
+    uint64_t operated_depth_ns = 0;
+    // Better D's split, on Reals (summary only): the qualified need's p50 and
+    // p95 and their sample count (0 before the window is ready), and F.
+    uint64_t d_need_p50_ns = 0;
+    uint64_t d_need_p95_ns = 0;
+    uint32_t d_need_samples = 0;
+    uint64_t d_margin_ns = 0;
+    // The presenter's vsync snap totals (summary only), on Reals.
+    uint64_t vsync_snaps = 0;
+    uint64_t vsync_snaps_skipped = 0;
     uint64_t apply_time_ns = 0;
     VkImage image = VK_NULL_HANDLE;
     // The Post's completion timeline point: the copy waits on it on the GPU.
@@ -251,6 +267,11 @@ class ZeroFGMainSurfaceEgress {
     uint64_t vsync_phase_reanchor = 0;
     uint64_t vsync_duplicate_refused = 0;
     uint64_t vsync_gap_absorbed = 0;
+    // zerofg_vsync_retire: whether it is on, and the synthetics retired (with
+    // the phase pushed, and without: two outputs in a row behind).
+    bool vsync_retire = false;
+    uint64_t vsync_retired = 0;
+    uint64_t vsync_retired_unpushed = 0;
     int64_t ready_before_vsync_p10_ns = 0;
     int64_t ready_before_vsync_p50_ns = 0;
     int64_t ready_before_vsync_p90_ns = 0;
@@ -276,7 +297,7 @@ class ZeroFGMainSurfaceEgress {
                           VkFormat format, uint32_t slot_count,
                           bool elevated_priority, bool apocalypse_guard,
                           bool free_output, bool vsync_quantizer,
-                          bool vsync_tight_reach,
+                          bool vsync_tight_reach, bool vsync_retire,
                           std::function<void()> wake_owner);
   ZeroFGMainSurfaceEgress(const ZeroFGMainSurfaceEgress&) = delete;
   ZeroFGMainSurfaceEgress& operator=(const ZeroFGMainSurfaceEgress&) = delete;
@@ -296,6 +317,16 @@ class ZeroFGMainSurfaceEgress {
   bool HasCapacity() const;
   // The panel's current refresh period as last observed (0: not yet known).
   uint64_t RefreshCycleNs() const;
+  // The vsync quantizer's lattice (an anchor vsync and the refresh) and the
+  // lead an output needs from its present call to the first vsync it can make;
+  // false until the quantizer has placed an output. Any thread.
+  bool VsyncGrid(uint64_t& anchor_ns, uint64_t& period_ns,
+                 uint64_t& lead_ns) const {
+    anchor_ns = grid_anchor_ns_.load(std::memory_order_relaxed);
+    period_ns = grid_period_ns_.load(std::memory_order_relaxed);
+    lead_ns = grid_lead_ns_.load(std::memory_order_relaxed);
+    return anchor_ns && period_ns && lead_ns;
+  }
   // Refuses while B does not produce (no swapchain yet, or handing back):
   // presentation is closed then, which is not ring pressure.
   EnqueueResult TryEnqueue(const Request& request);
@@ -425,6 +456,17 @@ class ZeroFGMainSurfaceEgress {
   // assigned_ns (0 and the logical target when the lattice is not known yet).
   uint64_t QuantizeToVsync(uint64_t target_ns, uint64_t now_ns,
                            uint64_t& assigned_ns);
+  // zerofg_vsync_retire (the owner 2026-11-19, the latency wells of x4 at 30
+  // on 120 Hz): true when this output is a synthetic whose own vsync the
+  // previous present already has while the quantizer's phase is pushed late
+  // (or for the second output in a row): the egress then drops it unshown and
+  // sheds one refresh of phase, so the display steps one tick back towards
+  // its schedule. Every vsync already has an output whenever N x the game's
+  // rate equals the refresh (x4 30 on 120 Hz, x3 on 90, x2 30 on 60), so the
+  // quantizer never finds the free vsync it sheds a phase into, and a pushed
+  // phase became latency for good. A single late S right before its R is
+  // still absorbed as before. Reals are never retired.
+  bool RetireBehindSynthetic(const Request& request);
   // The compositor latches a buffer for vsync V about one refresh before V
   // (shown frames were displayed 8.5-14 ms after ready, 2026-10-07): a slot is
   // reachable when the copy is predicted ready one refresh plus this margin
@@ -527,6 +569,54 @@ class ZeroFGMainSurfaceEgress {
   // switch it off; the window toward that, and whether the present
   // QuantizeToVsync just placed got a slot only the tight reach allowed.
   std::atomic<bool> tight_reach_;
+  // zerofg_vsync_retire (RetireBehindSynthetic) and the outputs in a row whose
+  // own vsync the previous present already had.
+  const bool vsync_retire_;
+  uint32_t vsync_behind_streak_ = 0;
+  // Pushed-phase shed (2026-11-27): consecutive outputs whose pushed phase the
+  // next output could have reached one vsync earlier.
+  std::atomic<uint64_t> grid_anchor_ns_{0};
+  std::atomic<uint64_t> grid_period_ns_{0};
+  std::atomic<uint64_t> grid_lead_ns_{0};
+  uint32_t vsync_shed_streak_ = 0;
+  static constexpr uint32_t kVsyncShedStreak = 8;
+  // Backlog drain (the owner 2026-11-27: Reals may be dropped in this case):
+  // outputs chained at least kBacklogDrainPeriods behind their own vsync
+  // because the previous present holds it, kBacklogDrainStreak in a row, with
+  // a source that fills the panel (no free vsync ever drains the chain): the
+  // output is dropped, Real or Synthetic, and the chain shortens by one.
+  bool DrainBacklog(const Request& request);
+  // Over capacity (the lattice's quantum shorter than a refresh: not every
+  // output can have a vsync of its own), a Synthetic yields its vsync to its
+  // pair's Real: dropped when showing it would push B a vsync later.
+  // Below capacity (2026-11-28, the shadow reservation made active): the
+  // last Synthetic before B is dropped when it pushes B a vsync later and
+  // past D + kShadowReserveNs, kReserveStreak pairs in a row (a chain, not one
+  // late B). The tripwire: a Real shown more than kTripPeriods refreshes after
+  // its target (the egress's lag, not the lattice's: a slow Source's age is
+  // not the Synthetics' fault) holds every Synthetic for kTripHoldPeriods
+  // refreshes, so the chain drains; the Synthetics return as the slots free.
+  bool YieldToReal(const Request& request);
+  uint64_t yielded_synthetic_ = 0;
+  uint64_t shadow_last_yielded_ = 0;
+  uint32_t reserve_streak_ = 0;
+  uint64_t reserved_synthetic_ = 0;
+  uint64_t shadow_last_reserved_ = 0;
+  uint64_t trip_hold_until_ns_ = 0;
+  uint64_t trips_ = 0;
+  uint64_t trip_held_synthetic_ = 0;
+  uint64_t shadow_last_trips_ = 0;
+  uint64_t shadow_last_trip_held_ = 0;
+  static constexpr uint32_t kReserveStreak = 3;
+  static constexpr uint64_t kTripPeriods = 5;
+  static constexpr uint64_t kTripHoldPeriods = 6;
+  uint32_t backlog_streak_ = 0;
+  uint64_t backlog_drained_real_ = 0;
+  uint64_t backlog_drained_synthetic_ = 0;
+  uint64_t shadow_last_drained_real_ = 0;
+  uint64_t shadow_last_drained_synthetic_ = 0;
+  static constexpr uint64_t kBacklogDrainPeriods = 2;
+  static constexpr uint32_t kBacklogDrainStreak = 8;
   uint32_t tight_reach_window_presents_ = 0;
   uint32_t tight_reach_window_late_ = 0;
   bool last_quantize_tight_only_ = false;
@@ -572,6 +662,54 @@ class ZeroFGMainSurfaceEgress {
   uint64_t latency_last_unmatched_ = 0;
   uint64_t latency_last_query_errors_ = 0;
   LatencyBatch latency_batch_;
+  // Shadow reservation and summary (2026-11-27, docs ARMSX3_GOW3_LATENCY in
+  // the lab): egress-thread-only, never consulted by pacing. For every
+  // Synthetic the quantizer places, the vsync its pair's Real B would get with
+  // the Synthetic shown and without it; a cut is counted (not made) when the
+  // Synthetic pushes B a vsync later and past D + kShadowReserveNs. B's
+  // predicted vsync (with the Synthetic, the path taken) is checked against
+  // its actualPresentTime. Reals shown past D + kShadowTripNs are counted as
+  // the tripwire's would-be trips.
+  static constexpr uint64_t kShadowReserveNs = 25000000ull;
+  static constexpr uint64_t kShadowTripNs = 35000000ull;
+  struct ShadowPrediction {
+    uint64_t source_id = 0;
+    uint64_t predicted_ns = 0;
+  };
+  std::array<ShadowPrediction, 16> shadow_predictions_ = {};
+  size_t shadow_prediction_next_ = 0;
+  uint64_t shadow_depth_ns_ = 0;
+  uint64_t shadow_need_p50_ns_ = 0;
+  uint64_t shadow_need_p95_ns_ = 0;
+  uint32_t shadow_need_samples_ = 0;
+  uint64_t shadow_margin_ns_ = 0;
+  uint64_t shadow_snaps_ = 0;
+  uint64_t shadow_snaps_skipped_ = 0;
+  uint64_t shadow_last_snaps_ = 0;
+  uint64_t shadow_last_snaps_skipped_ = 0;
+  uint64_t shadow_reals_presented_ = 0;
+  uint64_t shadow_synthetics_presented_ = 0;
+  uint64_t shadow_synthetics_judged_ = 0;
+  uint64_t shadow_would_delay_ = 0;
+  uint64_t shadow_would_cut_ = 0;
+  uint64_t shadow_would_trip_ = 0;
+  uint64_t shadow_error_unmatched_ = 0;
+  std::vector<int64_t> shadow_errors_ns_;
+  // The Real age split (summary only): Source issue to the output's target
+  // (the lattice, D included), target to its assigned vsync (the quantizer's
+  // push), and assigned vsync to actualPresentTime (the compositor). And the
+  // quantizer counters at the last summary, for the window's deltas.
+  std::vector<int64_t> shadow_lattice_ns_;
+  std::vector<int64_t> shadow_quantizer_ns_;
+  std::vector<int64_t> shadow_display_ns_;
+  uint64_t shadow_last_retired_ = 0;
+  uint64_t shadow_last_reanchor_ = 0;
+  uint64_t shadow_last_absorbed_ = 0;
+  uint64_t shadow_last_refused_ = 0;
+  void ShadowReserve(const Request& request, uint64_t previous_slot_ns,
+                     uint64_t offset_before, uint64_t synthetic_slot_ns);
+  void LogSummary(uint64_t window_ns, uint64_t refresh_ns,
+                  const std::array<uint64_t, LatencyBatch::kCapacity>& sorted);
   // Upper bound of the last present's display time, for the shaper (0: none).
   uint64_t shaper_latest_display_ns_ = 0;
   // The shaper's degradation latch, under stats_mutex_: the open 1 s window of

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(zerofg VERSION 1.1.0 LANGUAGES CXX)
+project(zerofg VERSION 1.2.0 LANGUAGES CXX)
 
 # ZeroFG: a Vulkan frame generation engine. This builds the static library
 # `zerofg` (and the alias `zerofg::zerofg`).
@@ -100,14 +100,19 @@ function(zerofg_compile_shader_in subdir common output_name source_name symbol)
 endfunction()
 
 zerofg_compile_shader_in(rc3 crop.comp rc3_crop crop.comp zerofg_rc3_crop_spv)
-foreach(_df down up patch_sg patch_wg patch_q dense clist cut)
+foreach(_df down up patch_sg patch_wg patch_q dense clist cut cam halo)
   zerofg_compile_shader_in(df df_common.glsl df_${_df} df_${_df}.comp zerofg_df_${_df}_spv)
 endforeach()
 zerofg_compile_shader_in(df df_common.glsl df_final df_final.comp zerofg_df_final_spv -DZFG_DF_IMAGE_OUT=1)
+# MFG: the phase forms are their own SPIR-V (ZFG_PHASE), so the middle's stays byte for byte what x2 has always run.
+zerofg_compile_shader_in(df df_common.glsl df_final_phase df_final.comp zerofg_df_final_phase_spv -DZFG_DF_IMAGE_OUT=1 -DZFG_PHASE=1)
 zerofg_compile_shader_in(df df_common.glsl df_clean_t df_clean_t.comp zerofg_df_clean_t_spv -DZFG_DF_IMAGE_OUT=1)
 zerofg_compile_shader_in(df df_common.glsl df_patch_q8 df_patch_q.comp zerofg_df_patch_q8_spv -DZFG_DF_LANES=8)
-foreach(_rc7 half quarter flist soft stats hud hudrule hudgs cost seed jump raw block stand ghost morph hole front fsmooth unfold cons extend alpha render trust mix fine guide tile scell sstart slist shyp sfit srefit sinl secho sdone sorder sgate tblock tfit tguide out)
+foreach(_rc7 half quarter flist soft stats hud hudrule hudgs gain cost seed jump raw block stand ghost morph hole front fsmooth unfold cons extend alpha render trust mix fine guide tile scell sstart slist shyp sfit srefit sinl secho sdone sorder sgate tblock tfit tguide out)
   zerofg_compile_shader_in(rc7 rc7_common.glsl rc7_${_rc7} rc7_${_rc7}.comp zerofg_rc7_${_rc7}_spv -DZFG_RC7_CORE=1)
+endforeach()
+foreach(_rc7 render tile)
+  zerofg_compile_shader_in(rc7 rc7_common.glsl rc7_${_rc7}_phase rc7_${_rc7}.comp zerofg_rc7_${_rc7}_phase_spv -DZFG_RC7_CORE=1 -DZFG_PHASE=1)
 endforeach()
 # The HUD layer (src/hud/hud_layer.cc), for hosts that give HUD planes: three self-contained passes around either engine.
 foreach(_hud occupancy prep compose)

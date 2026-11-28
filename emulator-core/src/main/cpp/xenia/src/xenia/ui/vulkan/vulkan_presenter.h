@@ -583,6 +583,8 @@ class VulkanPresenter final : public Presenter {
   // across Off/RZ/Z transitions until the normal host teardown quiesces Source.
   std::atomic<ZeroFGIndependentPresenter*> zerofg_source_presenter_{nullptr};
   std::atomic<ZeroFGSelection> zerofg_bound_selection_{ZeroFGSelection::kOff};
+  // Zero's switches the adapter was made with (ZeroFGZeroOptions).
+  std::atomic<uint32_t> zerofg_bound_zero_options_{0};
 
   VkDescriptorSetLayout guest_output_paint_image_descriptor_set_layout_ =
       VK_NULL_HANDLE;

@@ -479,6 +479,14 @@ struct ZeroFGIndependentPresenter::Impl {
   static constexpr uint32_t kBetterDMinSamples = 32;
   static constexpr size_t kBetterDWindowCapacity = 128;
   static constexpr uint64_t kBetterDFMaxNs = 32000000ull;
+  // The most D may operate at (ApplyBetterDSetpoint): a 20 fps source's need.
+  static constexpr uint64_t kBetterDCeilingNs = 60000000ull;
+  // Vsync snap (ApplyPendingSourcePhaseReanchor): how far past a vsync the first
+  // target plus the egress lead may land and still be pulled back to it, and the
+  // margin it then keeps before that vsync.
+  static constexpr uint64_t kVsyncSnapNs = 3500000ull;
+  static constexpr uint64_t kVsyncSnapMarginNs = 300000ull;
+  static constexpr uint64_t kVsyncSnapSpacingNs = 2000000000ull;
   static constexpr uint32_t kBetterDStepDivisor = 64;
   static constexpr uint32_t kBetterDArmDivisor = 4;
   static constexpr uint64_t kBetterDMarginNs = 1000000ull;
@@ -526,6 +534,8 @@ struct ZeroFGIndependentPresenter::Impl {
   static constexpr uint32_t kLogicalOutputCapacity =
       kLogicalRealReserve + kLogicalSyntheticCapacity;
   static_assert(kFinalOutputPoolSize > 1);
+  // The egress keeps a copy context per FinalOutput slot (MFG: 9 at x4 broke a session at slot 8 when the egress held 8).
+  static_assert(kFinalOutputPoolSize <= ZeroFGMainSurfaceEgress::kMaxSlots);
   static_assert(kRealResidencyCapacity > 2);
   static_assert(kCapturePoolSize >= kMailboxCount);
   static_assert(kPoolSize > kCandidateReserveTarget);
@@ -1171,6 +1181,10 @@ struct ZeroFGIndependentPresenter::Impl {
     uint64_t semantic_output_quantum_ns = 0;
     uint64_t semantic_tick_index = 0;
     uint64_t sequence_id = 0;
+    // MFG: a Synthetic's place in its pair (frame mfg_k of mfg_n, phase k / n); a committed Real's mfg_n is its epoch's N, the
+    // count its pair to the next Real takes. x2: 1 of 2.
+    uint32_t mfg_k = 1;
+    uint32_t mfg_n = 2;
   };
 
   struct EventBridge {
@@ -3127,7 +3141,8 @@ struct ZeroFGIndependentPresenter::Impl {
         // with free output and the vsync quantizer its push stacks on the
         // quantizer's lead (35-75 ms, Arkham 2026-10-07), so it stays off.
         /*apocalypse_guard=*/false, cvars::zerofg_free_output,
-        cvars::zerofg_vsync_quantizer, cvars::zerofg_vsync_tight_reach,
+        cvars::zerofg_vsync_quantizer, cvars::zerofg_tight_reach_on,
+        cvars::zerofg_pushed_phase_retire,
         [egress_bridge]() { SignalPresenterWake(egress_bridge); });
     const bool egress_started = egress->Start();
     if (egress_started) {
@@ -4601,7 +4616,8 @@ struct ZeroFGIndependentPresenter::Impl {
         "{}/{}/{}/{} ready_before_vsync_us p10/p50/p90={}/{}/{} "
         "vsync hit/late={}/{} hit_min queue/ready_before_vsync_us={}/{} "
         "late_max queue/ready_before_vsync_us={}/{} "
-        "tight_reach={} tight_only/late={}/{}",
+        "tight_reach={} tight_only/late={}/{} "
+        "vsync_retire={} retired/unpushed={}/{}",
         event,
         ZeroFGMainSurfaceProducer::Name(main_surface_producer.state()),
         main_surface_producer.handoff_begin_total(),
@@ -4674,7 +4690,8 @@ struct ZeroFGIndependentPresenter::Impl {
         stats.hit_ready_before_vsync_min_ns / 1000,
         stats.late_queue_before_vsync_max_ns / 1000,
         stats.late_ready_before_vsync_max_ns / 1000, stats.vsync_tight_reach,
-        stats.vsync_tight_only, stats.vsync_tight_only_late);
+        stats.vsync_tight_only, stats.vsync_tight_only_late,
+        stats.vsync_retire, stats.vsync_retired, stats.vsync_retired_unpushed);
   }
 
   bool TryActivateFromNativeSourceCadence() {
@@ -6986,8 +7003,8 @@ struct ZeroFGIndependentPresenter::Impl {
         latency_depth_decay_actual_compacted_total;
     trace.old_period_ns = previous_period_ns;
     trace.new_period_ns = new_period_ns;
-    trace.old_quantum_ns = std::max<uint64_t>(previous_period_ns / 2, 1);
-    trace.new_quantum_ns = std::max<uint64_t>(new_period_ns / 2, 1);
+    trace.old_quantum_ns = std::max<uint64_t>(previous_period_ns / EpochN(), 1);
+    trace.new_quantum_ns = std::max<uint64_t>(new_period_ns / EpochN(), 1);
     ++planned_space_trace.event_count;
     for (uint32_t level = 0; level <= kLogicalSyntheticCapacity; ++level) {
       if (!(trace.frontier_levels_seen & (uint32_t(1) << level)) ||
@@ -8660,12 +8677,208 @@ struct ZeroFGIndependentPresenter::Impl {
                               post_service_gpu_ns.Quantile(90, 100));
   }
 
+  // One output per refresh: N x the game's rate is the refresh (x4 at 30 on 120 Hz, x3 on 90), so every vsync has an output and
+  // no rate change can move the outputs earlier.
+  bool MfgOneRefreshPerOutput() const {
+    const uint64_t refresh_ns = main_surface_egress ? main_surface_egress->RefreshCycleNs() : 0;
+    return refresh_ns && stable_output_quantum_ns && stable_output_quantum_ns <= refresh_ns + refresh_ns / 8;
+  }
+
+  // zerofg_mfg_tick_retire (the owner 2026-11-19): the issue of the oldest accepted Real still without a target (0: none). A Real
+  // commits only when it heads the apply order, one tick before its target, so at x4 several accepted Reals wait uncommitted.
+  // A phase recovery anchored at the newest issue placed every one of them past it: each reanchor added their issue span to
+  // the lead (Gears of War 3 at x4: 42 -> 73 -> 107 -> 119 ms over three frequency recoveries).
+  uint64_t OldestPendingRealIssueNs() const {
+    uint64_t oldest_source_id = 0;
+    uint64_t oldest_issue_ns = 0;
+    for (const LogicalOutput& logical : logical_outputs) {
+      if (logical.state != LogicalOutputState::kFree && logical.state != LogicalOutputState::kDropped &&
+          logical.candidate.kind == CandidateKind::kReal && !logical.candidate.target_time_ns &&
+          logical.candidate.issue_time_ns &&
+          (!oldest_source_id || logical.candidate.source_id < oldest_source_id)) {
+        oldest_source_id = logical.candidate.source_id;
+        oldest_issue_ns = logical.candidate.issue_time_ns;
+      }
+    }
+    return oldest_issue_ns;
+  }
+
+  // zerofg_mfg_tick_retire, the semantic drain with one output per refresh (x4 at 30 on 120 Hz, x3 on 90, x2 at 30 on 60, x2
+  // at 60 on 120): there every vsync has an output, so neither the rate drain nor the presentation advance can take a lead
+  // back, and the reanchors' lead stayed (the wells). Asked at B's acceptance, before the pair's S exist: should the pair
+  // (A, B) span N - 1 ticks (N - 2 S, phases k / (N - 1); at x2 a real-only pair, B at A + ld*O)? Yes while the smallest
+  // lead of the last kMfgLeadSamples committed Reals, less one tick for each shortened pair not yet committed, keeps the
+  // phase cushion, a tick and max(half a tick, 8 ms) for the Source's jitter; every other pair at most. Every N-reading site
+  // takes the S's own N or A's, so B and every later output land one tick earlier. Reals are never dropped; an S that is not
+  // made is never owed (the Always-S contract covers the S a pair has).
+  // tools/pacing_sim (zerofg-depth testbed), Gears-like Source, 10 min: x4 120 / x3 90 / x2 60 wells in 109-117 of 117
+  // windows -> 0 (p50 77-87 ms, p99 93-112 ms), with the head anchor.
+  bool MfgShortPairWanted() {
+    if (!cvars::zerofg_mfg_tick_retire || !MfgOneRefreshPerOutput() || !operating_latency_ns ||
+        mfg_lead_sample_count < kMfgLeadSamples) {
+      return false;
+    }
+    if (mfg_short_rest) {
+      mfg_short_rest = false;  // never a run of shortened pairs
+      return false;
+    }
+    int64_t lead_ns = mfg_lead_samples[0];
+    for (uint32_t i = 1; i < kMfgLeadSamples; ++i) {
+      lead_ns = std::min(lead_ns, mfg_lead_samples[i]);
+    }
+    const int64_t quantum_ns = int64_t(stable_output_quantum_ns);
+    lead_ns -= int64_t(mfg_short_pending_count) * quantum_ns;
+    const int64_t cushion_ns = std::max<int64_t>(quantum_ns / kPhaseRecoveryLagQuantumDivisor, kPhaseRecoveryLagMinimumNs);
+    const int64_t needed_ns = cushion_ns + quantum_ns + std::max<int64_t>(quantum_ns / 2, 8000000);
+    return lead_ns >= needed_ns;
+  }
+
+  void MfgShortPairApplied(uint64_t b_source_id, bool real_only) {
+    if (mfg_short_pending_count == kMfgShortPendingMax) {
+      // A B that never committed (dropped with its slot): the oldest record goes.
+      for (uint32_t i = 1; i < kMfgShortPendingMax; ++i) {
+        mfg_short_pending[i - 1] = mfg_short_pending[i];
+      }
+      --mfg_short_pending_count;
+    }
+    mfg_short_pending[mfg_short_pending_count++] = b_source_id;
+    mfg_short_rest = true;
+    ++mfg_short_pair_total;
+    if (real_only) {
+      ++mfg_short_real_only_total;
+    }
+  }
+
+  // At each Real's first commitment: its lead past issue + D, and the shortened pairs it closes.
+  void ObserveMfgLead(uint64_t source_id, int64_t excess_ns) {
+    mfg_lead_samples[mfg_lead_sample_next] = excess_ns;
+    mfg_lead_sample_next = (mfg_lead_sample_next + 1) % kMfgLeadSamples;
+    mfg_lead_sample_count = std::min(mfg_lead_sample_count + 1, kMfgLeadSamples);
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < mfg_short_pending_count; ++i) {
+      if (mfg_short_pending[i] > source_id) {
+        mfg_short_pending[kept++] = mfg_short_pending[i];
+      }
+    }
+    mfg_short_pending_count = kept;
+  }
+
+  // MFG: the epoch's N (a constant 2 when kZeroFGMfgMaxN is 2, so every site that reads it compiles as before).
+  uint32_t EpochN() const {
+    if constexpr (kZeroFGMfgMaxN == 2) {
+      return 2;
+    } else {
+      return stable_output_n;
+    }
+  }
+
+  // The owner, 2026-11-18, after the first x3 / x4 runs: "tirar as proteções... cair automático é roubada, porque framerate
+  // flutua naturalmente... só mandar fazer e pronto". N is the selector, as chosen, capped only by what the refresh holds (below),
+  // with no step down on lateness (kMfgForced). It still needs the vsync quantizer and free output (3.4: N outputs producible at once need one vsync each).
+  // With kMfgForced false it is MFG_DESIGN 3.5: the largest n up to the selector with n <= r and r / n within 3 % of a whole
+  // number, r the refreshes per game frame, with 12 % hysteresis for the epoch's N.
+  static constexpr bool kMfgForced = true;
+  uint32_t MfgNForPeriod(uint64_t period_ns) const {
+    if constexpr (kZeroFGMfgMaxN == 2) {
+      return 2;
+    } else {
+      const uint32_t selector = std::clamp<uint32_t>(cvars::zerofg_multiplier, 2, kZeroFGMfgMaxN);
+      if (kMfgForced) {
+        if (!cvars::zerofg_free_output || !cvars::zerofg_vsync_quantizer) {
+          return 2;
+        }
+        // The one physical limit (Gears of War 3, 2026-11-20): N outputs need N vsyncs per game frame. With the display at 60 Hz
+        // and x4 / x3 from 30 the presenter scheduled 4 / 3 vsyncs into every 2, Android never dropped them (each one had its own
+        // future vsync), and the lead grew to 540 - 620 ms until the refresh came back. So N is the selector up to what the refresh
+        // holds, with 12 % slack for a game that wanders (Gears at a 30 lock: 33 - 36 ms): x4 at 30 is 4 on 120 Hz, 3 on 90, 2 on 60.
+        const uint64_t refresh_ns = main_surface_egress ? main_surface_egress->RefreshCycleNs() : 0;
+        if (!refresh_ns || !period_ns) {
+          return selector;
+        }
+        const double fit = double(period_ns) / double(refresh_ns) * 1.12;
+        return std::clamp<uint32_t>(uint32_t(fit), 2, selector);
+      }
+      const uint32_t ceiling = std::min(selector, mfg_overload_ceiling);
+      if (ceiling <= 2 || !period_ns || !cvars::zerofg_free_output || !cvars::zerofg_vsync_quantizer) {
+        return 2;
+      }
+      const uint64_t refresh_ns = main_surface_egress ? main_surface_egress->RefreshCycleNs() : 0;
+      if (!refresh_ns) {
+        return 2;
+      }
+      const double r = double(period_ns) / double(refresh_ns);
+      // Hysteresis (Gears of War 3 at a 30 lock wanders 33 - 36 ms, 2026-11-18: N went 4 - 2 - 4 at every reanchor): the epoch's
+      // N > 2 holds while r / N stays within 12 % of a whole number; a new N needs the 3 % rule.
+      if (stable_output_n > 2 && stable_output_n <= ceiling && double(stable_output_n) <= r * 1.12) {
+        const double per = r / double(stable_output_n);
+        const double whole = std::round(per);
+        if (whole >= 1.0 && std::abs(per - whole) <= 0.12 * whole) {
+          return stable_output_n;
+        }
+      }
+      for (uint32_t n = ceiling; n >= 3; --n) {
+        if (double(n) > r * 1.03) {
+          continue;
+        }
+        const double per = r / double(n);
+        const double whole = std::round(per);
+        if (whole >= 1.0 && std::abs(per - whole) <= 0.03 * whole) {
+          return n;
+        }
+      }
+      return 2;
+    }
+  }
+
+  // MFG_DESIGN 3.5, step down: over 5 % of the outputs late on their vsync in a 2 s window while N is above 2 lowers the ceiling
+  // to N - 1 (the next reanchor then takes the largest N the rule allows under it); the higher N is tried again after 5, 15, 30
+  // and 60 s. The reanchor itself is requested by EnsureStableLatencyMetronome when MfgNForPeriod no longer matches the epoch.
+  void ObserveMfgOverload(uint64_t now_ns) {
+    if constexpr (kZeroFGMfgMaxN > 2) {
+      if (!main_surface_egress) {
+        return;
+      }
+      if (!mfg_window_start_ns) {
+        const ZeroFGMainSurfaceEgress::Stats stats = main_surface_egress->SnapshotStats();
+        mfg_window_start_ns = now_ns;
+        mfg_window_hit = stats.vsync_hit;
+        mfg_window_late = stats.vsync_late;
+        return;
+      }
+      if (now_ns - mfg_window_start_ns < 2000000000ull) {
+        return;
+      }
+      const ZeroFGMainSurfaceEgress::Stats stats = main_surface_egress->SnapshotStats();
+      const uint64_t hit = stats.vsync_hit >= mfg_window_hit ? stats.vsync_hit - mfg_window_hit : 0;
+      const uint64_t late = stats.vsync_late >= mfg_window_late ? stats.vsync_late - mfg_window_late : 0;
+      mfg_window_start_ns = now_ns;
+      mfg_window_hit = stats.vsync_hit;
+      mfg_window_late = stats.vsync_late;
+      if (stable_output_n > 2 && hit + late >= 20 && late * 20 > hit + late) {
+        mfg_overload_ceiling = stable_output_n - 1;
+        static constexpr uint64_t kRetryNs[4] = {5000000000ull, 15000000000ull, 30000000000ull, 60000000000ull};
+        mfg_retry_at_ns = now_ns + kRetryNs[std::min<uint32_t>(mfg_retry_level, 3)];
+        mfg_retry_level = std::min<uint32_t>(mfg_retry_level + 1, 3);
+        ++mfg_step_down_total;
+        XELOGI("ZeroFGMfg step_down N={} late={}/{} retry_in_s={}", stable_output_n, late, hit + late,
+               (mfg_retry_at_ns - now_ns) / 1000000000ull);
+      } else if (mfg_overload_ceiling < kZeroFGMfgMaxN && mfg_retry_at_ns && now_ns >= mfg_retry_at_ns) {
+        mfg_overload_ceiling = kZeroFGMfgMaxN;
+        mfg_retry_at_ns = 0;
+        ++mfg_step_up_retry_total;
+        XELOGI("ZeroFGMfg retry ceiling={}", kZeroFGMfgMaxN);
+      } else if (stable_output_n > 2 && mfg_n_last_change_ns && now_ns - mfg_n_last_change_ns > 120000000000ull) {
+        mfg_retry_level = 0;  // two minutes held at the higher N: the next overload starts the retries from 5 s again
+      }
+    }
+  }
+
   uint64_t StageObservationBootstrapNs() const {
     if (stable_output_quantum_ns) {
       return stable_output_quantum_ns;
     }
     if (source_period_ns) {
-      return std::max<uint64_t>(source_period_ns / 2, 4000000ull);
+      return std::max<uint64_t>(source_period_ns / EpochN(), 4000000ull);
     }
     return 8000000ull;
   }
@@ -8723,7 +8936,7 @@ struct ZeroFGIndependentPresenter::Impl {
       return stable_output_quantum_ns;
     }
     if (source_period_ns) {
-      return std::max<uint64_t>(source_period_ns / 2, 1);
+      return std::max<uint64_t>(source_period_ns / EpochN(), 1);
     }
     return 8000000ull;
   }
@@ -8858,7 +9071,7 @@ struct ZeroFGIndependentPresenter::Impl {
     const uint64_t output_quantum_ns =
         stable_output_quantum_ns
             ? stable_output_quantum_ns
-            : source_period_ns ? std::max<uint64_t>(source_period_ns / 2, 1)
+            : source_period_ns ? std::max<uint64_t>(source_period_ns / EpochN(), 1)
                                : 8000000ull;
     // Deliberate slack, not a symbolic one-millisecond margin. Half an output
     // quantum absorbs ordinary host/service variance while the structural
@@ -8942,7 +9155,7 @@ struct ZeroFGIndependentPresenter::Impl {
     const uint64_t output_quantum_ns =
         stable_output_quantum_ns
             ? stable_output_quantum_ns
-            : source_period_ns ? std::max<uint64_t>(source_period_ns / 2, 1)
+            : source_period_ns ? std::max<uint64_t>(source_period_ns / EpochN(), 1)
                                : 0;
     if (required_ns && output_quantum_ns) {
       const uint64_t rounded_ns =
@@ -8956,7 +9169,7 @@ struct ZeroFGIndependentPresenter::Impl {
 
   uint64_t LatencyDepthBootstrapFloorNs() const {
     const uint64_t output_quantum_ns =
-        source_period_ns ? std::max<uint64_t>(source_period_ns / 2, 1)
+        source_period_ns ? std::max<uint64_t>(source_period_ns / EpochN(), 1)
                          : LatencyDepthCushionNs();
     return std::min<uint64_t>(
         SaturatingMultiplyNs(output_quantum_ns,
@@ -9469,11 +9682,11 @@ struct ZeroFGIndependentPresenter::Impl {
     proposal.epoch_origin_ns = semantic_epoch_origin_ns;
     proposal.quantum_ns = stable_output_quantum_ns;
     proposal.proposed_period_ns = proposed_period_ns;
-    proposal.proposed_quantum_ns = proposed_period_ns / 2;
+    proposal.proposed_quantum_ns = proposed_period_ns / EpochN();
     proposal.future = FindUnifiedRunwayShadowFuture();
     if (qualified && proposal.proposed_quantum_ns) {
       const int64_t period_delta_ns = PresenterSignedDeltaNs(
-          proposed_period_ns, SaturatingMultiplyNs(stable_output_quantum_ns, 2));
+          proposed_period_ns, SaturatingMultiplyNs(stable_output_quantum_ns, EpochN()));
       // Deadband labels only: retain raw P/O in the counterfactual geometry.
       proposal.kind = SignedMagnitudeNs(period_delta_ns) <=
                               kSourcePhaseMinimumFrequencyErrorNs
@@ -9580,7 +9793,7 @@ struct ZeroFGIndependentPresenter::Impl {
     shadow.observed_period_epoch = period_epoch;
     shadow.observed_quantum_ns = stable_output_quantum_ns;
     shadow.observed_epoch_origin_ns = semantic_epoch_origin_ns;
-    shadow.epoch_period_ns = SaturatingMultiplyNs(stable_output_quantum_ns, 2);
+    shadow.epoch_period_ns = SaturatingMultiplyNs(stable_output_quantum_ns, EpochN());
   }
 
   void ObserveUnifiedRunwayShadow(uint64_t now_ns) {
@@ -9765,7 +9978,7 @@ struct ZeroFGIndependentPresenter::Impl {
       return;
     }
     const uint64_t old_period_ns =
-        SaturatingMultiplyNs(shadow.proposal.quantum_ns, 2);
+        SaturatingMultiplyNs(shadow.proposal.quantum_ns, EpochN());
     const uint64_t robust_period_ns = source_period_ns;
     const int64_t robust_delta_ns =
         PresenterSignedDeltaNs(robust_period_ns, old_period_ns);
@@ -10126,6 +10339,11 @@ struct ZeroFGIndependentPresenter::Impl {
   // way H12 defers the latency feedback of an S that was FinalReady first.
   void ObserveBetterDSample(LogicalOutput& logical, uint64_t clean_ns,
                             uint64_t completion_ns) {
+    // MFG (MFG_DESIGN 3.2): D keeps sampling the first S of each pair; the later ones have one and two quanta of slack and
+    // would pull D down below what the first needs.
+    if (logical.candidate.kind == CandidateKind::kSynthetic && logical.candidate.mfg_k != 1) {
+      return;
+    }
     if (logical.better_d_sample_scored || logical.better_d_sample_pending) {
       ++better_d_double_score_total;
       return;
@@ -10297,7 +10515,13 @@ struct ZeroFGIndependentPresenter::Impl {
       ++better_d_f_ceiling_exit_total;
     }
     const uint64_t causal_ns = BetterDCausalNs();
-    const uint64_t d_ns = SaturatingAddNs(causal_ns, better_d_f_ns);
+    // The owner's ceiling (2026-11-27, pacing-shadow test): D never past what a
+    // 20 fps source needs (half its 50 ms pair, the generation and a margin).
+    // An erratic source (Daytona on Xendroid+ at 10-60 fps) taught a need of
+    // 65-86 ms at the median and D 70-110 ms; past the ceiling a late B costs
+    // its pair's synthetic (judder), not every Real's latency.
+    const uint64_t d_ns =
+        std::min(SaturatingAddNs(causal_ns, better_d_f_ns), kBetterDCeilingNs);
     better_d_causal_last_ns = causal_ns;
     latency_required_last_ns = causal_ns;
     operating_latency_ns = d_ns;
@@ -10547,7 +10771,7 @@ struct ZeroFGIndependentPresenter::Impl {
     }
     if (!shadow.block_intervals) {
       shadow.block_period_ns =
-          SaturatingMultiplyNs(stable_output_quantum_ns, 2);
+          SaturatingMultiplyNs(stable_output_quantum_ns, EpochN());
     }
     // Sum only delivered, qualified Issue intervals: never bridge pause time
     // or fabricate missing intervals. A resumed partial block keeps its P_epoch.
@@ -10616,7 +10840,7 @@ struct ZeroFGIndependentPresenter::Impl {
     }
     if (!phase_debt_block_intervals) {
       phase_debt_block_period_ns =
-          SaturatingMultiplyNs(stable_output_quantum_ns, 2);
+          SaturatingMultiplyNs(stable_output_quantum_ns, EpochN());
       phase_debt_period_epoch = period_epoch;
     }
     phase_debt_block_span_ns = SaturatingAddNs(
@@ -10668,7 +10892,7 @@ struct ZeroFGIndependentPresenter::Impl {
     // noisier period than the one phase recovery installed).
     const uint64_t lattice_period_ns = FrequencyAuthorityPeriodNs();
     const uint64_t epoch_pair_period_ns =
-        SaturatingMultiplyNs(stable_output_quantum_ns, 2);
+        SaturatingMultiplyNs(stable_output_quantum_ns, EpochN());
     const int64_t period_error_ns =
         PresenterSignedDeltaNs(epoch_pair_period_ns, lattice_period_ns);
     const int64_t phase_error_ns =
@@ -11072,6 +11296,14 @@ struct ZeroFGIndependentPresenter::Impl {
     // kPhaseRecoveryDrainPairs
     // issues; then the Source's period comes back, and that reanchor places
     // the epoch at issue + D if the drain went past it.
+    // zerofg_mfg_tick_retire (the owner 2026-11-19, the latency wells of x4
+    // at 30 on 120 Hz): with one output per refresh (N x the game's rate =
+    // the refresh, any N) the rate drain below cannot shorten anything, since
+    // N outputs need N vsyncs whatever the period, and its own reanchors add
+    // lead. There the short pairs drain the lead, one tick and one generated
+    // frame at a time (MfgShortPairWanted), and the rate drain stays off.
+    const bool tick_retire_owns_lead =
+        cvars::zerofg_mfg_tick_retire && MfgOneRefreshPerOutput();
     const char* cause = nullptr;
     uint64_t period_ns = 0;
     if (phase_recovery_drain_ns) {
@@ -11095,7 +11327,7 @@ struct ZeroFGIndependentPresenter::Impl {
         cause = frequency_due ? (lag_due ? "FL" : "F") : "L";
         period_ns = source_period_estimate_ns ? source_period_estimate_ns
                                               : lattice_period_ns;
-      } else if (lead_due) {
+      } else if (lead_due && !tick_retire_owns_lead) {
         const int64_t max_drain_ns = int64_t(
             source_period_estimate_ns * kPhaseRecoveryMaxDrainPermille / 1000);
         phase_recovery_drain_ns = std::min<int64_t>(
@@ -11159,8 +11391,10 @@ struct ZeroFGIndependentPresenter::Impl {
     }
 
     const uint64_t old_output_quantum_ns = stable_output_quantum_ns;
+    // MFG: the epoch's N is decided with its quantum (MFG_DESIGN 3.2, 3.5); with kZeroFGMfgMaxN = 2 it is always 2.
+    const uint32_t new_output_n = MfgNForPeriod(requested_source_period_ns);
     const uint64_t new_output_quantum_ns =
-        std::max<uint64_t>(requested_source_period_ns / 2, 1);
+        std::max<uint64_t>(requested_source_period_ns / new_output_n, 1);
     // A phase recovery re-places the phase even when its period leaves the
     // quantum where it was.
     if (new_output_quantum_ns == old_output_quantum_ns &&
@@ -11217,6 +11451,44 @@ struct ZeroFGIndependentPresenter::Impl {
         first_target_ns == std::numeric_limits<uint64_t>::max()) {
       return false;
     }
+    // Vsync snap (the owner 2026-11-27, option A): an output shows on the first
+    // vsync at or after its target plus the egress lead. When the lattice's
+    // first target lands that sum just past a vsync (by up to kVsyncSnapNs),
+    // the epoch starts early enough to make that vsync instead: a refresh of
+    // latency for that much less readiness. Never below the ordered floor.
+    if (main_surface_egress) {
+      uint64_t grid_anchor_ns = 0, grid_period_ns = 0, grid_lead_ns = 0;
+      // Only for a steady Source (phase recovery trusts its rate estimate) and
+      // at most once per kVsyncSnapSpacingNs: on Spider-Man (ARMSX2, ~50 fps
+      // wandering, 2026-11-27) the snap made outputs late enough to set phase
+      // recovery reanchoring 4x as often (605 against 142) and the Real age p99
+      // rose 83 -> 96 ms; on Daytona's steady 60 it took 7 ms off the median.
+      const uint64_t snap_now_ns = PresenterMonotonicTimeNs();
+      if (phase_recovery_trusted_period_ns &&
+          snap_now_ns - vsync_snap_last_ns >= kVsyncSnapSpacingNs &&
+          main_surface_egress->VsyncGrid(grid_anchor_ns, grid_period_ns,
+                                         grid_lead_ns)) {
+        const uint64_t due_ns = first_target_ns + grid_lead_ns;
+        const uint64_t past_ns =
+            due_ns >= grid_anchor_ns
+                ? (due_ns - grid_anchor_ns) % grid_period_ns
+                : (grid_period_ns - (grid_anchor_ns - due_ns) % grid_period_ns) %
+                      grid_period_ns;
+        const uint64_t floor_ns =
+            ordered_boundary_ns
+                ? SaturatingAddNs(ordered_boundary_ns, new_output_quantum_ns)
+                : 0;
+        const uint64_t step_ns = past_ns + kVsyncSnapMarginNs;
+        if (past_ns && past_ns <= kVsyncSnapNs && first_target_ns > step_ns &&
+            first_target_ns - step_ns >= std::max(floor_ns, cutover_floor_ns)) {
+          first_target_ns -= step_ns;
+          ++vsync_snap_total;
+          vsync_snap_last_ns = snap_now_ns;
+        } else {
+          ++vsync_snap_skipped_total;
+        }
+      }
+    }
     // The reanchor cutover. The first Real committed in the new epoch keeps
     // its predecessor and S(A->B) in the old epoch, so its causal floor is its
     // pair boundary (cutover_floor_ns, ReanchorCutoverFloorNs). A first tick
@@ -11234,6 +11506,14 @@ struct ZeroFGIndependentPresenter::Impl {
     const int64_t phase_before_ns = PresenterSignedDeltaNs(
         next_semantic_target_ns, source_anchor_ns);
     stable_output_quantum_ns = new_output_quantum_ns;
+    if (stable_output_n != new_output_n) {
+      ++mfg_n_change_total;
+      mfg_n_last_change_ns = PresenterMonotonicTimeNs();
+      XELOGI("ZeroFGMfg epoch N {} -> {} period_us={} quantum_us={} ceiling={} changes={} short_pairs={}", stable_output_n,
+             new_output_n, requested_source_period_ns / 1000, new_output_quantum_ns / 1000, mfg_overload_ceiling,
+             mfg_n_change_total, mfg_pair_short_total);
+    }
+    stable_output_n = new_output_n;
     semantic_epoch_origin_ns = first_target_ns;
     next_semantic_tick_index = 0;
     next_semantic_target_ns = first_target_ns;
@@ -11254,7 +11534,7 @@ struct ZeroFGIndependentPresenter::Impl {
     source_phase_reanchor_impulse_total_ns = SaturatingAddSignedNs(
         source_phase_reanchor_impulse_total_ns, reanchor_impulse_ns);
     source_phase_epoch_pair_period_last_ns =
-        SaturatingMultiplyNs(new_output_quantum_ns, 2);
+        SaturatingMultiplyNs(new_output_quantum_ns, new_output_n);
     source_phase_period_error_last_ns = PresenterSignedDeltaNs(
         source_phase_epoch_pair_period_last_ns, source_period_ns);
     source_phase_next_semantic_target_last_ns = next_semantic_target_ns;
@@ -11348,7 +11628,7 @@ struct ZeroFGIndependentPresenter::Impl {
             committed_a,
             PhaseBoundedPairDistance(committed_a, source_distance, b_issue_ns),
             synthetic_semantic_ns, floor_ns, synthetic_target_ns,
-            synthetic_tick, transition_real_only)) {
+            synthetic_tick, transition_real_only, 1, committed_a.mfg_n)) {
       return 0;
     }
     return floor_ns;
@@ -11363,8 +11643,9 @@ struct ZeroFGIndependentPresenter::Impl {
       return false;
     }
     if (!stable_latency_metronome_armed) {
+      stable_output_n = MfgNForPeriod(LatticePeriodNs());
       stable_output_quantum_ns =
-          std::max<uint64_t>(LatticePeriodNs() / 2, 1);
+          std::max<uint64_t>(LatticePeriodNs() / EpochN(), 1);
       latency_required_last_ns = BoundedRequiredLatencyDepthNs();
       operating_latency_ns =
           std::max(latency_required_last_ns, LatencyDepthBootstrapFloorNs());
@@ -11414,6 +11695,32 @@ struct ZeroFGIndependentPresenter::Impl {
     forward_skipped_out = false;
     bool source_reanchor_applied = false;
     const uint64_t pre_reanchor_semantic_target_ns = next_semantic_target_ns;
+    // MFG (MFG_DESIGN 3.2, 3.5): N changes only at a reanchor, future-only, through the confirmed-transition path a period change
+    // takes, and only while no S waits for its A (an unanchored S was made for the epoch's N; its A must commit in that epoch).
+    if constexpr (kZeroFGMfgMaxN > 2) {
+      if (!kMfgForced) {
+        ObserveMfgOverload(current_time_ns);
+      }
+      if (!source_rate_transition_reanchor_pending && !source_phase_reanchor_pending &&
+          !CountLiveUnanchoredSynthetics()) {
+        const uint64_t lattice_period_ns = FrequencyAuthorityPeriodNs();
+        const uint32_t desired_n = lattice_period_ns ? MfgNForPeriod(lattice_period_ns) : stable_output_n;
+        // A new N must hold 1.5 s before it asks for the reanchor (one change, not a flutter).
+        if (desired_n == stable_output_n) {
+          mfg_desired_n = 0;
+        } else if (desired_n != mfg_desired_n) {
+          mfg_desired_n = desired_n;
+          mfg_desired_since_ns = current_time_ns;
+        } else if ((kMfgForced && cvars::zerofg_multiplier != mfg_selector_seen) ||
+                   current_time_ns - mfg_desired_since_ns >= 1500000000ull) {
+          // Forced: a new selector is taken at once; a change the refresh asks for (MfgNForPeriod's fit) holds 1.5 s first.
+          mfg_selector_seen = cvars::zerofg_multiplier;
+          mfg_desired_n = 0;
+          source_rate_transition_reanchor_pending = true;
+          ++mfg_n_reanchor_request_total;
+        }
+      }
+    }
     if (source_rate_transition_reanchor_pending) {
       // Under the rate lock a confirmed regime transition reforms the lattice
       // at the lock's period, which it may already follow, or at phase
@@ -11421,8 +11728,10 @@ struct ZeroFGIndependentPresenter::Impl {
       const uint64_t lattice_period_ns = FrequencyAuthorityPeriodNs();
       RequestSourceReanchor(lattice_period_ns,
                             SourceReanchorRequestReason::kConfirmedTransition);
+      const uint32_t lattice_n = MfgNForPeriod(lattice_period_ns);
       if (stable_output_quantum_ns ==
-          std::max<uint64_t>(lattice_period_ns / 2, 1)) {
+              std::max<uint64_t>(lattice_period_ns / lattice_n, 1) &&
+          stable_output_n == lattice_n) {
         source_rate_transition_reanchor_pending = false;
         source_rate_transition_slower_pending = false;
       } else if (ApplyPendingSourcePhaseReanchor(
@@ -11451,11 +11760,28 @@ struct ZeroFGIndependentPresenter::Impl {
       ApplyPendingLatencyDepthReanchor(source_id, issue_ns, issue_anchor_ns);
     }
     ObserveSourcePhase(source_id, issue_ns, issue_anchor_ns, forward_skipped_out);
-    // A phase recovery places the epoch its cushion above issue + D.
-    const uint64_t recovery_anchor_ns =
+    // A phase recovery places the epoch its cushion above issue + D. With
+    // zerofg_mfg_tick_retire the issue is the oldest pending Real's
+    // (OldestPendingRealIssueNs): it commits first in the new epoch, and the
+    // later ones follow at their pair spacing, instead of all of them landing
+    // past the newest issue (the lead each reanchor added).
+    const bool phase_recovery_pending =
         source_reanchor_provenance.pending ==
-                SourceReanchorRequestReason::kPhaseRecovery
-            ? SaturatingAddNs(issue_anchor_ns, phase_recovery_cushion_ns)
+        SourceReanchorRequestReason::kPhaseRecovery;
+    uint64_t recovery_issue_anchor_ns = issue_anchor_ns;
+    if (phase_recovery_pending && cvars::zerofg_mfg_tick_retire &&
+        source_phase_reanchor_pending) {
+      const uint64_t oldest_issue_ns = OldestPendingRealIssueNs();
+      if (oldest_issue_ns && oldest_issue_ns < issue_ns) {
+        recovery_issue_anchor_ns =
+            SaturatingAddNs(oldest_issue_ns, operating_latency_ns);
+        ++mfg_drain_head_anchor_total;
+      }
+    }
+    const uint64_t recovery_anchor_ns =
+        phase_recovery_pending
+            ? SaturatingAddNs(recovery_issue_anchor_ns,
+                              phase_recovery_cushion_ns)
             : issue_anchor_ns;
     if (ApplyPendingSourcePhaseReanchor(
             issue_ns, issue_anchor_ns,
@@ -11583,7 +11909,8 @@ struct ZeroFGIndependentPresenter::Impl {
         !committed_a.target_time_ns || !operating_latency_ns) {
       return source_distance;
     }
-    const uint64_t pair_step_ns = SaturatingMultiplyNs(quantum_ns, 2);
+    const uint64_t pair_step_ns =
+        SaturatingMultiplyNs(quantum_ns, committed_a.mfg_n);
     const uint64_t phase_bound_ns = SaturatingAddNs(
         SaturatingAddNs(b_issue_ns, operating_latency_ns),
         SaturatingAddNs(PhaseReserveTargetNs(quantum_ns), pair_step_ns));
@@ -11606,7 +11933,8 @@ struct ZeroFGIndependentPresenter::Impl {
       ++accepted_gap_pair_phase_capped_total;
       accepted_gap_pair_phase_capped_tick_total = SaturatingAddNs(
           accepted_gap_pair_phase_capped_tick_total,
-          SaturatingMultiplyNs(source_distance - lattice_distance, 2));
+          SaturatingMultiplyNs(source_distance - lattice_distance,
+                               committed_a.mfg_n));
     }
     return lattice_distance;
   }
@@ -11640,20 +11968,23 @@ struct ZeroFGIndependentPresenter::Impl {
   // replayed, reconstructed or compressed. d_lat=1 is the nominal consecutive
   // pair and produces exactly the historical values. d_lat is decided once, as
   // the pair's initial contract, and never extends, rescues or retargets S.
+  // MFG (MFG_DESIGN 3.2): with N outputs per pair, S_k at A.tick + k * d_lat and B's floor at A.tick + N * d_lat, N being A's
+  // epoch N (the count of the S made for this pair, mfg_n) and k = 1 .. N - 1. k = 1, n = 2 is the function as it was.
   bool ComputePairTimingFromCommittedReal(
       const OutputCandidate& committed_a, uint64_t lattice_distance,
       uint64_t& synthetic_semantic_out, uint64_t& real_earliest_eligible_out,
       uint64_t& synthetic_target_out, uint64_t& synthetic_tick_out,
-      bool transition_real_only = false) const {
+      bool transition_real_only = false, uint32_t mfg_k = 1,
+      uint32_t mfg_n = 2) const {
     constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
     const uint64_t quantum_ns = committed_a.semantic_output_quantum_ns;
-    if (!lattice_distance || lattice_distance > kMax / 2 ||
+    if (!lattice_distance || lattice_distance > kMax / kZeroFGMfgMaxN ||
         !committed_a.target_time_ns || !committed_a.semantic_epoch_origin_ns ||
-        !quantum_ns) {
+        !quantum_ns || mfg_n < 2 || !mfg_k || mfg_k >= mfg_n) {
       return false;
     }
     const uint64_t pair_ticks =
-        lattice_distance * (transition_real_only ? 1 : 2);
+        lattice_distance * (transition_real_only ? 1 : mfg_n);
     if (quantum_ns > kMax / pair_ticks ||
         committed_a.target_time_ns > kMax - quantum_ns * pair_ticks ||
         committed_a.semantic_tick_index > kMax - pair_ticks) {
@@ -11672,15 +12003,18 @@ struct ZeroFGIndependentPresenter::Impl {
              real_earliest_eligible_out - committed_a.target_time_ns ==
                  synthetic_offset_ns;
     }
-    synthetic_tick_out = committed_a.semantic_tick_index + lattice_distance;
-    synthetic_target_out = committed_a.target_time_ns + synthetic_offset_ns;
+    synthetic_tick_out =
+        committed_a.semantic_tick_index + lattice_distance * mfg_k;
+    synthetic_target_out =
+        committed_a.target_time_ns + synthetic_offset_ns * mfg_k;
     synthetic_semantic_out = synthetic_target_out;
-    real_earliest_eligible_out = synthetic_target_out + synthetic_offset_ns;
+    real_earliest_eligible_out =
+        committed_a.target_time_ns + synthetic_offset_ns * mfg_n;
     return synthetic_target_out > committed_a.target_time_ns &&
            synthetic_target_out - committed_a.target_time_ns ==
-               synthetic_offset_ns &&
+               synthetic_offset_ns * mfg_k &&
            real_earliest_eligible_out - synthetic_target_out ==
-               synthetic_offset_ns;
+               synthetic_offset_ns * (mfg_n - mfg_k);
   }
 
   bool ComputeAcceptedRealTiming(const Slot& current,
@@ -11715,7 +12049,7 @@ struct ZeroFGIndependentPresenter::Impl {
             std::numeric_limits<uint64_t>::max() / 2 ||
         next_semantic_target_ns >
             std::numeric_limits<uint64_t>::max() -
-                stable_output_quantum_ns * 2) {
+                stable_output_quantum_ns * EpochN()) {
       return false;
     }
     // Accepted Real timing remains available even when its preceding Real has
@@ -11740,7 +12074,7 @@ struct ZeroFGIndependentPresenter::Impl {
       if (!ComputePairTimingFromCommittedReal(
               committed_a, lattice_distance, synthetic_semantic_out,
               real_earliest_eligible_out, synthetic_target_out,
-              synthetic_tick_out, transition_real_only)) {
+              synthetic_tick_out, transition_real_only, 1, committed_a.mfg_n)) {
         return false;
       }
       pair_lattice_distance_out = lattice_distance;
@@ -13037,6 +13371,10 @@ struct ZeroFGIndependentPresenter::Impl {
     request.current_view = current.view;
     request.current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     request.source_physical_extent = extent;
+    // MFG: this frame's place in its pair (x2: 1 of 2, the middle).
+    request.frame_index = logical.candidate.mfg_k;
+    request.frame_count = logical.candidate.mfg_n;
+    request.phase = float(logical.candidate.mfg_k) / float(logical.candidate.mfg_n);
     request.extent = current.storage_content_extent;
     request.previous_source_id =
         previous.source_id.load(std::memory_order_relaxed);
@@ -15054,7 +15392,8 @@ struct ZeroFGIndependentPresenter::Impl {
     }
     const uint64_t refresh_ns = main_surface_egress->RefreshCycleNs();
     if (!refresh_ns || stable_output_quantum_ns <= refresh_ns + refresh_ns / 8) {
-      // No vsync to gain inside one output quantum.
+      // No vsync to gain inside one output quantum. (There the lead drains
+      // semantically: zerofg_mfg_tick_retire's short pairs, MfgShortPairWanted.)
       return;
     }
     const int64_t band_ns = int64_t(refresh_ns) * 2;
@@ -15426,6 +15765,7 @@ struct ZeroFGIndependentPresenter::Impl {
       rate_lock_excess_ns = PresenterSignedDeltaNs(
           candidate.target_time_ns,
           SaturatingAddNs(candidate.issue_time_ns, operating_latency_ns));
+      ObserveMfgLead(candidate.source_id, rate_lock_excess_ns);
       // Phase recovery's samples: the Source's issue by Source id (its
       // frequency), and the excess by epoch (its phase).
       if (candidate.source_id) {
@@ -15689,7 +16029,8 @@ struct ZeroFGIndependentPresenter::Impl {
       if (!real_b || !lattice_distance || lattice_distance > source_distance ||
           !ComputePairTimingFromCommittedReal(
               committed_a, lattice_distance, synthetic_semantic_ns,
-              real_earliest_ns, synthetic_target_ns, synthetic_tick)) {
+              real_earliest_ns, synthetic_target_ns, synthetic_tick, false,
+              synthetic.candidate.mfg_k, synthetic.candidate.mfg_n)) {
         ++ordering_error_total;
         Terminalize(TerminalReason::kOrderingFailure,
                     synthetic.candidate.source_id);
@@ -15885,7 +16226,8 @@ struct ZeroFGIndependentPresenter::Impl {
           ComputePairTimingFromCommittedReal(
               last_applied_real_commitment, pair_lattice_distance,
               synthetic_semantic_ns, pair_boundary_ns, synthetic_target_ns,
-              synthetic_tick, transition_real_only);
+              synthetic_tick, transition_real_only, 1,
+              last_applied_real_commitment.mfg_n);
       rolling_pair_epoch_current =
           pair_timing_valid &&
           last_applied_real_commitment.semantic_epoch_origin_ns ==
@@ -15898,13 +16240,16 @@ struct ZeroFGIndependentPresenter::Impl {
                     last_applied_real_commitment.semantic_tick_index,
                     SaturatingMultiplyNs(
                         pair_lattice_distance,
-                        transition_real_only ? 1 : 2))
+                        transition_real_only
+                            ? 1
+                            : last_applied_real_commitment.mfg_n))
               : 0;
       pair_normal_boundary_tick =
           pair_timing_valid
               ? SaturatingAddNs(
                     last_applied_real_commitment.semantic_tick_index,
-                    SaturatingMultiplyNs(pair_lattice_distance, 2))
+                    SaturatingMultiplyNs(pair_lattice_distance,
+                                         last_applied_real_commitment.mfg_n))
               : 0;
       // H14.1: the pair boundary is allowed to become B's first commitment
       // only here, while B is the ordered head, and only while A and the
@@ -15943,6 +16288,7 @@ struct ZeroFGIndependentPresenter::Impl {
     candidate.semantic_target_time_ns = nominal_target_ns;
     candidate.semantic_epoch_origin_ns = semantic_epoch_origin_ns;
     candidate.semantic_output_quantum_ns = stable_output_quantum_ns;
+    candidate.mfg_n = EpochN();  // MFG: the pair from this Real to the next takes this epoch's N
     candidate.semantic_tick_index = assigned_tick;
     candidate.target_time_ns = assigned_target_ns;
     last_semantic_target_ns =
@@ -16246,6 +16592,27 @@ struct ZeroFGIndependentPresenter::Impl {
     request.latency_generation = generation;
     request.desired_present_ns = present_not_before_ns;
     request.output_quantum_ns = logical.candidate.semantic_output_quantum_ns;
+    // Shadow reservation (egress, observation only): where this pair's Real B
+    // is due after a Synthetic, and the operated depth D.
+    if (request.synthetic && logical.candidate.mfg_n > logical.candidate.mfg_k) {
+      request.next_real_offset_ns =
+          uint64_t(logical.candidate.mfg_n - logical.candidate.mfg_k) *
+          logical.candidate.semantic_output_quantum_ns;
+    }
+    request.operated_depth_ns = logical.operating_latency_ns;
+    // Better D's split for the summary line (on Reals only, so the quantiles
+    // are taken at the source's rate): the qualified need's median and p95
+    // (0 while the window is not ready) and the margin F.
+    if (!request.synthetic) {
+      if (BetterDWindowReady()) {
+        request.d_need_p50_ns = better_d_need_ns.Quantile(50, 100);
+        request.d_need_p95_ns = better_d_need_ns.Quantile(95, 100);
+        request.d_need_samples = uint32_t(better_d_need_ns.count());
+      }
+      request.d_margin_ns = better_d_f_ns;
+      request.vsync_snaps = vsync_snap_total;
+      request.vsync_snaps_skipped = vsync_snap_skipped_total;
+    }
     request.image = output.image;
     request.post_semaphore = output.post_completion_semaphore;
     request.post_value = output.post_completion_value;
@@ -16351,8 +16718,12 @@ struct ZeroFGIndependentPresenter::Impl {
     const bool real_order_bad =
         logical.candidate.kind == CandidateKind::kReal && previous_source &&
         logical.candidate.source_id <= previous_source;
+    // MFG: S_k sits k * d_lat ticks after its A (x2: k = 1).
     const uint64_t synthetic_pair_quantum_ns =
-        logical.candidate.semantic_output_quantum_ns;
+        logical.candidate.semantic_output_quantum_ns *
+        (logical.candidate.kind == CandidateKind::kSynthetic
+             ? std::max<uint32_t>(logical.candidate.mfg_k, 1)
+             : 1);
     const bool synthetic_pair_target_bad =
         logical.candidate.kind == CandidateKind::kSynthetic &&
         (!synthetic_pair_distance_valid ||
@@ -16993,9 +17364,14 @@ struct ZeroFGIndependentPresenter::Impl {
   }
 
   // Room to materialize the next Real and its mandatory Synthetic.
+  // MFG (MFG_DESIGN 3.2): room for the Real and the N - 1 frames of its pair, so the gate counts the build's most, kZeroFGMfgMaxN
+  // (a pair whose A was committed in an earlier epoch may still take a larger N than the epoch's). With 2 this is the gate as it was.
   bool SplitMaterializationCapacityAvailable() const {
-    if (kLogicalOutputCapacity - CountLogicalOutputs() < 2) {
+    if (kLogicalOutputCapacity - CountLogicalOutputs() < kZeroFGMfgMaxN) {
       return false;
+    }
+    if constexpr (kZeroFGMfgMaxN > 2) {
+      return CountSyntheticProductionFrontier() + (kZeroFGMfgMaxN - 1) <= kLogicalSyntheticCapacity;
     }
     // NOTE: kLogicalSyntheticCapacity is the same numeral as the frontier
     // bound only because both derive from kSyntheticPoolSize + 1. The
@@ -17023,7 +17399,7 @@ struct ZeroFGIndependentPresenter::Impl {
     // the live Synthetic ticket count, which the frontier deliberately stops
     // bounding -- so once tickets exceeded the old cap every hold was
     // misreported as presentation residence, including the legitimate ones.
-    if (kLogicalOutputCapacity - CountLogicalOutputs() < 2) {
+    if (kLogicalOutputCapacity - CountLogicalOutputs() < kZeroFGMfgMaxN) {
       return SidecarHoldCause::kLogicalIdentity;
     }
     // The frontier refused. By construction an S past Post is not in the
@@ -17555,9 +17931,16 @@ struct ZeroFGIndependentPresenter::Impl {
       // computing this pair. Re-evaluate before applying any shared-era
       // capacity veto so the first post-warmup pair is mandatory as well.
       split_always_s = SplitAlwaysSArmed();
+      // zerofg_mfg_tick_retire: this pair drains one tick of the lead (MfgShortPairWanted): N - 1 ticks with N - 2 S, or at
+      // x2 the TransitionRealOnly contract (no S, B at A + ld*O), whose anchoring already exists.
+      const bool mfg_short_pair =
+          synthetic_eligible && pair_targets_valid && pair_a_source_id && MfgShortPairWanted();
+      const bool mfg_short_real_only = mfg_short_pair && EpochN() <= 2;
+      bool mfg_short_applied = false;
       if (synthetic_eligible && pair_targets_valid && pair_a_source_id &&
-          H1cMayCreateTransitionRealOnlyPair(PresenterMonotonicTimeNs(),
-              last_processed_source_issue_period_sequence)) {
+          (mfg_short_real_only ||
+           H1cMayCreateTransitionRealOnlyPair(PresenterMonotonicTimeNs(),
+               last_processed_source_issue_period_sequence))) {
         // ComputeAcceptedRealTiming above already ran the metronome and
         // Better-D/phase observers for this Source issue. Re-running it for
         // the H1c projection would create a second policy observation. The
@@ -17597,8 +17980,12 @@ struct ZeroFGIndependentPresenter::Impl {
           // commitment of pair A will replace/raise it using A+ld*O.
         }
         if (h1c_transition_real_only) {
-          ++h1c_transition_real_only_pair_total;
-          ++h1c_episode_real_only_pairs;
+          if (mfg_short_real_only) {
+            mfg_short_applied = true;
+          } else {
+            ++h1c_transition_real_only_pair_total;
+            ++h1c_episode_real_only_pairs;
+          }
         }
       } else if (synthetic_eligible &&
                  transition_planned_space_state ==
@@ -17689,8 +18076,58 @@ struct ZeroFGIndependentPresenter::Impl {
             real_earliest_eligible_ns > now
                 ? real_earliest_eligible_ns - now
                 : 0;
+        // MFG (MFG_DESIGN 3.2): the pair owes N - 1 frames, created together, in order, each with its tick and its phase k / N.
+        // N is A's epoch N when A is committed, else the epoch's (which cannot change while this S waits for its A). With
+        // kZeroFGMfgMaxN = 2 the loop runs once, as before.
+        uint32_t pair_n = 2;
+        OutputCandidate mfg_committed_a;
+        bool mfg_a_committed = false;
+        if constexpr (kZeroFGMfgMaxN > 2) {
+          mfg_a_committed = synthetic_target_ns && pair_a_source_id &&
+                            FindRealSemanticCommitment(pair_a_source_id, mfg_committed_a);
+          pair_n = std::clamp<uint32_t>(mfg_a_committed ? mfg_committed_a.mfg_n : EpochN(), 2, kZeroFGMfgMaxN);
+          // zerofg_mfg_tick_retire: a short pair spans N - 1 ticks. Its S carry N - 1 (their phases and ticks, and B's floor
+          // when A commits later: AnchorSyntheticPairsToCommittedReal); with A already committed B's floor is set here.
+          if (mfg_short_pair && !mfg_short_real_only && pair_n >= 3) {
+            --pair_n;
+            mfg_short_applied = true;
+            if (mfg_a_committed) {
+              uint64_t short_s_semantic_ns = 0;
+              uint64_t short_b_floor_ns = 0;
+              uint64_t short_s_target_ns = 0;
+              uint64_t short_s_tick = 0;
+              if (ComputePairTimingFromCommittedReal(mfg_committed_a, pair_lattice_distance, short_s_semantic_ns,
+                                                     short_b_floor_ns, short_s_target_ns, short_s_tick, false, 1,
+                                                     pair_n)) {
+                real_earliest_eligible_ns = short_b_floor_ns;
+              }
+            }
+          }
+        }
+        const uint64_t mfg_first_semantic_ns = synthetic_semantic_ns;
+        const uint64_t mfg_first_target_ns = synthetic_target_ns;
+        const uint64_t mfg_first_tick_index = synthetic_tick_index;
+        for (uint32_t mfg_k = 1; mfg_k < pair_n; ++mfg_k) {
+        if (mfg_k > 1) {
+          if (mfg_first_target_ns) {
+            uint64_t unused_floor_ns = 0;
+            if (!mfg_a_committed ||
+                !ComputePairTimingFromCommittedReal(
+                    mfg_committed_a, pair_lattice_distance, synthetic_semantic_ns, unused_floor_ns,
+                    synthetic_target_ns, synthetic_tick_index, false, mfg_k, pair_n)) {
+              ++mfg_pair_short_total;
+              break;
+            }
+          }
+          if (!split_always_s && !HasLogicalCapacityForSynthetic()) {
+            ++mfg_pair_short_total;
+            break;
+          }
+        }
         OutputCandidate synthetic;
         synthetic.kind = CandidateKind::kSynthetic;
+        synthetic.mfg_k = mfg_k;
+        synthetic.mfg_n = pair_n;
         synthetic.source_id =
             current.source_id.load(std::memory_order_relaxed);
         synthetic.pair_a_source_id =
@@ -17731,6 +18168,7 @@ struct ZeroFGIndependentPresenter::Impl {
           }
           synthetic_eligible = false;
           RecordSyntheticDrop(SyntheticDropReason::kNoSyntheticSlot);
+          break;
         } else {
           if (split_always_s) {
             ++split_s_obligation_created_total;
@@ -17778,6 +18216,10 @@ struct ZeroFGIndependentPresenter::Impl {
           ObservePlannedSpaceSyntheticOpportunity(
               output, real_earliest_eligible_ns, frontier_before_create);
         }
+        }  // for mfg_k
+        synthetic_semantic_ns = mfg_first_semantic_ns;
+        synthetic_target_ns = mfg_first_target_ns;
+        synthetic_tick_index = mfg_first_tick_index;
       }
       if (stable_pair && synthetic_logical == UINT32_MAX &&
           !h1c_transition_real_only && !h1c_postconfirm_quarantined) {
@@ -17796,6 +18238,9 @@ struct ZeroFGIndependentPresenter::Impl {
               h1c_transition_real_only ? PairContract::kTransitionRealOnly
                                        : PairContract::kNormal)) {
         return false;
+      }
+      if (mfg_short_applied) {
+        MfgShortPairApplied(current.source_id.load(std::memory_order_relaxed), mfg_short_real_only);
       }
       if (next_semantic_tick_index !=
               nominal_cursor_tick_before_real_accept ||
@@ -18032,6 +18477,50 @@ struct ZeroFGIndependentPresenter::Impl {
         presentation_advance_excess_max_ns / 1000,
         main_surface_egress ? main_surface_egress->RefreshCycleNs() / 1000
                             : 0);
+    // 2026-11-19, the latency wells at x4: why each Real lands where it does
+    // (cumulative per Connect). Route: the pair boundary or the projection;
+    // what last carried the ordered boundary (applied R, applied S, an
+    // explicit S hold, an implicit hold); the projection's extra ticks past
+    // the nominal one, by its winner mask; Reals already due at their first
+    // commitment; the runway and ready age at commitment (p50/p90); D.
+    XELOGI(
+        "ZeroFGRealCommit observed={} route pair/projection={}/{} "
+        "boundary none/R/S/S_hold/implicit_hold={}/{}/{}/{}/{} "
+        "extra_ticks by mask 0..7={}/{}/{}/{}/{}/{}/{}/{} "
+        "projections by mask 0..7={}/{}/{}/{}/{}/{}/{}/{} "
+        "late={} lateness_us p50/p90={}/{} runway_pair_us p50/p90={}/{} "
+        "runway_projection_us p50/p90={}/{} ready_at_commit={} "
+        "ready_age_us p50/p90={}/{} D_us={} mfg_pair_short={} "
+        "mfg_drain on/head_anchored/short_pairs/real_only/pending={}/{}/{}/{}/{}",
+        real_commit_observed_total, commit_route_pair_boundary_total,
+        commit_route_projection_total, commit_boundary_kind_total[0],
+        commit_boundary_kind_total[1], commit_boundary_kind_total[2],
+        commit_boundary_kind_total[3], commit_boundary_kind_total[4],
+        commit_projection_mask_extra_tick_total[0],
+        commit_projection_mask_extra_tick_total[1],
+        commit_projection_mask_extra_tick_total[2],
+        commit_projection_mask_extra_tick_total[3],
+        commit_projection_mask_extra_tick_total[4],
+        commit_projection_mask_extra_tick_total[5],
+        commit_projection_mask_extra_tick_total[6],
+        commit_projection_mask_extra_tick_total[7],
+        commit_projection_mask_total[0], commit_projection_mask_total[1],
+        commit_projection_mask_total[2], commit_projection_mask_total[3],
+        commit_projection_mask_total[4], commit_projection_mask_total[5],
+        commit_projection_mask_total[6], commit_projection_mask_total[7],
+        real_commit_late_total, real_commit_lateness_ns.Quantile(50, 100) / 1000,
+        real_commit_lateness_ns.Quantile(90, 100) / 1000,
+        real_commit_runway_pair_ns.Quantile(50, 100) / 1000,
+        real_commit_runway_pair_ns.Quantile(90, 100) / 1000,
+        real_commit_runway_projection_ns.Quantile(50, 100) / 1000,
+        real_commit_runway_projection_ns.Quantile(90, 100) / 1000,
+        commit_ready_at_commit_total,
+        real_ready_age_at_commit_ns.Quantile(50, 100) / 1000,
+        real_ready_age_at_commit_ns.Quantile(90, 100) / 1000,
+        operating_latency_ns / 1000, mfg_pair_short_total,
+        cvars::zerofg_mfg_tick_retire, mfg_drain_head_anchor_total,
+        mfg_short_pair_total, mfg_short_real_only_total,
+        mfg_short_pending_count);
     XELOGI(
         "ZeroFGDeviceB domain=presenter_B Source_q0_counts_exclude_B=true "
         "ingress_queue_busy_retry={} submit_after_teardown_idle={} "
@@ -19399,6 +19888,44 @@ struct ZeroFGIndependentPresenter::Impl {
   uint64_t split_live_real_retarget_total = 0;
   bool stable_latency_metronome_armed = false;
   uint64_t stable_output_quantum_ns = 0;
+  // MFG (MFG_DESIGN_2026-11 section 3): the epoch's outputs per pair, one Real and N - 1 generated. Decided with the quantum at an
+  // epoch's start (P / N); 2 whenever kZeroFGMfgMaxN is 2.
+  uint32_t stable_output_n = 2;
+  uint64_t mfg_n_change_total = 0;
+  uint64_t mfg_n_reanchor_request_total = 0;
+  uint64_t mfg_n_last_change_ns = 0;
+  // Step down under load (3.5): the ceiling the overload sets, the 2 s window over the egress's vsync hit / late, and the retry.
+  uint32_t mfg_overload_ceiling = kZeroFGMfgMaxN;
+  uint64_t mfg_window_start_ns = 0;
+  uint64_t mfg_window_hit = 0;
+  uint64_t mfg_window_late = 0;
+  uint32_t mfg_retry_level = 0;
+  uint64_t mfg_retry_at_ns = 0;
+  uint64_t mfg_step_down_total = 0;
+  uint64_t mfg_step_up_retry_total = 0;
+  uint64_t mfg_pair_short_total = 0;  // pairs that got fewer than N - 1 frames (no room or no timing)
+  // zerofg_mfg_tick_retire: phase recoveries anchored at the oldest pending Real's issue; the short pairs (MfgShortPairWanted):
+  // the last kMfgLeadSamples committed Reals' lead past issue + D, the Bs of shortened pairs not yet committed, whether the next
+  // pair rests, the pairs shortened (real-only ones among them).
+  uint64_t mfg_drain_head_anchor_total = 0;
+  static constexpr uint32_t kMfgLeadSamples = 4;
+  std::array<int64_t, kMfgLeadSamples> mfg_lead_samples = {};
+  uint32_t mfg_lead_sample_count = 0;
+  uint32_t mfg_lead_sample_next = 0;
+  static constexpr uint32_t kMfgShortPendingMax = 16;
+  std::array<uint64_t, kMfgShortPendingMax> mfg_short_pending = {};
+  uint32_t mfg_short_pending_count = 0;
+  bool mfg_short_rest = false;
+  uint64_t mfg_short_pair_total = 0;
+  // Vsync snap: reanchors whose first target was pulled back to a vsync, and
+  // those the grid knew of but could not (past the window, or a floor).
+  uint64_t vsync_snap_total = 0;
+  uint64_t vsync_snap_skipped_total = 0;
+  uint64_t vsync_snap_last_ns = 0;
+  uint64_t mfg_short_real_only_total = 0;
+  uint32_t mfg_desired_n = 0;  // a different N the rule wants, and since when (debounce)
+  uint64_t mfg_desired_since_ns = 0;
+  uint32_t mfg_selector_seen = 0;  // the zerofg_multiplier the last N change saw (forced mode: a new selector skips the hold)
   uint64_t operating_latency_ns = 0;
   uint64_t latency_required_last_ns = 0;
   uint64_t next_semantic_target_ns = 0;

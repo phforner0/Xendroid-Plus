@@ -213,6 +213,9 @@ class EmulatorSession {
     /** Requested mode; the native presenter drains and switches on its own thread. */
     fun zeroFgMode(): ZeroFgMode = if (booted) ZeroFgMode.fromValue(core.zerofg_mode()) else ZeroFgMode.OFF
     fun setZeroFgMode(mode: ZeroFgMode) { if (booted) core.set_zerofg_mode(mode.value) }
+    /** MFG: the multiplier ceiling (2 to 4); the presenter takes it at its next reanchor. */
+    fun zeroFgMultiplier(): Int = if (booted) core.zerofg_multiplier() else 2
+    fun setZeroFgMultiplier(n: Int) { if (booted) core.set_zerofg_multiplier(n.coerceIn(2, 4)) }
     fun zeroFgMainSurfaceActive(): Boolean = booted && core.zerofg_main_surface_active()
     /** Rate of outputs delivered by the native presenter, not inferred from a multiplier. */
     fun outputFps(): Double = if (booted) core.output_fps() else 0.0

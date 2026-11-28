@@ -1374,6 +1374,17 @@ static void j_set_zerofg_mode(JNIEnv* env, jobject thiz, jint mode) {
     XELOGI("ZeroFG: mode {} requested from the app", requested);
 }
 
+// MFG: the multiplier ceiling (2, 3 or 4). The presenter reads it at its next reanchor (zerofg_independent_presenter, MfgNForPeriod).
+static void j_set_zerofg_multiplier(JNIEnv* env, jobject thiz, jint n) {
+    cvars::zerofg_multiplier = uint32_t(std::clamp(int(n), 2, 4));
+    XELOGI("ZeroFG: multiplier x{} requested from the app", cvars::zerofg_multiplier);
+}
+
+static jint j_zerofg_multiplier(JNIEnv* env, jobject thiz) {
+    return jint(cvars::zerofg_multiplier);
+}
+
+
 static jint j_zerofg_mode(JNIEnv* env, jobject thiz) {
     return jint(xe::ui::vulkan::RequestedZeroFGMode());
 }
@@ -2464,6 +2475,8 @@ int register_xendroid_Emulator(JNIEnv* env){
             ,{"set_frame_generation", "(ZIF)V", (void *) j_set_frame_generation}
             ,{"set_zerofg_mode", "(I)V", (void *) j_set_zerofg_mode}
             ,{"zerofg_mode", "()I", (void *) j_zerofg_mode}
+            ,{"set_zerofg_multiplier", "(I)V", (void *) j_set_zerofg_multiplier}
+            ,{"zerofg_multiplier", "()I", (void *) j_zerofg_multiplier}
             ,{"zerofg_main_surface_active", "()Z", (void *) j_zerofg_main_surface_active}
             ,{"output_fps", "()D", (void *) j_output_fps}
             ,{"presentation_state", "()[J", (void *) j_presentation_state}
