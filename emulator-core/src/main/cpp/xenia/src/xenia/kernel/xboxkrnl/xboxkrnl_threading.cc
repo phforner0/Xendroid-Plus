@@ -18,6 +18,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
+#include "xenia/cpu/backend/a64/a64_hle_sync_layout.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -30,6 +31,14 @@
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
+
+static_assert(offsetof(X_KPCR, current_irql) ==
+              cpu::backend::a64::kKpcrCurrentIrqlOffset);
+static_assert(offsetof(X_KPCR, prcb_data) +
+                  offsetof(X_KPRCB, current_thread) ==
+              cpu::backend::a64::kKpcrCurrentThreadOffset);
+static_assert(offsetof(X_KSPINLOCK, prcb_of_owner) ==
+              cpu::backend::a64::kSpinLockOwnerOffset);
 
 // r13 + 0x100: pointer to thread local state
 // Thread local state:

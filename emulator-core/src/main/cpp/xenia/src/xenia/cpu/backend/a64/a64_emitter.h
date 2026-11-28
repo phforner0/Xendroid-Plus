@@ -125,6 +125,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   void Call(const hir::Instr* instr, GuestFunction* function);
   void CallIndirect(const hir::Instr* instr, int reg_index);
   void CallExtern(const hir::Instr* instr, const Function* function);
+  bool TryEmitInlineHleSync(const GuestFunction* extern_function,
+                            uint32_t thunk_offset);
   void CallNative(void* fn);
   void CallNativeSafe(void* fn);
   // Loads the host address for the guest address in w16 into x9. A direct bl,
@@ -166,6 +168,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   bool IsFeatureEnabled(uint64_t feature_flag) const {
     return (feature_flags_ & feature_flag) == feature_flag;
   }
+  bool UseLrcpcForTsoLoad(const hir::Instr* instr) const;
 
   Xbyak_aarch64::Label& AddToTail(TailEmitCallback callback,
                                   uint32_t alignment = 0);
@@ -288,6 +291,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   size_t LayOutLocals(hir::HIRBuilder* builder);
   bool Emit(hir::HIRBuilder* builder, size_t stack_size,
             EmitFunctionInfo& func_info);
+  void EmitLoadPinnedSlots(const hir::LoopPromotionRegion& region);
+  void EmitStorePinnedSlots(const hir::LoopPromotionRegion& region,
+                            uint32_t slot_mask);
+  bool TryEmitPinnedContextInstr(const hir::Instr* instr,
+                                 const hir::LoopPromotionRegion& region);
   // Whether a guest function has to be emitted again with long-range branches.
   bool IsNearBranchOutOfRange(const Xbyak_aarch64::Error& e) const;
 
@@ -320,7 +328,36 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];
 
+  struct PendingDirectCall {
+    size_t branch_code_offset = 0;
+    size_t stub_code_offset = SIZE_MAX;
+    uint32_t target_guest_addr = 0;
+    GuestFunction* target_fn = nullptr;
+    bool is_tail = false;
+  };
+  void SetPendingDirectCallStubOffset(size_t index, size_t offset) {
+    if (index < pending_direct_calls_.size()) {
+      pending_direct_calls_[index].stub_code_offset = offset;
+    }
+  }
+
+  struct PendingIndirectCallPic {
+    size_t gate_code_offset = 0;
+    size_t cmp_lo_code_offset = 0;
+    size_t cmp_hi_code_offset = 0;
+    size_t call_op_code_offset = 0;
+    size_t fallback_code_offset = SIZE_MAX;
+    bool is_tail = false;
+  };
+  void SetPendingIndirectCallPicFallbackOffset(size_t index, size_t offset) {
+    if (index < pending_indirect_call_pics_.size()) {
+      pending_indirect_call_pics_[index].fallback_code_offset = offset;
+    }
+  }
+
   std::vector<TailEmitter> tail_code_;
+  std::vector<PendingDirectCall> pending_direct_calls_;
+  std::vector<PendingIndirectCallPic> pending_indirect_call_pics_;
   std::vector<Xbyak_aarch64::Label*> label_cache_;
 
   // v128 constants needing a literal, with labels owned by label_cache_.
@@ -343,6 +380,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // Set per attempt while a guest function is emitted (the helper thunks keep
   // the long-range form).
   bool near_branches_ = false;
+  bool uses_stack_skew_skip_ = false;
+  bool uses_r13_skew_guard_ = false;
+  bool r13_skew_guard_needs_low_bound_ = false;
+  bool uses_stackpoints_ = true;
+  size_t entry_offset_mod_4k_ = 0;
 };
 
 }  // namespace a64

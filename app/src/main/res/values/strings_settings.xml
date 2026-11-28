@@ -114,6 +114,13 @@
     <string name="xd_opt_mask_no_gpu">All but the GPU</string>
     <string name="xd_opt_up_to_px">up to %1$d px</string>
     <string name="xd_opt_fxaa_extreme">FXAA extreme</string>
+    <string name="xd_opt_lod_off">Off (game default)</string>
+    <string name="xd_opt_lod_1">+1 (half-res mips)</string>
+    <string name="xd_opt_lod_2">+2 (quarter-res mips)</string>
+    <string name="xd_opt_div_auto">Auto</string>
+    <string name="xd_opt_div_native">Native panel</string>
+    <string name="xd_opt_div_half">Half (÷2)</string>
+    <string name="xd_opt_div_third">Third (÷3)</string>
     <plurals name="xd_set_games_override">
         <item quantity="one">%1$d game uses another value</item>
         <item quantity="other">%1$d games use another value</item>
@@ -159,7 +166,7 @@
     <string name="st_t_kernel_precise_guest_delays">Precise game waits</string>
     <string name="st_d_kernel_precise_guest_delays">Serves the game\'s waits with sub-millisecond accuracy. A plain system sleep overshoots and lengthens every frame.</string>
     <string name="st_t_apu_apu_performance_hint">Audio performance hint (ADPF)</string>
-    <string name="st_d_apu_apu_performance_hint">Registers an ADPF performance hint session over the dispatch and audio threads so the system holds clocks for the audio deadline.</string>
+    <string name="st_d_apu_apu_performance_hint">Registers an ADPF performance hint session over the audio worker and XMA decoder threads so the system holds clocks for the audio deadline.</string>
     <string name="st_t_vulkan_adrenotools_force_max_clocks">Force maximum GPU clocks</string>
     <string name="st_d_vulkan_adrenotools_force_max_clocks">Force the GPU to its maximum clocks via the custom driver; more speed, more heat and battery drain.</string>
     <string name="st_t_vulkan_adrenotools_turbo_reassert_seconds">Request maximum clocks again every</string>
@@ -301,4 +308,16 @@
     <string name="st_d_memory_shm_coalesce_writewatch_pages">Batches contiguous guest physical pages into single mprotect syscalls when arming or clearing GPU write watches.</string>
     <string name="st_t_kernel_file_read_no_apc_inline">Defer file read APC completion</string>
     <string name="st_d_kernel_file_read_no_apc_inline">Queues asynchronous NtReadFile completion APCs instead of running them inline, fixing race conditions in streaming engines that expect deferred delivery.</string>
+    <string name="st_t_gpu_gpu_texture_lod_bias">Texture LOD bias</string>
+    <string name="st_d_gpu_gpu_texture_lod_bias">Shifts mipmap detail level on 3D textures to save GPU bandwidth on mobile devices (0 keeps game default; +1 uses half-res mips). Applies from next launch.</string>
+    <string name="st_t_vulkan_vulkan_android_present_divisor">Swapchain size divisor</string>
+    <string name="st_d_vulkan_vulkan_android_present_divisor">Reduces high-DPI panel swapchain size by an integer factor while keeping at least the game\'s render resolution (saves GPU time on QHD+/tablet displays). Auto picks automatically; Native panel disables.</string>
+    <string name="st_t_gpu_vulkan_defer_resolve_clears">Defer resolve clears</string>
+    <string name="st_d_gpu_vulkan_defer_resolve_clears">Folds eligible EDRAM resolve clears into the next draw render pass via LOAD_OP_CLEAR or in-pass clears, cutting tile-memory round-trips on mobile GPUs.</string>
+    <string name="st_t_gpu_vulkan_auto_vrs_thermal">Thermal auto-VRS</string>
+    <string name="st_d_gpu_vulkan_auto_vrs_thermal">Dynamically scales 3D multisampled scene shading rate (1x1 -> 2x1 -> 2x2) when Android thermal pressure rises (never affects 1x post-processing or HUD). Applies from next launch.</string>
+    <string name="st_t_cpu_adpf_cpu_performance_hint">Guest CPU performance hint (ADPF)</string>
+    <string name="st_d_cpu_adpf_cpu_performance_hint">Registers live guest CPU worker threads with an Android ADPF performance hint session to stabilize clocks under heavy CPU load.</string>
+    <string name="st_t_cpu_jit_warmup_jprof">JIT warmup profile (.jprof)</string>
+    <string name="st_d_cpu_jit_warmup_jprof">Saves discovered PowerPC function addresses per game (.jprof) and pre-translates them in the background on next launch to cut gameplay JIT stutter.</string>
 </resources>

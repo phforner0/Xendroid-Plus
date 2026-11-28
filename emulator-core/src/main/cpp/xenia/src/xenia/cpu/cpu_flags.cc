@@ -68,6 +68,13 @@ DEFINE_uint32(
 
 DEFINE_bool(validate_hir, false,
             "Perform validation checks on the HIR during compilation.", "CPU");
+DEFINE_bool(
+    accurate_fpscr_status, false,
+    "Maintain FPSCR exception summary bits (FX/FEX/VX/OX) after scalar FP "
+    "instructions. Disabled by default: titles rarely inspect them and "
+    "skipping the FPSCR read-modify-write avoids overhead while preserving "
+    "CR1 copies when Rc=1.",
+    "CPU");
 
 // https://github.com/bitsh1ft3r/Xenon/blob/091e8cd4dc4a7c697b4979eb200be7c9dee3590b/Xenon/Core/XCPU/PPU/PowerPC.h#L370
 DEFINE_uint64(
@@ -93,6 +100,29 @@ DEFINE_bool(break_condition_truncate, true, "truncate value to 32-bits", "CPU");
 
 DEFINE_bool(break_on_debugbreak, true, "int3 on JITed __debugbreak requests.",
             "CPU");
+DEFINE_bool(
+    adpf_cpu_performance_hint, false,
+    "Android: register live guest CPU worker threads with an ADPF performance "
+    "hint session to stabilize CPU clocks under heavy load.",
+    "CPU");
+DEFINE_bool(
+    jit_warmup_jprof, true,
+    "Persist discovered guest function addresses in a per-title .jprof cache "
+    "and pre-translate them in the background on next launch.",
+    "CPU");
+DEFINE_uint32(
+    jit_warmup_jprof_threads, 2,
+    "Background worker threads for .jprof JIT pre-translation (clamped 1..4).",
+    "CPU");
+DEFINE_uint32(
+    jit_warmup_jprof_save_interval_ms, 10000,
+    "Minimum interval in ms between periodic .jprof LMK-safe checkpoints.",
+    "CPU");
+DEFINE_uint32(
+    jit_warmup_jprof_save_batch, 256,
+    "New resolved functions required before triggering a periodic .jprof "
+    "checkpoint.",
+    "CPU");
 
 namespace xe {
 namespace cpu {

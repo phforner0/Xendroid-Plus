@@ -114,6 +114,13 @@
     <string name="xd_opt_mask_no_gpu">Tudo menos a GPU</string>
     <string name="xd_opt_up_to_px">até %1$d px</string>
     <string name="xd_opt_fxaa_extreme">FXAA extremo</string>
+    <string name="xd_opt_lod_off">Desligado (padrão do jogo)</string>
+    <string name="xd_opt_lod_1">+1 (mips em meia resolução)</string>
+    <string name="xd_opt_lod_2">+2 (mips em 1/4 da resolução)</string>
+    <string name="xd_opt_div_auto">Automático</string>
+    <string name="xd_opt_div_native">Painel nativo</string>
+    <string name="xd_opt_div_half">Metade (÷2)</string>
+    <string name="xd_opt_div_third">Terço (÷3)</string>
     <plurals name="xd_set_games_override">
         <item quantity="one">%1$d jogo usa outro valor</item>
         <item quantity="other">%1$d jogos usam outro valor</item>
@@ -159,7 +166,7 @@
     <string name="st_t_kernel_precise_guest_delays">Esperas precisas do jogo</string>
     <string name="st_d_kernel_precise_guest_delays">Atende as esperas do jogo com precisão abaixo de 1 ms. Uma espera comum do sistema passa do ponto e aumenta o tempo de cada quadro.</string>
     <string name="st_t_apu_apu_performance_hint">Dica de desempenho para o áudio (ADPF)</string>
-    <string name="st_d_apu_apu_performance_hint">Registra uma sessão ADPF nas threads de despacho e de áudio para o sistema segurar os clocks no prazo do áudio.</string>
+    <string name="st_d_apu_apu_performance_hint">Registra uma sessão ADPF nas threads de áudio (Audio Worker e decodificador XMA) para o sistema segurar os clocks no prazo do áudio.</string>
     <string name="st_t_vulkan_adrenotools_force_max_clocks">Forçar clocks máximos da GPU</string>
     <string name="st_d_vulkan_adrenotools_force_max_clocks">Com driver personalizado, pede a GPU no clock máximo. Mais velocidade, mais calor e bateria.</string>
     <string name="st_t_vulkan_adrenotools_turbo_reassert_seconds">Repetir o pedido de clocks máximos a cada</string>
@@ -301,4 +308,16 @@
     <string name="st_d_memory_shm_coalesce_writewatch_pages">Agrupa páginas físicas contíguas do jogo em chamadas mprotect únicas ao armar ou limpar vigias de escrita da GPU.</string>
     <string name="st_t_kernel_file_read_no_apc_inline">Adiar APC de conclusão de leitura</string>
     <string name="st_d_kernel_file_read_no_apc_inline">Enfileira APCs assíncronos de NtReadFile em vez de executá-los na hora, corrigindo condições de corrida em motores de streaming.</string>
+    <string name="st_t_gpu_gpu_texture_lod_bias">Viés de LOD de textura</string>
+    <string name="st_d_gpu_gpu_texture_lod_bias">Desloca o nível de detalhe de mipmaps em texturas 3D para economizar banda da GPU no celular (0 mantém o padrão do jogo; +1 usa mips em meia resolução). Vale a partir da próxima abertura.</string>
+    <string name="st_t_vulkan_vulkan_android_present_divisor">Divisor de tamanho do swapchain</string>
+    <string name="st_d_vulkan_vulkan_android_present_divisor">Reduz o tamanho do swapchain em telas de alta densidade por um fator inteiro, mantendo no mínimo a resolução de renderização do jogo (economiza GPU em telas QHD+ e tablets). Automático escolhe sozinho; Painel nativo desativa.</string>
+    <string name="st_t_gpu_vulkan_defer_resolve_clears">Adiar limpezas de resolve</string>
+    <string name="st_d_gpu_vulkan_defer_resolve_clears">Agrupa limpezas elegíveis de resolve da EDRAM no próximo render pass de desenho via LOAD_OP_CLEAR ou limpeza no pass, reduzindo tráfego em GPUs mobile.</string>
+    <string name="st_t_gpu_vulkan_auto_vrs_thermal">Auto-VRS térmico</string>
+    <string name="st_d_gpu_vulkan_auto_vrs_thermal">Escala dinamicamente a taxa de shading da cena 3D multisampled (1x1 -> 2x1 -> 2x2) sob pressão térmica no Android (nunca afeta pós-processamento 1x ou HUD). Vale a partir da próxima abertura.</string>
+    <string name="st_t_cpu_adpf_cpu_performance_hint">Dica de desempenho de CPU guest (ADPF)</string>
+    <string name="st_d_cpu_adpf_cpu_performance_hint">Registra threads ativas de CPU guest em uma sessão ADPF do Android para estabilizar clocks sob carga pesada de CPU.</string>
+    <string name="st_t_cpu_jit_warmup_jprof">Perfil de aquecimento JIT (.jprof)</string>
+    <string name="st_d_cpu_jit_warmup_jprof">Salva por jogo os endereços de funções PowerPC descobertas (.jprof) e as pré-traduz em segundo plano na próxima abertura para reduzir engasgos do JIT.</string>
 </resources>

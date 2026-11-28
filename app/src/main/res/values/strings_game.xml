@@ -82,6 +82,8 @@
     <string name="menu_t_stretch">Stretch to the whole screen</string>
     <string name="menu_t_stretch_note">From the next start</string>
     <string name="menu_t_tv">TV or external screen</string>
+    <string name="menu_t_secondary_dashboard">Secondary screen dashboard</string>
+    <string name="menu_t_secondary_dashboard_note">Telemetry overlay on a secondary display (turn off for normal TV mirroring)</string>
     <string name="menu_t_winfg">Win-FG 2×</string>
     <string name="menu_t_winfg_preset">Win-FG preset</string>
     <string name="menu_t_lsfg">Native LSFG</string>

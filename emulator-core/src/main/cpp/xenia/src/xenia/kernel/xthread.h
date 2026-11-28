@@ -25,6 +25,7 @@
 #include "xenia/base/threading.h"
 #include "xenia/cpu/thread.h"
 #include "xenia/cpu/thread_state.h"
+#include "xenia/kernel/delay0_backoff.h"
 #include "xenia/kernel/util/native_list.h"
 #include "xenia/kernel/util/xfiletime.h"
 #include "xenia/kernel/xmutant.h"
@@ -848,6 +849,7 @@ class XThread : public XObject, public cpu::Thread {
   // Signaled when a fiber-backed thread exits, so waits on the thread object
   // resolve (the host thread handle that normally serves this role is absent).
   std::unique_ptr<xe::threading::Event> fiber_exit_event_;
+  Delay0BackoffState delay0_backoff_;
 
   std::mutex thread_lock_;
 };

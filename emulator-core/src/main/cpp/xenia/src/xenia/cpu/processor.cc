@@ -55,6 +55,12 @@ DEFINE_path(trace_function_data_path, "", "File to write trace data to.",
             "CPU");
 DEFINE_bool(break_on_start, false, "Break into the debugger on startup.",
             "CPU");
+DEFINE_bool(
+    vscr_sat_census, true,
+    "Elide AltiVec VSCR[SAT] updates when static module census proves no "
+    "loaded module executes mfvscr and dynamic code is disabled. Set false "
+    "to always track VSCR[SAT].",
+    "CPU");
 
 namespace xe {
 namespace kernel {
@@ -260,9 +266,41 @@ void Processor::PreLaunch() {
   }
 }
 
+namespace {
+bool IsKernelTrampolineModule(const Module* module) {
+  constexpr std::string_view kTrampolineSuffix = "_trampoline";
+  const std::string& mod_name = module->name();
+  return !module->is_executable() &&
+         mod_name.size() >= kTrampolineSuffix.size() &&
+         mod_name.compare(mod_name.size() - kTrampolineSuffix.size(),
+                          kTrampolineSuffix.size(), kTrampolineSuffix) == 0;
+}
+}  // namespace
+
 bool Processor::AddModule(std::unique_ptr<Module> module) {
-  auto global_lock = global_critical_region_.Acquire();
-  modules_.push_back(std::move(module));
+  if (!module) {
+    return false;
+  }
+  Module* added = module.get();
+  bool triggers_vscr_observable = false;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    modules_.push_back(std::move(module));
+    if (added != builtin_module_) {
+      if (auto* xex = dynamic_cast<XexModule*>(added)) {
+        if (!xex->is_patch() && xex->ReadsVscr()) {
+          triggers_vscr_observable = true;
+        }
+      } else if (!IsKernelTrampolineModule(added)) {
+        // Any non-XEX module (e.g. ElfModule, executable RawModule, late
+        // runtime module) cannot be statically proven free of mfvscr.
+        triggers_vscr_observable = true;
+      }
+    }
+  }
+  if (triggers_vscr_observable) {
+    OnModuleReadsVscr();
+  }
   return true;
 }
 
@@ -658,6 +696,29 @@ size_t Processor::ResolveFunctionsInParallel(
   return resolved_count.load(std::memory_order_relaxed);
 }
 
+void Processor::SetJitProfileFilter(const Module* module, uint32_t low_address,
+                                    uint32_t high_address) {
+  std::lock_guard<std::mutex> lock(jprof_mutex_);
+  jprof_module_ = module;
+  jprof_low_addr_ = low_address;
+  jprof_high_addr_ = high_address;
+  if (!module) {
+    jprof_pending_addresses_.clear();
+  }
+  jprof_filter_active_.store(module != nullptr && low_address < high_address,
+                             std::memory_order_release);
+}
+
+void Processor::DrainJitProfileAddresses(std::vector<uint32_t>& out) {
+  std::lock_guard<std::mutex> lock(jprof_mutex_);
+  if (jprof_pending_addresses_.empty()) {
+    return;
+  }
+  out.insert(out.end(), jprof_pending_addresses_.begin(),
+             jprof_pending_addresses_.end());
+  jprof_pending_addresses_.clear();
+}
+
 Function* Processor::ResolveFunction(uint32_t address) {
   Entry* entry;
   Entry::Status status = entry_table_.GetOrCreate(address, &entry);
@@ -676,6 +737,7 @@ Function* Processor::ResolveFunction(uint32_t address) {
     }
     constexpr uint32_t kMaxCompileAttempts = 4;
     for (uint32_t attempt = 1;; ++attempt) {
+      const bool vscr_at_start = vscr_sat_observable();
       // Grab symbol declaration.
       auto function = module ? LookupFunction(module, address) : nullptr;
       const bool defined = function && DemandFunction(function);
@@ -701,15 +763,19 @@ Function* Processor::ResolveFunction(uint32_t address) {
         swept = defined && SweptSince(function, sweep_count);
         EndCompile(sweep_count);
       }
+      const bool vscr_stale =
+          defined && !vscr_at_start && vscr_sat_observable();
       if (!defined) {
         entry_table_.MarkFailed(entry);
         return nullptr;
       }
-      if (swept) {
+      if (swept || vscr_stale) {
         // The module would hand back the same already defined symbol.
         module->ForgetSymbol(address);
         if (attempt < kMaxCompileAttempts) {
-          sweep_count = BeginCompile();
+          if (dynamic) {
+            sweep_count = BeginCompile();
+          }
           continue;
         }
         // Code the guest keeps rewriting runs once for the callers waiting on
@@ -723,6 +789,12 @@ Function* Processor::ResolveFunction(uint32_t address) {
       entry_table_.MarkReady(entry, function, function->end_address());
       if (dynamic) {
         RecordDynamicCode(function);
+      } else if (jprof_filter_active_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> jprof_lock(jprof_mutex_);
+        if (module == jprof_module_ && !(address & 3) &&
+            address >= jprof_low_addr_ && address < jprof_high_addr_) {
+          jprof_pending_addresses_.push_back(address);
+        }
       }
       return function;
     }
@@ -750,12 +822,113 @@ Module* Processor::LookupModule(uint32_t address) {
   return nullptr;
 }
 
-void Processor::EnableDynamicCode() {
-  auto global_lock = global_critical_region_.Acquire();
-  if (!dynamic_code_module_) {
-    dynamic_code_module_ = std::make_unique<DynamicCodeModule>(this);
+void Processor::InvalidateCompiledFunctionsForVscr() {
+  std::vector<uint32_t> forgotten_addresses;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    code_sweep_count_.fetch_add(1, std::memory_order_seq_cst);
+    for (Function* function : entry_table_.DeleteRange(0u, 0xFFFFFFFFu)) {
+      if (!function || !function->is_guest()) {
+        continue;
+      }
+      if (function->module() && function->module() != builtin_module_) {
+        function->module()->ForgetSymbol(function->address());
+        forgotten_addresses.push_back(function->address());
+      }
+    }
   }
-  dynamic_code_enabled_.store(true, std::memory_order_relaxed);
+  if (backend_ && !forgotten_addresses.empty()) {
+    for (uint32_t addr : forgotten_addresses) {
+      backend_->InvalidateDynamicCalls(addr, addr);
+    }
+  }
+  if (!forgotten_addresses.empty()) {
+    XELOGI(
+        "Processor: invalidated {} compiled guest function(s) after late "
+        "VSCR[SAT] observability transition",
+        forgotten_addresses.size());
+  }
+}
+
+void Processor::OnModuleReadsVscr() {
+  bool need_invalidation = false;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    need_invalidation =
+        !vscr_sat_observable_.exchange(true, std::memory_order_acq_rel);
+  }
+  if (need_invalidation) {
+    InvalidateCompiledFunctionsForVscr();
+  }
+}
+
+void Processor::EnableDynamicCode() {
+  bool need_vscr_invalidation = false;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (!dynamic_code_module_) {
+      dynamic_code_module_ = std::make_unique<DynamicCodeModule>(this);
+    }
+    dynamic_code_enabled_.store(true, std::memory_order_release);
+    need_vscr_invalidation =
+        !vscr_sat_observable_.load(std::memory_order_acquire);
+    vscr_sat_observable_.store(true, std::memory_order_release);
+  }
+  if (need_vscr_invalidation) {
+    InvalidateCompiledFunctionsForVscr();
+  }
+}
+
+void Processor::BeginVscrSatCensus() {
+  vscr_sat_observable_.store(true, std::memory_order_release);
+}
+
+void Processor::FinishVscrSatCensus() {
+  auto global_lock = global_critical_region_.Acquire();
+  bool observable = !cvars::vscr_sat_census ||
+                    dynamic_code_enabled_.load(std::memory_order_acquire);
+  bool saw_xex = false;
+  if (!observable) {
+    constexpr std::string_view kTrampolineSuffix = "_trampoline";
+    for (const auto& module : modules_) {
+      if (module.get() == builtin_module_) {
+        continue;
+      }
+      if (auto* xex = dynamic_cast<XexModule*>(module.get())) {
+        if (xex->is_patch()) {
+          continue;
+        }
+        saw_xex = true;
+        if (xex->ReadsVscr()) {
+          observable = true;
+          break;
+        }
+        continue;
+      }
+      // KernelModule registers non-executable "*_trampoline" RawModules that
+      // only emit `sc; blr` import stubs and never execute guest mfvscr.
+      // Any other non-XEX module (e.g. ElfModule or executable RawModule)
+      // remains conservative.
+      const std::string& mod_name = module->name();
+      const bool is_kernel_trampoline =
+          !module->is_executable() &&
+          mod_name.size() >= kTrampolineSuffix.size() &&
+          mod_name.compare(mod_name.size() - kTrampolineSuffix.size(),
+                           kTrampolineSuffix.size(), kTrampolineSuffix) == 0;
+      if (is_kernel_trampoline) {
+        continue;
+      }
+      observable = true;
+      break;
+    }
+    if (!saw_xex) {
+      observable = true;
+    }
+  }
+  vscr_sat_observable_.store(observable, std::memory_order_release);
+  XELOGI("Processor: VSCR[SAT] census complete (observable={}, census={})",
+         observable ? "true" : "false",
+         cvars::vscr_sat_census ? "on" : "off");
 }
 
 Function* Processor::LookupFunction(uint32_t address) {

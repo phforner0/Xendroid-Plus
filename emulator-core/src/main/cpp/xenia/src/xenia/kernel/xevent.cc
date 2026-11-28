@@ -115,11 +115,6 @@ void XEvent::RecordSetter() {
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
   set_priority_increment(priority_increment);
   RecordSetter();
-  if (manual_reset_) {
-    // Releases every waiter parked right now, even if the event is reset
-    // before they run. Must precede the wake below.
-    pulse_epoch_.fetch_add(1);
-  }
   // KeSetEvent returns the signal state from before.
   int32_t old_signal_state;
   {
@@ -129,6 +124,12 @@ int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
     kevent->header.signal_state = 1;
     host_signaled_ = true;
     event_->Set();
+    if (manual_reset_) {
+      // Releases every waiter parked right now, even if the event is reset
+      // before they run. Must follow signal_state under global_lock and precede
+      // the wake below.
+      pulse_epoch_.fetch_add(1);
+    }
   }
   WakeCooperativeWaiters();
   return old_signal_state;
@@ -139,25 +140,26 @@ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
   RecordSetter();
   auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
   // KePulseEvent returns the pre-pulse signal state.
-  int32_t old_signal_state = kevent->header.signal_state;
+  int32_t old_signal_state;
   // A parked cooperative waiter re-polls only after a host pulse has already
   // reset the event, so every pulse would be lost. Deliver as a set the first
   // waiter consumes, which for an auto-reset event with a waiter is exactly
   // pulse semantics.
   if (!manual_reset_ && waiters_.HasWaiters()) {
-    Set(priority_increment, wait);
-    return old_signal_state;
-  }
-  if (manual_reset_) {
-    // Releases every waiter parked right now. Must precede the wake below.
-    pulse_epoch_.fetch_add(1);
+    return Set(priority_increment, wait);
   }
   {
     auto global_lock = global_critical_region_.Acquire();
+    old_signal_state = kevent->header.signal_state;
     event_->Pulse();
     // Pulse leaves the event reset after releasing waiters.
     kevent->header.signal_state = 0;
     host_signaled_ = false;
+    if (manual_reset_) {
+      // Releases every waiter parked right now. Must follow signal_state under
+      // global_lock and precede the wake below.
+      pulse_epoch_.fetch_add(1);
+    }
   }
   WakeCooperativeWaiters();
   return old_signal_state;
@@ -188,22 +190,31 @@ void XEvent::SyncFromGuest() {
   if (!guest_object()) {
     return;
   }
-  bool guest_signaled = false;
+  bool wake_waiters = false;
   {
     auto global_lock = global_critical_region_.Acquire();
     auto* kevent = memory()->TranslateVirtual<X_KEVENT*>(guest_object());
-    guest_signaled = kevent->header.signal_state ? true : false;
+    if (!kevent) {
+      return;
+    }
+    const bool guest_signaled = kevent->header.signal_state ? true : false;
     if (guest_signaled == host_signaled_) {
       return;
     }
     host_signaled_ = guest_signaled;
     if (guest_signaled) {
       event_->Set();
+      if (manual_reset_) {
+        // Releases every parked cooperative waiter even if the event is reset
+        // before it runs; mirrors Set()/Pulse() ordering under global_lock.
+        pulse_epoch_.fetch_add(1);
+      }
+      wake_waiters = true;
     } else {
       event_->Reset();
     }
   }
-  if (guest_signaled) {
+  if (wake_waiters) {
     WakeCooperativeWaiters();
   }
 }

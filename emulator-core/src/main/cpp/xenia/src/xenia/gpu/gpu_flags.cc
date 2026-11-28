@@ -284,6 +284,13 @@ DEFINE_int32(anisotropic_override, -1,
              "  5 = Force 16x anisotropic filtering",
              "GPU");
 
+DEFINE_int32(
+    gpu_texture_lod_bias, 0,
+    "Global mipmap LOD bias added to computed-LOD texture fetches "
+    "(0 = game default, 1 = one mip smaller / half-res textures, "
+    "2 = quarter-res; clamped to [-2, 4]).",
+    "GPU");
+
 DEFINE_bool(use_fuzzy_alpha_epsilon, false,
             "Use approximate compare for alpha values to prevent flickering on "
             "NVIDIA graphics cards",

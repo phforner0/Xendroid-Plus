@@ -32,4 +32,20 @@ class ThermalWatchTest {
         assertEquals(Level.OK, watch.sample(null, 0))
         assertNull(watch.sample(-1f, -1))
     }
+
+    @Test fun systemHeadroomNormalizesForJniWithoutAlteringAdvisoryLevel() {
+        val watch = ThermalWatch()
+        val (cpu1, gpu1) = watch.recordSystemHeadroom(45.5f, 12.0f)
+        assertEquals(45.5f, cpu1, 0f)
+        assertEquals(12.0f, gpu1, 0f)
+        assertEquals(45.5f, watch.lastCpuHeadroom!!, 0f)
+        assertEquals(12.0f, watch.lastGpuHeadroom!!, 0f)
+        assertEquals(Level.OK, watch.level)
+
+        val (cpuBad, gpuBad) = watch.recordSystemHeadroom(Float.NaN, 150f)
+        assertEquals(-1f, cpuBad, 0f)
+        assertEquals(-1f, gpuBad, 0f)
+        assertNull(watch.lastCpuHeadroom)
+        assertNull(watch.lastGpuHeadroom)
+    }
 }

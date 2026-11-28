@@ -254,6 +254,34 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // enabled or the startup storage preload is running, in which case it
   // doesn't block and unready pipelines have their draws dropped at replay.
   void EndSubmission();
+  // Async Submit Worker split of EndSubmission() (Onda 3A): runs Recorder-only
+  // bookkeeping (MaybeSaveVkPipelineCache, storage_writer_.RequestFlush,
+  // ProcessDeferredDestructions) on the GPU Commands thread and returns the
+  // required primary pipeline creation ticket for the chunk (0 if no wait is
+  // needed, e.g. under vulkan_async_skip_draws / startup_loading or when all
+  // previously enqueued pipelines have already finished).
+  uint64_t PrepareAsyncSubmissionOnRecorder();
+  // Worker-thread safe: waits on creation_threads_ until every primary
+  // pipeline creation with creation_ticket <= required_ticket has finished (or
+  // shutdown is requested), without blocking on newer tickets queued for
+  // subsequent chunks.
+  void AwaitPipelineTicket(uint64_t required_ticket);
+  // RAII scope marking the current thread as the asynchronous Submit & Replay
+  // Worker during DeferredCommandBuffer::Execute() so ResolvePipelineForReplay
+  // never calls ExpeditePipeline() / CreateQueuedPipeline(..., nullptr) with
+  // the Recorder's single-threaded translator.
+  class ScopedWorkerReplay {
+   public:
+    ScopedWorkerReplay();
+    ~ScopedWorkerReplay();
+    ScopedWorkerReplay(const ScopedWorkerReplay&) = delete;
+    ScopedWorkerReplay& operator=(const ScopedWorkerReplay&) = delete;
+  };
+  static bool IsInAsyncReplayThread();
+  // Worker-thread safe replacement for ExpeditePipeline during replay:
+  // promotes `pipeline` in creation_queue_ and waits for creation_threads_ to
+  // finish compiling it without touching guest_shader_cache_.translator().
+  bool WaitForPipelineCompletionFromWorker(Pipeline* pipeline);
   // Throttled persist of the VkPipelineCache blob. Cheap no-op unless new
   // pipelines were created and the save interval elapsed. Called from
   // EndSubmission().
@@ -275,9 +303,21 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // solid-color / visible-RT draws before dropping or standing in (adapted from
   // XDroid360 33623e916, BSD-3-Clause).
   bool WaitForPipeline(Pipeline* pipeline, uint32_t timeout_ms);
+  // Resolves a deferred pipeline slot at DeferredCommandBuffer::Execute() time.
+  // Returns VK_NULL_HANDLE if creation failed or did not finish within the
+  // bounded wait so replay safely drops the draws.
+  VkPipeline ResolvePipelineForReplay(Pipeline* pipeline, uint32_t timeout_ms,
+                                      bool expedite_on_replay);
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type,
                            const uint32_t* host_address, uint32_t dword_count);
+  // Write-watch cached shader lookup for PM4_IM_LOAD (guest physical address).
+  VulkanShader* LoadShaderFromGuestAddress(xenos::ShaderType shader_type,
+                                           uint32_t guest_physical_address,
+                                           const uint32_t* host_address,
+                                           uint32_t dword_count);
+  void InvalidateShaderLoadWatchCache();
+  void OnShaderMemoryInvalidated(uint32_t physical_address, uint32_t length);
   // Analyze shader microcode on the translator thread.
   void AnalyzeShaderUcode(Shader& shader) {
     shader.AnalyzeUcode(ucode_disasm_buffer_);
@@ -544,6 +584,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // True when queued solely to upgrade a fast-linked GPL pipeline to a
     // link-time-optimized (LTO) pipeline in the background.
     bool lto_link_only = false;
+    // Monotonic ticket for primary pipelines queued from ConfigurePipeline
+    // (0 for background LTO re-links and startup storage preload).
+    uint64_t creation_ticket = 0;
   };
 
   // Comparator for priority queue - higher priority first.
@@ -585,6 +628,38 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
       heap_.pop_back();
       std::make_heap(heap_.begin(), heap_.end(),
                      PipelineCreationPriorityCompare());
+      return true;
+    }
+    bool Contains(const Pipeline* pipeline) const {
+      return std::any_of(heap_.begin(), heap_.end(),
+                         [pipeline](const PipelineCreationArguments& a) {
+                           return &a.pipeline->second == pipeline;
+                         });
+    }
+    bool HasTicketAtOrBefore(uint64_t required_ticket) const {
+      if (required_ticket == 0) {
+        return false;
+      }
+      return std::any_of(
+          heap_.begin(), heap_.end(),
+          [required_ticket](const PipelineCreationArguments& a) {
+            return a.creation_ticket != 0 &&
+                   a.creation_ticket <= required_ticket;
+          });
+    }
+    bool PromoteToMaxPriority(const Pipeline* pipeline) {
+      auto it = std::find_if(heap_.begin(), heap_.end(),
+                             [pipeline](const PipelineCreationArguments& a) {
+                               return &a.pipeline->second == pipeline;
+                             });
+      if (it == heap_.end()) {
+        return false;
+      }
+      if (it->priority < 255) {
+        it->priority = 255;
+        std::make_heap(heap_.begin(), heap_.end(),
+                       PipelineCreationPriorityCompare());
+      }
       return true;
     }
 
@@ -769,6 +844,16 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
                      xe::hash::IdentityHasher<uint64_t>>
       shaders_;
 
+  // Write-watch cache for PM4_IM_LOAD (lazily allocated when
+  // vulkan_shader_load_watch_cache is enabled).
+  struct ShaderLoadWatchCacheState;
+  std::unique_ptr<ShaderLoadWatchCacheState> shader_load_watch_cache_;
+  bool shader_load_watch_cache_was_enabled_ = false;
+  static std::pair<uint32_t, uint32_t> ShaderWatchInvalidationThunk(
+      void* context_ptr, uint32_t physical_address_start, uint32_t length,
+      bool exact_range);
+  void ShutdownShaderLoadWatchCache();
+
   // Geometry shaders for Xenos primitive types not supported by Vulkan.
   // Stores VK_NULL_HANDLE if failed to create.
   std::unordered_map<GeometryShaderKey, VkShaderModule,
@@ -819,6 +904,7 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
 
   // Vulkan pipeline cache for faster pipeline creation.
   VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
+  PFN_vkMergePipelineCaches vk_merge_pipeline_caches_ = nullptr;
 
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher>
       pipelines_;
@@ -845,6 +931,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // performance. Higher priority pipelines (those writing to visible RTs)
   // are compiled first.
   CreationRequestHeap creation_queue_;
+  uint64_t next_creation_ticket_ = 0;
+  std::vector<uint64_t> in_flight_primary_tickets_;
+  bool HasPendingCreationAtOrBeforeTicketLocked(uint64_t required_ticket) const;
   std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;
   // Notified when a creation thread is done with a pipeline it took.
@@ -882,14 +971,24 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // Verified, size-bounded, atomically replaced file per driver identity (see
   // vulkan_pipeline_cache_file.h). Set while vk_pipeline_cache_path_ is.
   std::unique_ptr<pipeline_cache_file::Store> vk_pipeline_cache_store_;
-  // Saves vk_pipeline_cache_ to vk_pipeline_cache_path_ (no-op if either is
-  // unset). Safe to call from the GPU thread concurrently with pipeline
-  // creation (the pipeline cache is internally synchronized by the driver).
-  void SaveVkPipelineCache();
+  // Serializes SaveVkPipelineCacheFromHandle() and store teardown across threads.
+  std::mutex vk_pipeline_cache_save_mutex_;
+  // Non-blocking snapshot save: merges vk_pipeline_cache_ into a temporary
+  // VkPipelineCache and dispatches vkGetPipelineCacheData + disk I/O onto
+  // storage_writer_'s low-priority WriteThread (coalescing superseded saves).
+  void SaveVkPipelineCacheAsync();
+  // Synchronous fallback / final shutdown persist on the caller thread.
+  void SaveVkPipelineCacheSync();
+  void SaveVkPipelineCacheFromHandle(VkPipelineCache cache_handle);
   // Periodically persist vk_pipeline_cache_ on the GPU thread so the cache
   // survives Android process kills (upstream only saves at clean shutdown,
   // which Android frequently skips when terminating the process).
+  static constexpr uint64_t kVkPipelineCacheSaveIntervalMs = 20000;
+  static constexpr uint64_t kVkPipelineCachePrecreateSaveIntervalMs = 5000;
+  static constexpr size_t kVkPipelineCachePrecreateSaveBatch = 256;
+  std::atomic<bool> vk_pipeline_cache_active_{false};
   std::atomic<bool> vk_pipeline_cache_dirty_{false};
+  std::atomic<bool> vk_pipeline_cache_saved_since_init_{false};
   uint64_t vk_pipeline_cache_last_save_ms_ = 0;
 };
 

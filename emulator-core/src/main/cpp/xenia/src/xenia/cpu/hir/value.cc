@@ -899,13 +899,16 @@ void Value::Insert(Value* index, Value* part, TypeName type) {
 
   switch (type) {
     case INT8_TYPE:
-      me->u8[index->constant.u8 ^ 3] = part->constant.u8;
+      me->u8[(index->constant.u8 & 0xF) ^ 3] = part->constant.u8;
       break;
     case INT16_TYPE:
-      me->u16[index->constant.u8 ^ 1] = part->constant.u16;
+      me->u16[(index->constant.u8 & 0x7) ^ 1] = part->constant.u16;
       break;
     case INT32_TYPE:
-      me->u32[index->constant.u8] = part->constant.u32;
+      me->u32[index->constant.u8 & 0x3] = part->constant.u32;
+      break;
+    default:
+      assert_unhandled_case(type);
       break;
   }
 }

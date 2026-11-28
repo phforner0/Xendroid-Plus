@@ -96,6 +96,7 @@ class VulkanZPDQueryPool {
   void ClearFSICounter(DeferredCommandBuffer& deferred_command_buffer,
                        uint32_t query_index);
   void RecordResolveBatch(VkCommandBuffer command_buffer);
+  void RecordResolveBatch(DeferredCommandBuffer& deferred_command_buffer);
 
   void InvalidateReadback();
 

@@ -13,6 +13,7 @@
 #include "xenia/base/string_buffer.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/hir/hir_builder.h"
+#include "xenia/cpu/ppc/ppc_hle_memory.h"
 
 namespace xe {
 namespace cpu {
@@ -38,7 +39,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
     // Emit comment nodes.
     EMIT_DEBUG_COMMENTS = 1 << 0,
   };
-  bool Emit(GuestFunction* function, uint32_t flags);
+  bool Emit(GuestFunction* function, uint32_t flags,
+            HleMemoryOp hle_memory_op = HleMemoryOp::kNone);
 
   GuestFunction* function() const { return function_; }
   Function* LookupFunction(uint32_t address);
@@ -74,6 +76,7 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   void StoreCA(Value* value);
   Value* LoadSAT();
   void StoreSAT(Value* value);
+  bool vscr_sat_observable() const { return vscr_sat_observable_; }
 
   Value* LoadGPR(uint32_t reg);
   void StoreGPR(uint32_t reg, Value* value);
@@ -97,6 +100,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
 
   // Reset each Emit:
   bool with_debug_info_;
+  bool track_fpscr_status_ = false;
+  bool vscr_sat_observable_ = true;
   GuestFunction* function_;
   uint64_t start_address_;
   uint64_t instr_count_;

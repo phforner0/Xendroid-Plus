@@ -382,6 +382,31 @@ inline float GetUnexpiredTelemetryFps(
   }
   return fps;
 }
+inline std::atomic<uint64_t>& last_bench_gpu_exec_ns() {
+  static std::atomic<uint64_t> v{0};
+  return v;
+}
+inline std::atomic<uint32_t>& last_frame_draw_count() {
+  static std::atomic<uint32_t> v{0};
+  return v;
+}
+inline std::atomic<uint32_t>& active_title_id_atomic() {
+  static std::atomic<uint32_t> v{0};
+  return v;
+}
+using PadLiveCallback = void (*)(const char*);
+inline std::atomic<PadLiveCallback>& pad_live_callback() {
+  static std::atomic<PadLiveCallback> v{nullptr};
+  return v;
+}
+inline std::atomic<PadLiveCallback>& pad_script_live_callback() {
+  static std::atomic<PadLiveCallback> v{nullptr};
+  return v;
+}
+inline std::atomic<PadLiveCallback>& pad_record_live_callback() {
+  static std::atomic<PadLiveCallback> v{nullptr};
+  return v;
+}
 }  // namespace internal
 
 // Per-frame guest frame times for run summaries: 1 ms buckets, the last one holds

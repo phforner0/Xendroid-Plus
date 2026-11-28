@@ -2,7 +2,8 @@
 apu = "aaudio"                                    	# Audio system. Use: [any, nop, opensles, aaudio]
 apu_aaudio_buffer_bursts = 4                      	# Depth of the Android audio buffer, in device bursts. Higher rides out emulator slowdowns without dropping audio, at the cost of latency.
 apu_aaudio_log_stats = false                      	# Log Android audio callback statistics (gaps, queue depth, underruns) once a second.
-apu_max_queued_frames = 8                         	# Allows changing max buffered audio frames to reduce audio delay. Lowering this value might cause performance issues. Value range: [4-64]
+apu_max_queued_frames = 12                        	# Allows changing max buffered audio frames to reduce audio delay. Lowering this value might cause performance issues. Value range: [4-64]
+apu_performance_hint = false                      	# Register an ADPF performance hint session over the audio worker and XMA decoder threads so the power HAL holds clocks for the audio deadline.
 enable_xmp = true                                 	# Enables Music Player playback.
 ffmpeg_verbose = false                            	# Verbose FFmpeg output (debug and above)
 mute = false                                      	# Mutes all audio output.
@@ -268,12 +269,13 @@ log_to_stdout = true                              	# Write log output to stdout
 
 
 [Memory]
+a64_wx_dual_mapping = true                        	# Use W^X dual-mapping (r-xs + rw-s via memfd_create/ASharedMemory) for JIT code cache and guest trampolines after live SELinux probe. Overridable on Android via debug.xendroid.jit_wx=0|1.
 ignore_offset_for_ranged_allocations = false      	# Allows to ignore 4k offset for physical allocations with provided range. Certain titles check if result matches provided lower range.
 mmap_address_high = 8                             	# 1-124
 protect_on_release = false                        	# Protect released memory to prevent accesses.
 protect_zero = true                               	# Protect the zero page from reads and writes.
 scribble_heap = false                             	# Scribble 0xCD into all allocated heap memory.
-writable_executable_memory = true                 	# Allow mapping memory with both write and execute access, for simulating behavior on platforms where that's not supported
+writable_executable_memory = true                 	# Permit RWX fallback when W^X dual-mapping (a64_wx_dual_mapping) is disabled or fails the live SELinux probe.
 
 
 [Profiles]

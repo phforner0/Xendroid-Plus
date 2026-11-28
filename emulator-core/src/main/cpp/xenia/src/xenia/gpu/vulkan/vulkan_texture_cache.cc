@@ -28,6 +28,7 @@
 #include "xenia/gpu/texture_util.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
+#include "xenia/gpu/vulkan/vulkan_driver_quirks.h"
 #include "xenia/ui/vulkan/ui_samplers.h"
 #include "xenia/ui/vulkan/vulkan_mem_alloc.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
@@ -3460,6 +3461,8 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(
   // These image views are about to change - let the command processor know the
   // texture descriptor sets referencing them need to be rewritten.
   texture_bindings_changed_ |= fetch_constant_mask;
+  texture_bindings_changed_vertex_ |= fetch_constant_mask;
+  texture_bindings_changed_pixel_ |= fetch_constant_mask;
   uint32_t bindings_remaining = fetch_constant_mask;
   uint32_t binding_index;
   while (xe::bit_scan_forward(bindings_remaining, &binding_index)) {
@@ -3510,6 +3513,17 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(
   vmaGetAllocationInfo(texture_cache.vma_allocator_, allocation_,
                        &allocation_info);
   SetHostMemoryUsage(uint64_t(allocation_info.size));
+}
+
+VulkanTextureCache::VulkanTexture::Usage
+VulkanTextureCache::VulkanTexture::SetUsage(Usage new_usage) {
+  Usage old_usage = usage_;
+  if (old_usage != new_usage) {
+    usage_ = new_usage;
+    static_cast<VulkanTextureCache&>(texture_cache())
+        .IncrementTextureUsageGeneration();
+  }
+  return old_usage;
 }
 
 VkImageView VulkanTextureCache::VulkanTexture::GetLoadStorageLevelView(
@@ -3966,10 +3980,16 @@ bool VulkanTextureCache::Initialize() {
   const bool eac_rg11_supported =
       (eac_rg11_properties.optimalTilingFeatures & kLinearFilterFeatures) ==
       kLinearFilterFeatures;
-  const bool is_samsung_xclipse =
-      device_properties.vendorID == 0x144D ||
-      device_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY ||
-      std::strstr(device_properties.deviceName, "Xclipse") != nullptr;
+  static_assert(kVkDriverIdMesaRadv == uint32_t(VK_DRIVER_ID_MESA_RADV));
+  static_assert(kVkDriverIdArmProprietary ==
+                uint32_t(VK_DRIVER_ID_ARM_PROPRIETARY));
+  static_assert(kVkDriverIdMesaTurnip == uint32_t(VK_DRIVER_ID_MESA_TURNIP));
+  static_assert(kVkDriverIdMesaPanvk == uint32_t(VK_DRIVER_ID_MESA_PANVK));
+  static_assert(kVkDriverIdSamsungProprietary ==
+                uint32_t(VK_DRIVER_ID_SAMSUNG_PROPRIETARY));
+  const bool is_samsung_xclipse = IsSamsungXclipseProprietary(
+      uint32_t(device_properties.driverID), device_properties.vendorID,
+      device_properties.deviceName);
   const bool force_xclipse_transcode =
       is_samsung_xclipse && cvars::vulkan_xclipse_bc_transcode;
   const bool allow_bcn_astc_transcode =

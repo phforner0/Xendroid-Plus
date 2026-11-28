@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "xenia/ui/vulkan/vulkan_device.h"
+#include "xenia/ui/vulkan/vulkan_present_timing.h"
 
 namespace xe {
 namespace ui {
@@ -345,8 +346,9 @@ class ZeroFGMainSurfaceEgress {
   struct TimingRecord {
     bool used = false;
     bool resolved = false;
-    uint32_t present_id = 0;
+    uint64_t present_id = 0;
     uint64_t sequence_id = 0;
+    bool present_id_64bit = false;
     bool synthetic = false;
     uint64_t source_id = 0;
     uint64_t issue_time_ns = 0;
@@ -474,6 +476,7 @@ class ZeroFGMainSurfaceEgress {
   static constexpr uint32_t kLimiterResleepStreak = 4;
   void PollCopyCompletions();
   void MaybePollTimings(bool force);
+  void RefreshExtSwapchainTimingMetadata();
   void PushCompletion(const Completion& completion);
   void Fail(Failure failure, int32_t vk_result);
   void MarkSurfaceOutdated(int32_t vk_result);
@@ -533,6 +536,15 @@ class ZeroFGMainSurfaceEgress {
 
   // Egress-thread state, touched by the owner only after the join.
   VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+  PresentTimingBackend active_timing_backend_ = PresentTimingBackend::kNone;
+  uint64_t ext_timing_properties_counter_ = 0;
+  uint64_t ext_time_domains_counter_ = 0;
+  SelectedTimeDomain ext_time_domain_ = {};
+  uint32_t ext_stage_query_mask_ = 0;
+  uint32_t ext_target_stage_ = 0;
+  bool ext_present_at_absolute_time_ = false;
+  bool ext_use_present_id2_ = false;
+  bool ext_use_present_id1_ = false;
   // Free output: the release fence of the held image, and that image
   // (UINT32_MAX: none held).
   VkFence image_fence_ = VK_NULL_HANDLE;

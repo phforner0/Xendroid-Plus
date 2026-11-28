@@ -30,6 +30,7 @@ import java.util.Locale
  */
 class DualScreenDashboard(
     private val activity: Activity,
+    initialEnabled: Boolean = false,
 ) : DisplayManager.DisplayListener, AutoCloseable {
 
     data class DashboardSnapshot(
@@ -50,6 +51,7 @@ class DualScreenDashboard(
     private var presentation: Presentation? = null
     private var canvasView: DashboardCanvasView? = null
     private var occupiedDisplayId: Int? = null
+    private var enabled: Boolean = initialEnabled
     private var closing = false
     private var latest = DashboardSnapshot()
     private val fpsHistory = FloatArray(60)
@@ -57,6 +59,13 @@ class DualScreenDashboard(
 
     init {
         manager?.registerDisplayListener(this, Handler(Looper.getMainLooper()))
+        if (enabled) reconcileDisplay()
+    }
+
+    /** Enables or disables attaching telemetry to secondary/external displays (#146). */
+    fun setEnabled(on: Boolean) {
+        if (enabled == on) return
+        enabled = on
         reconcileDisplay()
     }
 
@@ -68,6 +77,7 @@ class DualScreenDashboard(
     }
 
     fun update(snapshot: DashboardSnapshot) {
+        if (!enabled) return
         latest = snapshot
         if (snapshot.fps > 0.0) {
             if (historyCount < fpsHistory.size) {
@@ -87,7 +97,10 @@ class DualScreenDashboard(
             .firstOrNull { it.isValid && it.displayId != Display.DEFAULT_DISPLAY && it.displayId != occupiedDisplayId }
 
     private fun reconcileDisplay() {
-        if (closing) return
+        if (closing || !enabled) {
+            dismissCurrent()
+            return
+        }
         val wanted = candidateDisplay()
         val current = presentation?.display
         if (wanted == null) {

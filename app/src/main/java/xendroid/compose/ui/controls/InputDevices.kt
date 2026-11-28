@@ -50,7 +50,16 @@ object InputDevices {
             else @Suppress("DEPRECATION") device.vibrator.hasVibrator()
         }.getOrDefault(false)
         val gyro = Build.VERSION.SDK_INT >= 31 && runCatching { device.sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE) != null }.getOrDefault(false)
-        return TestedDevice(device.id, device.name, device.descriptor, device.vendorId, device.productId, names, vibrates, gyro)
+        return TestedDevice(
+            device.id,
+            device.name.orEmpty(),
+            device.descriptor ?: "device:${device.id}",
+            device.vendorId,
+            device.productId,
+            names,
+            vibrates,
+            gyro,
+        )
     }
 
     /** A physical keyboard: letters, not the phone's own keys, not a controller. */
@@ -64,7 +73,7 @@ object InputDevices {
         val devices: List<InputDevice> = InputDevice.getDeviceIds().toList().mapNotNull { id -> InputDevice.getDevice(id) }
         return InputDevicesNow(
             pads = devices.filter { d -> Gamepads.isController(d) }.map { d -> describe(context, d) },
-            keyboards = devices.filter { d -> isKeyboard(d) }.map { d -> KeyboardDevice(d.id, d.name) },
+            keyboards = devices.filter { d -> isKeyboard(d) }.map { d -> KeyboardDevice(d.id, d.name.orEmpty()) },
         )
     }
 

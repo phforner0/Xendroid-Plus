@@ -9,6 +9,7 @@
 
 #include "xenia/gpu/spirv_shader_translator.h"
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 
@@ -1893,6 +1894,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           lod = builder_->createNoContractionBinOp(
               spv::OpFAdd, type_float_, lod,
               builder_->makeFloatConstant(instr.attributes.lod_bias));
+        }
+        // Global mipmap LOD bias for computed-LOD fetches only.
+        if (use_computed_lod) {
+          const int32_t global_lod_bias =
+              std::clamp(cvars::gpu_texture_lod_bias, -2, 4);
+          if (global_lod_bias != 0) {
+            lod = builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float_, lod,
+                builder_->makeFloatConstant(
+                    static_cast<float>(global_lod_bias)));
+          }
         }
 
         // Cube auto-LOD without register gradients uses implicit LOD + bias to

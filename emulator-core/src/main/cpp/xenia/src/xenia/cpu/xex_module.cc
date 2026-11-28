@@ -1206,6 +1206,9 @@ bool XexModule::LoadContinue() {
 
   // Notify backend that we have an executable range.
   processor_->backend()->CommitExecutableRange(low_address_, high_address_);
+  if (ReadsVscr()) {
+    processor_->OnModuleReadsVscr();
+  }
 
   // Add all imports (variables/functions).
   xex2_opt_import_libraries* opt_import_libraries = nullptr;
@@ -1528,6 +1531,46 @@ bool XexModule::SetupLibraryImports(const std::string_view name,
 
 bool XexModule::ContainsAddress(uint32_t address) {
   return address >= low_address_ && address < high_address_;
+}
+
+bool XexModule::ReadsVscr() const {
+  if (!loaded_ || !finished_load_ || is_patch()) {
+    return false;
+  }
+  if (!base_address_) {
+    return true;
+  }
+  auto* heap = memory()->LookupHeap(base_address_);
+  if (!heap) {
+    return true;
+  }
+  const auto* sec_header = xex_security_info();
+  if (!sec_header || !sec_header->page_descriptors) {
+    return true;
+  }
+  const uint32_t page_size = heap->page_size();
+  for (uint32_t i = 0, page = 0; i < sec_header->page_descriptor_count; ++i) {
+    xex2_page_descriptor desc;
+    desc.value = xe::byte_swap(sec_header->page_descriptors[i].value);
+    if (desc.info == XEX_SECTION_CODE) {
+      const uint32_t start = base_address_ + (page * page_size);
+      const uint32_t size = desc.page_count * page_size;
+      const uint8_t* ptr = memory()->TranslateVirtual(start);
+      if (!ptr) {
+        // Conservative: unable to scan code pages, assume VSCR may be read.
+        return true;
+      }
+      for (uint32_t off = 0; off + 4 <= size; off += 4) {
+        const uint32_t code = xe::load_and_swap<uint32_t>(ptr + off);
+        // mfvscr vD: primary opcode 4, RA=0, RB=0, XO=1540 (0x604).
+        if ((code & 0xFC1FFFFFu) == 0x10000604u) {
+          return true;
+        }
+      }
+    }
+    page += desc.page_count;
+  }
+  return false;
 }
 
 bool XexModule::GetPageSectionType(uint32_t address,

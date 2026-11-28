@@ -64,6 +64,8 @@ X_STATUS xeRtlInitializeCriticalSectionAndSpinCount(X_RTL_CRITICAL_SECTION* cs,
                                                     uint32_t cs_ptr,
                                                     uint32_t spin_count);
 
+void xeRtlLeaveCriticalSectionWakeTrampoline(cpu::ppc::PPCContext* ctx);
+
 }  // namespace xboxkrnl
 }  // namespace kernel
 }  // namespace xe

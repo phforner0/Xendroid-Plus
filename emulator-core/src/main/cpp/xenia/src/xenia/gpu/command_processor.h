@@ -25,9 +25,12 @@
 #include <array>
 #include <vector>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/guest_gpu_progress.h"
 #include "xenia/base/math.h"
 #include "xenia/base/ring_buffer.h"
+#include "xenia/gpu/pm4_ib_cache.h"
+#include "xenia/gpu/pm4_noop_filter.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
@@ -36,6 +39,9 @@
 #include "xenia/memory.h"
 #include "xenia/ui/presentation_runtime.h"
 #include "xenia/ui/presenter.h"
+
+DECLARE_bool(vulkan_pm4_noop_reg_filter_4wide);
+DECLARE_bool(pm4_indirect_buffer_cache);
 
 namespace xe {
 
@@ -267,6 +273,9 @@ class CommandProcessor {
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
   virtual void ClearReadbackBuffers();
+  // Synchronizes all submitted GPU work and flushes frame/submission timing
+  // counters (used by TraceBench between loops/ABBA blocks).
+  virtual void WaitUntilGpuIdleForBench() {}
 
   TraceWriter& trace_writer() { return trace_writer_; }
 
@@ -327,9 +336,10 @@ class CommandProcessor {
   bool AwaitMemexportReadbacks(const char* reason) { return false; }
   bool MemexportReadbacksPending() const { return false; }
 
-  void RestoreRegisters(uint32_t first_register,
-                        const uint32_t* register_values,
-                        uint32_t register_count, bool execute_callbacks);
+  virtual void RestoreRegisters(uint32_t first_register,
+                                const uint32_t* register_values,
+                                uint32_t register_count,
+                                bool execute_callbacks);
   void RestoreGammaRamp(
       const reg::DC_LUT_30_COLOR* new_gamma_ramp_256_entry_table,
       const reg::DC_LUT_PWL_DATA* new_gamma_ramp_pwl_rgb,
@@ -519,6 +529,12 @@ class CommandProcessor {
   void WorkerThreadMain();
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
+  // Called on the GPU Commands thread inside Pause() before signalling the
+  // caller's fence and parking on pause_resume_event_. Backends with an
+  // asynchronous submit worker override this to drain queued submissions so no
+  // vkQueueSubmit or command-buffer replay races with onPause, surface
+  // recreation, or savestate Save/Load.
+  virtual void OnPause() {}
   // rarely needed, most register writes have no special logic here
   XE_NOINLINE
   void HandleSpecialRegisterWrite(uint32_t index, uint32_t value);
@@ -529,6 +545,23 @@ class CommandProcessor {
   XE_FORCEINLINE
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                      uint32_t num_registers);
+
+  // Host-endian (pre-swapped) register range write used by PM4 IB cache replay.
+  // Applies the 4-wide NEON/scalar no-op filter when
+  // vulkan_pm4_noop_reg_filter_4wide is enabled without pre-mutating
+  // register_file_->values[] before WriteRegister().
+  virtual void WriteRegistersHostEndian(uint32_t start_index,
+                                        const uint32_t* host_values,
+                                        uint32_t num_registers);
+
+  static std::pair<uint32_t, uint32_t> Pm4IbWatchInvalidationThunk(
+      void* context_ptr, uint32_t physical_address_start, uint32_t length,
+      bool exact_range);
+  void EnsurePm4IbWatchRegistered();
+  void ShutdownPm4IbCache();
+  void InvalidatePm4IbCache();
+  void OnPm4IbMemoryInvalidated(uint32_t physical_address, uint32_t length);
+  void OnPm4IbCacheEndFrame();
 
   XE_FORCEINLINE
   virtual void WriteRegisterRangeFromRing(xe::RingBuffer* ring, uint32_t base,
@@ -1090,6 +1123,19 @@ class CommandProcessor {
   };
   VblankProbe vblank_probe_;
   std::atomic<uint64_t> vblank_probe_last_vblank_ns_{0};
+
+  pm4_ib::Pm4IndirectBufferCache pm4_ib_cache_;
+  void* pm4_ib_watch_callback_handle_ = nullptr;
+  bool pm4_ib_cache_was_enabled_ = false;
+
+  // Cached vulkan_late_swap_present lookup and debug.xendroid.late_swap
+  // override (-1 = unset, 0 = false, 1 = true) so ThrottlePresentation() never
+  // does per-frame ConfigVars map lookups, std::string allocations, or
+  // __system_property_get syscalls.
+  void PollLateSwapProperty();
+  const bool* late_swap_cvar_ptr_ = nullptr;
+  bool late_swap_cvar_resolved_ = false;
+  std::atomic<int32_t> late_swap_prop_override_{-1};
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

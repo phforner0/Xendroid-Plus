@@ -34,6 +34,7 @@
 #include "xenia/memory.h"
 
 DECLARE_bool(debug);
+DECLARE_bool(vscr_sat_census);
 
 namespace xe {
 namespace cpu {
@@ -152,6 +153,15 @@ class Processor {
   bool dynamic_code_enabled() const {
     return dynamic_code_enabled_.load(std::memory_order_relaxed);
   }
+  // VSCR[SAT] observability census: while active or if any module contains
+  // mfvscr (or dynamic code is enabled), saturating vector ops update VSCR.
+  void BeginVscrSatCensus();
+  void FinishVscrSatCensus();
+  void OnModuleReadsVscr();
+  bool vscr_sat_observable() const {
+    return !cvars::vscr_sat_census ||
+           vscr_sat_observable_.load(std::memory_order_acquire);
+  }
   // Whether |module| holds the code that no module claims.
   bool IsDynamicCodeModule(const Module* module) const {
     return module && module == dynamic_code_module_.get();
@@ -176,6 +186,15 @@ class Processor {
   // Changes whenever compiled code may have been dropped. A function resolved
   // before a change may have been dropped before it could be cached.
   uint64_t code_sweep_count() const { return code_sweep_count_.load(); }
+  void BumpCodeSweepCount() {
+    code_sweep_count_.fetch_add(1, std::memory_order_seq_cst);
+  }
+
+  // Configures per-title .jprof address collection for the active executable
+  // module, and drains newly compiled addresses into |out|.
+  void SetJitProfileFilter(const Module* module, uint32_t low_address,
+                           uint32_t high_address);
+  void DrainJitProfileAddresses(std::vector<uint32_t>& out);
 
   // The exclusive end of the swept range an address falls in, or 0 for none.
   uint32_t SweptCodeEnd(uint32_t address);
@@ -319,6 +338,7 @@ class Processor {
                                          uint32_t current_pc);
 
   bool DemandFunction(Function* function);
+  void InvalidateCompiledFunctionsForVscr();
 
   Memory* memory_ = nullptr;
   std::unique_ptr<StackWalker> stack_walker_;
@@ -345,6 +365,7 @@ class Processor {
   // Consulted after modules_, so a loaded module always takes precedence.
   std::unique_ptr<Module> dynamic_code_module_;
   std::atomic<bool> dynamic_code_enabled_{false};
+  std::atomic<bool> vscr_sat_observable_{true};
   std::atomic<bool> keep_dynamic_context_stores_{false};
   std::atomic<SyscallHook> syscall_hook_{nullptr};
   std::atomic<CodeFaultHook> code_fault_hook_{nullptr};
@@ -408,6 +429,13 @@ class Processor {
   std::vector<Breakpoint*> breakpoints_;
 
   Irql irql_;
+
+  std::atomic<bool> jprof_filter_active_{false};
+  std::mutex jprof_mutex_;
+  const Module* jprof_module_ = nullptr;
+  uint32_t jprof_low_addr_ = 0;
+  uint32_t jprof_high_addr_ = 0;
+  std::vector<uint32_t> jprof_pending_addresses_;
 };
 
 }  // namespace cpu

@@ -33,7 +33,16 @@ class A64Function : public GuestFunction {
   }
 
   // The bytes its frame takes, which the prolog subtracts from sp.
-  size_t stack_size() const { return stack_size_; }
+  size_t stack_size() const {
+    return stack_size_.load(std::memory_order_acquire);
+  }
+
+  bool forbid_stack_skew_skip() const {
+    return forbid_stack_skew_skip_.load(std::memory_order_acquire);
+  }
+  void set_forbid_stack_skew_skip(bool value) {
+    forbid_stack_skew_skip_.store(value, std::memory_order_release);
+  }
 
   void Setup(uint8_t* machine_code, size_t machine_code_length,
              size_t stack_size);
@@ -44,7 +53,8 @@ class A64Function : public GuestFunction {
  private:
   std::atomic<uint8_t*> machine_code_{nullptr};
   std::atomic<size_t> machine_code_length_{0};
-  size_t stack_size_ = 0;
+  std::atomic<bool> forbid_stack_skew_skip_{false};
+  std::atomic<size_t> stack_size_{0};
 };
 
 }  // namespace a64

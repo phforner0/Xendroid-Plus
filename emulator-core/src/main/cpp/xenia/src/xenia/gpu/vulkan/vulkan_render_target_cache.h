@@ -10,8 +10,536 @@
 #ifndef XENIA_GPU_VULKAN_VULKAN_RENDER_TARGET_CACHE_H_
 #define XENIA_GPU_VULKAN_VULKAN_RENDER_TARGET_CACHE_H_
 
-#include <array>
+#include <algorithm>
+#include <climits>
 #include <cstdint>
+
+namespace xe {
+namespace gpu {
+namespace vulkan {
+namespace resolve_opts {
+
+// Pure C++20 decision helpers and state trackers for Vulkan resolve
+// optimizations, directly testable without Vulkan headers via
+// XENIA_GPU_VULKAN_RESOLVE_OPTS_PURE_LOGIC_ONLY.
+
+constexpr uint32_t kMsaa1X = 0;
+constexpr uint32_t kMsaa2X = 1;
+constexpr uint32_t kMsaa4X = 2;
+
+constexpr uint32_t kSampleSelect0 = 0;
+constexpr uint32_t kSampleSelect1 = 1;
+constexpr uint32_t kSampleSelect3 = 3;
+constexpr uint32_t kSampleSelect01 = 4;
+
+constexpr uint32_t kColorRtFmt16_16Float = 6;
+constexpr uint32_t kColorRtFmt16_16_16_16Float = 7;
+constexpr uint32_t kColorRtFmt32Float = 14;
+constexpr uint32_t kColorRtFmt32_32Float = 15;
+
+constexpr uint32_t kStencilOpKeep = 0;
+constexpr uint32_t kStencilOpZero = 1;
+constexpr uint32_t kStencilOpReplace = 2;
+
+constexpr bool IsInPassFloatColorFormat(uint32_t color_rt_format) {
+  return color_rt_format == kColorRtFmt16_16Float ||
+         color_rt_format == kColorRtFmt16_16_16_16Float ||
+         color_rt_format == kColorRtFmt32Float ||
+         color_rt_format == kColorRtFmt32_32Float;
+}
+
+enum class InPassFloatDecision {
+  kNotFloat,
+  kAllowed,
+  kRejectDisabled,
+  kRejectNonZeroExpBias,
+};
+
+constexpr InPassFloatDecision EvaluateInPassFloatResolve(
+    bool is_float_format, bool cvar_in_pass_resolve_float,
+    int32_t effective_exp_bias) {
+  if (!is_float_format) {
+    return InPassFloatDecision::kNotFloat;
+  }
+  if (!cvar_in_pass_resolve_float) {
+    return InPassFloatDecision::kRejectDisabled;
+  }
+  if (effective_exp_bias != 0) {
+    return InPassFloatDecision::kRejectNonZeroExpBias;
+  }
+  return InPassFloatDecision::kAllowed;
+}
+
+enum class InPassMsaaDecision {
+  kAllowed1x,
+  kAllowed2x,
+  kRejectDisabled,
+  kRejectUnsupportedMsaa,
+  kRejectUnsupportedSampleSelect,
+  kRejectPassMismatch,
+};
+
+constexpr InPassMsaaDecision EvaluateInPassMsaaResolve(
+    uint32_t resolve_msaa, uint32_t pass_msaa, bool pass_host_2x,
+    bool single_sample_storage, bool color_rts_use_transfer_formats,
+    uint32_t copy_sample_select, bool cvar_in_pass_resolve_msaa2x) {
+  if (resolve_msaa == kMsaa1X) {
+    if (copy_sample_select > kSampleSelect3) {
+      return InPassMsaaDecision::kRejectUnsupportedSampleSelect;
+    }
+    if (pass_msaa != kMsaa1X || color_rts_use_transfer_formats) {
+      return InPassMsaaDecision::kRejectPassMismatch;
+    }
+    return InPassMsaaDecision::kAllowed1x;
+  }
+  if (resolve_msaa == kMsaa2X) {
+    if (!cvar_in_pass_resolve_msaa2x) {
+      return InPassMsaaDecision::kRejectDisabled;
+    }
+    if (pass_msaa != kMsaa2X || pass_host_2x || single_sample_storage ||
+        color_rts_use_transfer_formats) {
+      return InPassMsaaDecision::kRejectPassMismatch;
+    }
+    if (copy_sample_select != kSampleSelect0 &&
+        copy_sample_select != kSampleSelect1 &&
+        copy_sample_select != kSampleSelect01) {
+      return InPassMsaaDecision::kRejectUnsupportedSampleSelect;
+    }
+    return InPassMsaaDecision::kAllowed2x;
+  }
+  return InPassMsaaDecision::kRejectUnsupportedMsaa;
+}
+
+// VK_EXT_rasterization_order_attachment_access only orders same-sample reads.
+// Multisampled in-pass resolves run at pixel rate and issue cross-sample
+// subpassLoad(subpassInputMS, sample) reads, so they MUST always emit a
+// VK_DEPENDENCY_BY_REGION_BIT memory barrier and MUST NOT set the ROAA
+// pipeline flag.
+constexpr bool ShouldEmitInPassLocalReadBarrier(
+    bool rasterization_order_color_access, bool source_is_multisampled) {
+  return !rasterization_order_color_access || source_is_multisampled;
+}
+
+constexpr bool ShouldEnableInPassRoaaPipelineFlag(
+    bool rasterization_order_color_access, bool source_is_multisampled) {
+  return rasterization_order_color_access && !source_is_multisampled;
+}
+
+// In-pass resolve packs fixed-point formats using canonical unsigned/snorm16
+// encodings and float formats bitwise. When accurate_resolve_number_formats is
+// enabled, reject signed/integer destination number formats on unsigned fixed
+// targets (e.g. k_8_8_8_8 / k_2_10_10_10 -> SNORM/UINT/SINT) so they fall
+// back to the full compute resolve path.
+constexpr bool IsInPassDestNumberFormatSupported(
+    uint32_t color_rt_format, uint32_t copy_dest_number,
+    bool accurate_resolve_number_formats) {
+  if (!accurate_resolve_number_formats) {
+    return true;
+  }
+  constexpr uint32_t kNumUnsignedRepeatingFraction = 0;
+  constexpr uint32_t kNumSignedRepeatingFraction = 1;
+  constexpr uint32_t kNumFloat = 7;
+  if (IsInPassFloatColorFormat(color_rt_format)) {
+    return copy_dest_number == kNumFloat ||
+           copy_dest_number == kNumUnsignedRepeatingFraction;
+  }
+  constexpr uint32_t kColorRtFmt16_16 = 4;
+  constexpr uint32_t kColorRtFmt16_16_16_16 = 5;
+  if (color_rt_format == kColorRtFmt16_16 ||
+      color_rt_format == kColorRtFmt16_16_16_16) {
+    return copy_dest_number == kNumSignedRepeatingFraction ||
+           copy_dest_number == kNumUnsignedRepeatingFraction;
+  }
+  return copy_dest_number == kNumUnsignedRepeatingFraction;
+}
+
+struct InPassAffineResult {
+  bool ok = false;
+  const char* reject_reason = nullptr;
+  int64_t offset_x = 0;
+  int64_t offset_y = 0;
+};
+
+inline InPassAffineResult ComputeInPassAffineOffset(
+    bool is_64bpp, bool is_2x_msaa, uint32_t first_sample_index,
+    uint32_t pixel_x0, uint32_t pixel_y0, uint32_t width, uint32_t height,
+    uint32_t dump_base, uint32_t dump_pitch, uint32_t rt_base_tiles,
+    uint32_t rt_pitch_tiles, uint32_t band_tile_offset) {
+  InPassAffineResult result{};
+  if (!width || !height) {
+    result.reject_reason = "empty rect";
+    return result;
+  }
+  if (!rt_pitch_tiles) {
+    result.reject_reason = "mapping not affine";
+    return result;
+  }
+  const uint32_t tile_size_x = is_64bpp ? 40u : 80u;
+  constexpr uint32_t kTileSizeY = 16u;
+  const uint32_t sample_y_log2 = is_2x_msaa ? 1u : 0u;
+  const uint32_t tile_pixel_size_y = kTileSizeY >> sample_y_log2;
+  const uint32_t sample_y_offset = first_sample_index & 1u;
+
+  int64_t offset_x = INT64_MAX;
+  int64_t offset_y = INT64_MAX;
+  const uint32_t tiles_x = (width + tile_size_x - 1u) / tile_size_x;
+  const uint32_t tiles_y = (height + tile_pixel_size_y - 1u) / tile_pixel_size_y;
+  for (uint32_t ty = 0; ty <= tiles_y; ++ty) {
+    const uint32_t py = std::min(ty * tile_pixel_size_y, height - 1u);
+    for (uint32_t tx = 0; tx <= tiles_x; ++tx) {
+      const uint32_t px = std::min(tx * tile_size_x, width - 1u);
+      const uint32_t sx = px + pixel_x0;
+      const uint32_t sy = ((py + pixel_y0) << sample_y_log2) + sample_y_offset;
+      const uint32_t tile_x = sx / tile_size_x;
+      const uint32_t tile_y = sy / kTileSizeY;
+      const uint32_t nonwrapped = dump_base + tile_y * dump_pitch + tile_x;
+      const uint64_t shifted = uint64_t(nonwrapped) + uint64_t(band_tile_offset);
+      if (shifted < uint64_t(rt_base_tiles)) {
+        result.reject_reason = "tile before rt base";
+        return result;
+      }
+      const uint32_t linear = uint32_t(shifted - uint64_t(rt_base_tiles));
+      const uint32_t rt_tile_y = linear / rt_pitch_tiles;
+      const uint32_t rt_tile_x = linear - rt_tile_y * rt_pitch_tiles;
+      const int64_t texel_x =
+          int64_t(rt_tile_x) * tile_size_x + (sx - tile_x * tile_size_x);
+      const int64_t texel_y =
+          int64_t(rt_tile_y) * kTileSizeY + (sy - tile_y * kTileSizeY);
+      const int64_t host_x = texel_x;
+      const int64_t host_y = texel_y >> sample_y_log2;
+      const int64_t corner_offset_x = int64_t(px) - host_x;
+      const int64_t corner_offset_y = int64_t(py) - host_y;
+      if (offset_x == INT64_MAX) {
+        offset_x = corner_offset_x;
+        offset_y = corner_offset_y;
+      } else if (corner_offset_x != offset_x || corner_offset_y != offset_y) {
+        result.reject_reason = "mapping not affine";
+        return result;
+      }
+    }
+  }
+  result.ok = true;
+  result.offset_x = offset_x;
+  result.offset_y = offset_y;
+  return result;
+}
+
+struct DirectHostColorMatch {
+  bool matched = false;
+  bool encode_pwl_gamma_from_unorm16 = false;
+};
+
+constexpr DirectHostColorMatch EvaluateDirectHostColorFormatMatch(
+    uint32_t rt_color_format, uint32_t resolve_color_key_format,
+    uint32_t k8888_format, uint32_t k8888_gamma_format,
+    bool gamma_render_target_as_unorm16, bool cvar_gamma_alias) {
+  if (rt_color_format == resolve_color_key_format) {
+    return {true, false};
+  }
+  if (cvar_gamma_alias && resolve_color_key_format == k8888_format &&
+      rt_color_format == k8888_gamma_format) {
+    return {true, gamma_render_target_as_unorm16};
+  }
+  return {false, false};
+}
+
+struct StencilZeroRect {
+  bool valid = false;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+
+  void Invalidate() {
+    valid = false;
+    x = 0;
+    y = 0;
+    width = 0;
+    height = 0;
+  }
+
+  bool Covers(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh) const {
+    if (!valid || !rw || !rh) {
+      return false;
+    }
+    return rx >= x && ry >= y &&
+           uint64_t(rx) + uint64_t(rw) <= uint64_t(x) + uint64_t(width) &&
+           uint64_t(ry) + uint64_t(rh) <= uint64_t(y) + uint64_t(height);
+  }
+};
+
+constexpr bool StencilOpCanWriteNonZeroFromZero(uint32_t stencil_op,
+                                                uint8_t stencil_ref,
+                                                uint8_t stencil_write_mask) {
+  if (!stencil_write_mask) {
+    return false;
+  }
+  if (stencil_op == kStencilOpKeep || stencil_op == kStencilOpZero) {
+    return false;
+  }
+  if (stencil_op == kStencilOpReplace) {
+    return (stencil_ref & stencil_write_mask) != 0;
+  }
+  // Conservatively treat increment/decrement/invert/wrap as potentially
+  // producing non-zero stencil values.
+  return true;
+}
+
+constexpr bool DoesDrawPotentiallyWriteNonZeroStencil(
+    bool stencil_enable, bool backface_enable, uint32_t fail, uint32_t zpass,
+    uint32_t zfail, uint8_t ref_front, uint8_t write_mask_front,
+    uint32_t fail_bf, uint32_t zpass_bf, uint32_t zfail_bf, uint8_t ref_back,
+    uint8_t write_mask_back) {
+  if (!stencil_enable) {
+    return false;
+  }
+  if (StencilOpCanWriteNonZeroFromZero(fail, ref_front, write_mask_front) ||
+      StencilOpCanWriteNonZeroFromZero(zpass, ref_front, write_mask_front) ||
+      StencilOpCanWriteNonZeroFromZero(zfail, ref_front, write_mask_front)) {
+    return true;
+  }
+  if (backface_enable &&
+      (StencilOpCanWriteNonZeroFromZero(fail_bf, ref_back, write_mask_back) ||
+       StencilOpCanWriteNonZeroFromZero(zpass_bf, ref_back, write_mask_back) ||
+       StencilOpCanWriteNonZeroFromZero(zfail_bf, ref_back, write_mask_back))) {
+    return true;
+  }
+  return false;
+}
+
+inline void UpdateStencilZeroRectOnDepthResolveClear(
+    StencilZeroRect& rect, bool had_clear_transfers, uint32_t clear_x,
+    uint32_t clear_y, uint32_t clear_w, uint32_t clear_h,
+    uint8_t stencil_clear_value) {
+  if (stencil_clear_value != 0 || !clear_w || !clear_h) {
+    rect.Invalidate();
+    return;
+  }
+  if (!had_clear_transfers && rect.Covers(clear_x, clear_y, clear_w, clear_h)) {
+    // Existing wider zero region remains intact (no transfers touched outside).
+    return;
+  }
+  rect.valid = true;
+  rect.x = clear_x;
+  rect.y = clear_y;
+  rect.width = clear_w;
+  rect.height = clear_h;
+}
+
+inline void UpdateStencilZeroRectOnBandReplication(StencilZeroRect& rect,
+                                                   uint32_t rt_width,
+                                                   uint32_t rt_height,
+                                                   uint32_t guest_band_rows) {
+  if (!guest_band_rows || guest_band_rows >= rt_height) {
+    return;
+  }
+  if (rect.Covers(0, 0, rt_width, guest_band_rows)) {
+    rect.valid = true;
+    rect.x = 0;
+    rect.y = 0;
+    rect.width = rt_width;
+    rect.height = rt_height;
+  } else {
+    rect.Invalidate();
+  }
+}
+
+inline bool IsDepthResolveCoveredByStencilZero(
+    const StencilZeroRect& rect, uint32_t msaa_samples, uint32_t pixel_x0,
+    uint32_t pixel_y0, uint32_t width, uint32_t height, uint32_t dump_base,
+    uint32_t dump_pitch, uint32_t rt_base_tiles, uint32_t rt_pitch_tiles,
+    uint32_t band_tile_offset) {
+  if (!rect.valid || !width || !height || !rt_pitch_tiles ||
+      rt_pitch_tiles != dump_pitch) {
+    return false;
+  }
+  const uint32_t tile_px_x = 80u >> uint32_t(msaa_samples >= kMsaa4X);
+  const uint32_t tile_px_y = 16u >> uint32_t(msaa_samples >= kMsaa2X);
+  if (uint64_t(pixel_x0) + uint64_t(width) >
+      uint64_t(dump_pitch) * uint64_t(tile_px_x)) {
+    return false;
+  }
+  const int64_t tile_delta =
+      int64_t(dump_base) + int64_t(band_tile_offset) - int64_t(rt_base_tiles);
+  if (tile_delta < 0 || (tile_delta % int64_t(rt_pitch_tiles)) != 0) {
+    return false;
+  }
+  const uint64_t delta_tile_y = uint64_t(tile_delta / int64_t(rt_pitch_tiles));
+  const uint64_t rt_y0 = uint64_t(pixel_y0) + delta_tile_y * uint64_t(tile_px_y);
+  if (rt_y0 > UINT32_MAX) {
+    return false;
+  }
+  return rect.Covers(pixel_x0, uint32_t(rt_y0), width, height);
+}
+
+constexpr bool ShouldFetchStencilInDepthResolve(bool probe_skip_stencil,
+                                                bool cvar_skip_unused_stencil,
+                                                bool covered_by_stencil_zero) {
+  if (probe_skip_stencil) {
+    return false;
+  }
+  if (cvar_skip_unused_stencil && covered_by_stencil_zero) {
+    return false;
+  }
+  return true;
+}
+
+constexpr bool IsFastEdramResolveCopyShaderIndex(uint32_t shader_index) {
+  return shader_index <= 3u;
+}
+
+inline void ComputeFastEdramResolveGroupCount(uint32_t base_x_log2,
+                                              uint32_t base_y_log2,
+                                              uint32_t width, uint32_t height,
+                                              bool use_64x1,
+                                              uint32_t& groups_x_out,
+                                              uint32_t& groups_y_out) {
+  const uint32_t x_log2 = use_64x1 ? (base_x_log2 + 3u) : base_x_log2;
+  const uint32_t y_log2 = use_64x1 ? 0u : base_y_log2;
+  groups_x_out = (width + ((uint32_t(1) << x_log2) - 1u)) >> x_log2;
+  groups_y_out = (height + ((uint32_t(1) << y_log2) - 1u)) >> y_log2;
+}
+
+inline void ComputeDirectHostResolveDispatchGroups(uint32_t thread_count_x,
+                                                   uint32_t thread_count_y,
+                                                   bool use_64x1,
+                                                   uint32_t& groups_x_out,
+                                                   uint32_t& groups_y_out) {
+  if (use_64x1) {
+    groups_x_out = (thread_count_x + 63u) >> 6;
+    groups_y_out = thread_count_y;
+  } else {
+    groups_x_out = (thread_count_x + 7u) >> 3;
+    groups_y_out = (thread_count_y + 7u) >> 3;
+  }
+}
+
+// Computes the minimum guest pixel height required on a render target to cover
+// EDRAM ownership-transfer range [start_tiles, end_tiles) (with 2048-tile ring
+// wraparound). `rt_pitch_tiles` must be `RenderTargetKey::GetPitchTiles()`.
+inline uint32_t ComputeTransferNeededGuestHeight(uint32_t start_tiles,
+                                                 uint32_t end_tiles,
+                                                 uint32_t rt_base_tiles,
+                                                 uint32_t rt_pitch_tiles,
+                                                 uint32_t msaa_samples) {
+  constexpr uint32_t kEdramTileCount = 2048u;
+  if (end_tiles <= start_tiles || !rt_pitch_tiles) {
+    return 0u;
+  }
+  const uint32_t clamped_start = std::min(start_tiles, kEdramTileCount);
+  const uint32_t clamped_end = std::min(end_tiles, kEdramTileCount);
+  if (clamped_end <= clamped_start) {
+    return 0u;
+  }
+  uint32_t max_local_tile_end = 0u;
+  if (clamped_start >= rt_base_tiles) {
+    max_local_tile_end = clamped_end - rt_base_tiles;
+  } else if (clamped_end <= rt_base_tiles) {
+    max_local_tile_end = (kEdramTileCount - rt_base_tiles) + clamped_end;
+  } else {
+    max_local_tile_end = kEdramTileCount;
+  }
+  const uint32_t tile_rows =
+      (max_local_tile_end + rt_pitch_tiles - 1u) / rt_pitch_tiles;
+  const uint32_t tile_height_px = (msaa_samples >= kMsaa2X) ? 8u : 16u;
+  return tile_rows * tile_height_px;
+}
+
+// Returns whether a render target with `allocated_guest_height` and legal cap
+// `max_guest_height` covers `needed_guest_height` (clamped to max_guest_height
+// to match EnsureRenderTargetHeight(), preventing narrow or wrapped RTs already
+// at max_guest_height from being mistakenly dropped as OOM-undersized).
+constexpr bool RenderTargetHeightCoversNeeded(uint32_t allocated_guest_height,
+                                              uint32_t max_guest_height,
+                                              uint32_t needed_guest_height) {
+  const uint32_t clamped_needed =
+      max_guest_height ? std::min(needed_guest_height, max_guest_height)
+                       : needed_guest_height;
+  return allocated_guest_height >= clamped_needed;
+}
+
+// Vulkan stage/access bitmask constants mirrored for pure-logic unit tests
+// (static_asserted against Vulkan headers in vulkan_render_target_cache.cc).
+constexpr uint32_t kVkStageTopOfPipeBit = 0x00000001u;
+constexpr uint32_t kVkStageFragmentShaderBit = 0x00000080u;
+constexpr uint32_t kVkStageComputeShaderBit = 0x00000800u;
+constexpr uint32_t kVkStageAllCommandsBit = 0x00010000u;
+constexpr uint32_t kVkAccessShaderReadBit = 0x00000020u;
+
+struct GrowBarrierPlan {
+  uint32_t pre_src_stage = 0;
+  uint32_t pre_src_access = 0;
+  uint32_t post_dst_stage = 0;
+  uint32_t post_dst_access = 0;
+  uint32_t post_layout = 0;
+};
+
+// Resolves valid Vulkan pre-copy and post-copy barrier stages/accesses for
+// GrowRenderTarget(), guaranteeing:
+//   1. pre_src_stage != 0, and TOP_OF_PIPE is never paired with non-zero access
+//   2. post_dst_stage != 0 and NEVER contains VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+//      (preventing VUID-vkCmdPipelineBarrier-dstStageMask-03900).
+inline GrowBarrierPlan ResolveGrowBarrierStates(
+    uint32_t old_stage, uint32_t old_access, uint32_t old_layout,
+    uint32_t draw_stage, uint32_t draw_access, uint32_t draw_layout,
+    bool old_layout_is_transient_or_transfer, bool old_layout_is_shader_read) {
+  GrowBarrierPlan plan{};
+  uint32_t pre_stage = old_stage;
+  uint32_t pre_access = old_access;
+  if (pre_stage == 0u) {
+    pre_stage = pre_access ? kVkStageAllCommandsBit : kVkStageTopOfPipeBit;
+  } else if ((pre_stage & kVkStageTopOfPipeBit) != 0u && pre_access != 0u) {
+    pre_stage &= ~kVkStageTopOfPipeBit;
+    if (pre_stage == 0u) {
+      pre_stage = kVkStageAllCommandsBit;
+    }
+  }
+  if (pre_stage == kVkStageTopOfPipeBit) {
+    pre_access = 0u;
+  }
+  plan.pre_src_stage = pre_stage;
+  plan.pre_src_access = pre_access;
+
+  const uint32_t safe_draw_stage =
+      (draw_stage & ~kVkStageTopOfPipeBit) ? (draw_stage & ~kVkStageTopOfPipeBit)
+                                           : kVkStageAllCommandsBit;
+  if (old_layout_is_transient_or_transfer) {
+    plan.post_dst_stage = safe_draw_stage;
+    plan.post_dst_access = draw_access;
+    plan.post_layout = draw_layout;
+  } else if (old_layout_is_shader_read) {
+    const uint32_t stripped = old_stage & ~kVkStageTopOfPipeBit;
+    if (stripped != 0u && old_access != 0u) {
+      plan.post_dst_stage = stripped;
+      plan.post_dst_access = old_access;
+    } else {
+      plan.post_dst_stage =
+          kVkStageFragmentShaderBit | kVkStageComputeShaderBit;
+      plan.post_dst_access = kVkAccessShaderReadBit;
+    }
+    plan.post_layout = old_layout;
+  } else {
+    const uint32_t stripped = old_stage & ~kVkStageTopOfPipeBit;
+    if (stripped != 0u) {
+      plan.post_dst_stage = stripped;
+      plan.post_dst_access = old_access ? old_access : draw_access;
+    } else {
+      plan.post_dst_stage = safe_draw_stage;
+      plan.post_dst_access = draw_access;
+    }
+    plan.post_layout = old_layout;
+  }
+  return plan;
+}
+
+}  // namespace resolve_opts
+}  // namespace vulkan
+}  // namespace gpu
+}  // namespace xe
+
+#ifndef XENIA_GPU_VULKAN_RESOLVE_OPTS_PURE_LOGIC_ONLY
+
+#include <array>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -24,15 +552,18 @@
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache_file.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
+#include "xenia/gpu/vulkan/deferred_resolve_clear.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/vulkan/single_layout_descriptor_set_pool.h"
 #include "xenia/ui/vulkan/vulkan_upload_buffer_pool.h"
 
+DECLARE_bool(vulkan_defer_resolve_clears);
 DECLARE_bool(vulkan_depth_unorm24);
 DECLARE_bool(vulkan_normalize_dontcare_keys);
 DECLARE_bool(vulkan_msaa_4x_as_2x2);
 DECLARE_bool(vulkan_msaa_single_sample_storage);
 DECLARE_bool(vulkan_rasterization_order_attachment_access);
+DECLARE_bool(vulkan_rt_rows_on_demand);
 
 namespace xe {
 namespace gpu {
@@ -257,6 +788,42 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // guest render pass - after the in-pass transfers, before the draw.
   void EncodePendingDrawPassClears();
 
+  // Deferred resolve clear folding (vulkan_defer_resolve_clears):
+  // StageDeferredResolveClearsForLastUpdate() is called at the end of Update()
+  // and stages any pending resolve clears on the bound attachments without
+  // consuming them from VulkanRenderTarget (so speculative Update() aborts
+  // preserve them).
+  void StageDeferredResolveClearsForLastUpdate();
+  // Bitmask of attachment slots (0 = depth, 1..4 = color) that received
+  // VK_ATTACHMENT_LOAD_OP_CLEAR in the most recent
+  // GetLastUpdateRenderingAttachments() call.
+  uint32_t last_update_load_op_clear_mask() const {
+    return last_update_load_op_clear_mask_;
+  }
+  bool HasPendingDeferredResolveClears() const {
+    return !deferred_clear_render_targets_.empty();
+  }
+  bool HasStagedDeferredResolveClears() const {
+    return staged_deferred_clear_mask_ != 0;
+  }
+  // Called immediately after CmdVkBeginRendering / CmdVkBeginRenderPass.
+  // Expands the deferred command buffer's drawn bounds for each slot in
+  // `load_op_clear_mask` and consumes only those slots from their targets.
+  void ConsumeDeferredResolveClearsOnPassBegin(uint32_t load_op_clear_mask);
+  // Emits CmdVkClearAttachments inside the currently-active guest render pass
+  // for any staged deferred resolve clears not folded into LOAD_OP_CLEAR (e.g.
+  // sub-rect clears, traditional VkRenderPass, or already-open pass), and clears
+  // PendingResolveClear on those targets only after emitting.
+  void EncodePendingDeferredResolveClears();
+  // Immediately executes all pending deferred resolve clears in standalone
+  // single-attachment passes (e.g. on runtime toggle-off via
+  // debug.xendroid.defer_resolve_clears or before resolve copies / dumps).
+  // Returns true if any clears were flushed.
+  bool FlushAllDeferredResolveClears();
+  // Discards all pending and staged deferred resolve clears without GPU work
+  // (e.g. RestoreEdramSnapshot, ClearCache, Shutdown).
+  void DiscardAllDeferredResolveClears();
+
   // For VK_KHR_dynamic_rendering: fills in attachment info structures.
   // Returns the number of color attachments (may be less than max if trailing
   // slots are unused). depth_attachment and stencil_attachment are filled if
@@ -351,6 +918,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t GetMaxRenderTargetHeight() const override;
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
+  bool EnsureRenderTargetHeight(RenderTarget* render_target,
+                                uint32_t needed_guest_height) override;
 
   bool IsHostDepthEncodingDifferent(
       xenos::DepthRenderTargetFormat format) const override;
@@ -658,7 +1227,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                        VkImageView view_depth_color,
                        VkImageView view_depth_stencil, VkImageView view_stencil,
                        VkImageView view_color_transfer_separate,
-                       size_t descriptor_set_index_transfer_source)
+                       size_t descriptor_set_index_transfer_source,
+                       uint32_t allocated_guest_height,
+                       uint32_t max_guest_height)
         : RenderTarget(key),
           render_target_cache_(render_target_cache),
           image_(image),
@@ -668,13 +1239,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
           view_stencil_(view_stencil),
           view_color_transfer_separate_(view_color_transfer_separate),
           descriptor_set_index_transfer_source_(
-              descriptor_set_index_transfer_source) {}
+              descriptor_set_index_transfer_source),
+          allocated_guest_height_(allocated_guest_height),
+          max_guest_height_(max_guest_height) {}
     ~VulkanRenderTarget();
 
+    uint32_t allocated_guest_height() const { return allocated_guest_height_; }
+    uint32_t max_guest_height() const { return max_guest_height_; }
+
     VkImage image() const { return image_; }
+    VkDeviceMemory memory() const { return memory_; }
 
     VkImageView view_depth_color() const { return view_depth_color_; }
     VkImageView view_depth_stencil() const { return view_depth_stencil_; }
+    VkImageView view_stencil() const { return view_stencil_; }
     VkImageView view_color_transfer_separate() const {
       return view_color_transfer_separate_;
     }
@@ -683,8 +1261,34 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                  ? view_color_transfer_separate_
                  : view_depth_color_;
     }
+    size_t descriptor_set_index_transfer_source() const {
+      return descriptor_set_index_transfer_source_;
+    }
+    size_t descriptor_set_index_input_attachment() const {
+      return descriptor_set_index_input_attachment_;
+    }
     void SetDescriptorSetIndexInputAttachment(size_t index) {
       descriptor_set_index_input_attachment_ = index;
+    }
+    void ReplaceBackingResources(VkImage image, VkDeviceMemory memory,
+                                 VkImageView view_depth_color,
+                                 VkImageView view_depth_stencil,
+                                 VkImageView view_stencil,
+                                 VkImageView view_color_transfer_separate,
+                                 size_t descriptor_set_index_transfer_source,
+                                 size_t descriptor_set_index_input_attachment,
+                                 uint32_t new_allocated_guest_height) {
+      image_ = image;
+      memory_ = memory;
+      view_depth_color_ = view_depth_color;
+      view_depth_stencil_ = view_depth_stencil;
+      view_stencil_ = view_stencil;
+      view_color_transfer_separate_ = view_color_transfer_separate;
+      descriptor_set_index_transfer_source_ =
+          descriptor_set_index_transfer_source;
+      descriptor_set_index_input_attachment_ =
+          descriptor_set_index_input_attachment;
+      allocated_guest_height_ = new_allocated_guest_height;
     }
     VkDescriptorSet GetDescriptorSetInputAttachment() const {
       return render_target_cache_.descriptor_set_pool_input_attachment_->Get(
@@ -737,6 +1341,28 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       temporary_sort_index_ = index;
     }
 
+    bool has_pending_resolve_clear() const {
+      return pending_resolve_clear_.active;
+    }
+    const PendingResolveClear& pending_resolve_clear() const {
+      return pending_resolve_clear_;
+    }
+    void SetPendingResolveClear(const PendingResolveClear& clear) {
+      pending_resolve_clear_ = clear;
+      pending_resolve_clear_.active = true;
+    }
+    void ClearPendingResolveClear() {
+      pending_resolve_clear_ = PendingResolveClear{};
+    }
+
+    const resolve_opts::StencilZeroRect& stencil_zero_rect() const {
+      return stencil_zero_rect_;
+    }
+    resolve_opts::StencilZeroRect& mutable_stencil_zero_rect() {
+      return stencil_zero_rect_;
+    }
+    void InvalidateStencilZeroRect() { stencil_zero_rect_.Invalidate(); }
+
    private:
     VulkanRenderTargetCache& render_target_cache_;
     size_t descriptor_set_index_input_attachment_ = SIZE_MAX;
@@ -755,12 +1381,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // 2 sampled images for depth / stencil, 1 sampled image for color.
     size_t descriptor_set_index_transfer_source_;
 
+    // Allocated vs maximum EDRAM-wrap height in guest pixels (row-on-demand).
+    uint32_t allocated_guest_height_;
+    uint32_t max_guest_height_;
+
     VkPipelineStageFlags current_stage_mask_ = 0;
     VkAccessFlags current_access_mask_ = 0;
     VkImageLayout current_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     // Temporary storage for indices in operations like transfers and dumps.
     uint32_t temporary_sort_index_ = 0;
+
+    PendingResolveClear pending_resolve_clear_{};
+    resolve_opts::StencilZeroRect stencil_zero_rect_{};
   };
 
   struct FramebufferKey {
@@ -1329,6 +1962,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool msaa_single_sample_storage_ = false;
   bool mali_normalize_mixed_load_ops_ = false;
   bool rasterization_order_color_access_ = false;
+  // Latched at Initialize() from cvars::vulkan_resolve_compute_64x1 so
+  // WorkgroupSize specialization and dispatch group counts always match.
+  bool resolve_compute_64x1_ = false;
+
+  void PollRuntimeDebugProperties();
 
   VkPipelineCache UseRtPipelineCache();
   void SaveRtPipelineCache(bool force);
@@ -1344,6 +1982,45 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   std::unordered_map<FramebufferKey, Framebuffer, FramebufferKey::Hasher>
       framebuffers_;
+
+  // Backing resources created for a VulkanRenderTarget (initial or grown).
+  struct RenderTargetBackingResources {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view_depth_color = VK_NULL_HANDLE;
+    VkImageView view_depth_stencil = VK_NULL_HANDLE;
+    VkImageView view_stencil = VK_NULL_HANDLE;
+    VkImageView view_color_transfer_separate = VK_NULL_HANDLE;
+    size_t descriptor_set_index_transfer_source = SIZE_MAX;
+    size_t descriptor_set_index_input_attachment = SIZE_MAX;
+  };
+  bool CreateRenderTargetBackingResources(RenderTargetKey key,
+                                          uint32_t guest_height,
+                                          RenderTargetBackingResources& out);
+  bool GrowRenderTarget(VulkanRenderTarget* render_target,
+                        uint32_t needed_guest_height);
+  bool EnsureTransferRenderTargetsHeight(
+      uint32_t render_target_count, RenderTarget* const* render_targets,
+      const std::vector<Transfer>* render_target_transfers,
+      const Transfer::Rectangle* resolve_clear_rectangle);
+
+  // Retired VulkanRenderTarget images/views/descriptors/framebuffers from
+  // row-on-demand growth, destroyed once entry.submission <= completed.
+  struct DeferredRtDestruction {
+    uint64_t submission = 0;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view_depth_color = VK_NULL_HANDLE;
+    VkImageView view_depth_stencil = VK_NULL_HANDLE;
+    VkImageView view_stencil = VK_NULL_HANDLE;
+    VkImageView view_color_transfer_separate = VK_NULL_HANDLE;
+    bool is_depth = false;
+    size_t descriptor_set_index_transfer_source = SIZE_MAX;
+    size_t descriptor_set_index_input_attachment = SIZE_MAX;
+    std::vector<VkFramebuffer> framebuffers;
+  };
+  std::vector<DeferredRtDestruction> deferred_rt_destructions_;
+  void DestroyDeferredRtDestructions(uint64_t completed_submission);
 
   // Set 0 - EDRAM storage buffer, set 1 - source depth sampled image (and
   // unused stencil from the transfer descriptor set), HostDepthStoreConstants
@@ -1446,6 +2123,27 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t transfers_as_clears_ = 0;
   uint64_t transfer_tiles_as_clears_ = 0;
 
+  // Deferred resolve clears pending across VulkanRenderTarget instances.
+  std::vector<VulkanRenderTarget*> deferred_clear_render_targets_;
+  std::array<PendingResolveClear, 1 + xenos::kMaxColorRenderTargets>
+      staged_deferred_clears_{};
+  std::array<VulkanRenderTarget*, 1 + xenos::kMaxColorRenderTargets>
+      staged_deferred_clear_render_targets_{};
+  uint32_t staged_deferred_clear_mask_ = 0;
+  uint32_t staged_deferred_clear_full_mask_ = 0;
+  mutable uint32_t last_update_load_op_clear_mask_ = 0;
+  void RegisterPendingResolveClear(VulkanRenderTarget* render_target,
+                                   const PendingResolveClear& clear);
+  void UnregisterPendingResolveClear(VulkanRenderTarget* render_target);
+  void ClearStagedDeferredResolveClears();
+  bool FlushDeferredResolveClearForTarget(VulkanRenderTarget* render_target);
+  void FlushDeferredResolveClearsForTransfers(
+      uint32_t render_target_count, RenderTarget* const* render_targets,
+      const std::vector<Transfer>* render_target_transfers, bool flush_dests);
+  void FlushOverlappingDeferredResolveClears(
+      uint32_t base_tiles, uint32_t tile_count,
+      const VulkanRenderTarget* exclude_render_target);
+
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
 
@@ -1470,5 +2168,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 }  // namespace vulkan
 }  // namespace gpu
 }  // namespace xe
+
+#endif  // !XENIA_GPU_VULKAN_RESOLVE_OPTS_PURE_LOGIC_ONLY
 
 #endif  // XENIA_GPU_VULKAN_VULKAN_RENDER_TARGET_CACHE_H_

@@ -495,6 +495,11 @@ int Memory::MapViews(uint8_t* mapping_base) {
       return 1;
     }
   }
+  for (size_t n = 0; n < xe::countof(map_info); n++) {
+    xe::memory::AdviseHugePages(
+        views_.all_views[n],
+        map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1);
+  }
   return 0;
 }
 

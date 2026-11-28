@@ -10,9 +10,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Global compile options applied to every target in this build.
-# Baseline ARMv8.2-A + LSE atomics + SDOT/UDOT + FP16 + LDAPR (RCPC) + CRC32
-# (Snapdragon 855+ / Cortex-A75+ / Dimensity 1000+ / Exynos 9820+).
-add_compile_options(-march=armv8.2-a+lse+dotprod+fp16+rcpc+crc)
+# Baseline ARMv8.0-A so Cortex-A73/A53 devices (e.g. Snapdragon 680, #122) do not
+# fault with SIGILL on static/library load. -moutline-atomics dispatches to LSE
+# atomics at runtime on ARMv8.1+ CPUs while falling back to LL/SC on ARMv8.0.
+add_compile_options(-march=armv8-a -moutline-atomics)
 add_compile_options(-stdlib=libc++)
 add_compile_options(-fno-omit-frame-pointer)
 add_compile_options(-funwind-tables)
@@ -42,6 +43,51 @@ endif()
 add_library(hardware_ProcessorInfo SHARED hardware_ProcessorInfo.cpp)
 target_link_libraries(hardware_ProcessorInfo PRIVATE vulkan)
 
+# Optional Release Profile-Guided Optimization (PGO). Default OFF so standard
+# :app:assembleRelease and Debug builds stay 100% unchanged.
+set(XENDROID_PGO_MODE "OFF" CACHE STRING "Optional Release PGO mode: OFF, GENERATE, USE")
+set_property(CACHE XENDROID_PGO_MODE PROPERTY STRINGS OFF GENERATE USE)
+set(XENDROID_PGO_PROFILE "" CACHE FILEPATH "Path to merged .profdata file when XENDROID_PGO_MODE=USE")
+set(XENDROID_PGO_PROFILE_DIR "/data/local/tmp/xendroid-pgo" CACHE STRING
+    "Default runtime .profraw output dir when XENDROID_PGO_MODE=GENERATE (overridden by LLVM_PROFILE_FILE)")
+
+string(TOUPPER "${XENDROID_PGO_MODE}" _xe_pgo_mode)
+if(_xe_pgo_mode STREQUAL "OFF" OR _xe_pgo_mode STREQUAL "")
+  # Default path: zero changes to :app:assembleRelease or configureCMakeDebug.
+elseif(_xe_pgo_mode STREQUAL "GENERATE")
+  add_compile_options(
+    $<$<CONFIG:Release,RelWithDebInfo>:-fprofile-generate=${XENDROID_PGO_PROFILE_DIR}>
+  )
+  add_link_options(
+    $<$<CONFIG:Release,RelWithDebInfo>:-fprofile-generate=${XENDROID_PGO_PROFILE_DIR}>
+  )
+  message(STATUS "XenDroid Release PGO: GENERATE -> ${XENDROID_PGO_PROFILE_DIR}")
+elseif(_xe_pgo_mode STREQUAL "USE")
+  if(NOT XENDROID_PGO_PROFILE)
+    message(FATAL_ERROR "XENDROID_PGO_MODE=USE requires -DXENDROID_PGO_PROFILE=<path/to/default.profdata>")
+  endif()
+  if(NOT EXISTS "${XENDROID_PGO_PROFILE}" OR IS_DIRECTORY "${XENDROID_PGO_PROFILE}")
+    message(FATAL_ERROR "XENDROID_PGO_PROFILE does not exist or is a directory: '${XENDROID_PGO_PROFILE}'")
+  endif()
+  add_compile_options(
+    $<$<CONFIG:Release,RelWithDebInfo>:-fprofile-use=${XENDROID_PGO_PROFILE}>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-backend-plugin>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-profile-instr-unprofiled>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-profile-instr-out-of-date>
+  )
+  # ThinLTO (-flto=thin) defers optimization/inlining to lld at link time,
+  # so lld also needs -fprofile-use and the -Wno-* flags under -Werror.
+  add_link_options(
+    $<$<CONFIG:Release,RelWithDebInfo>:-fprofile-use=${XENDROID_PGO_PROFILE}>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-backend-plugin>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-profile-instr-unprofiled>
+    $<$<CONFIG:Release,RelWithDebInfo>:-Wno-profile-instr-out-of-date>
+  )
+  message(STATUS "XenDroid Release PGO: USE -> ${XENDROID_PGO_PROFILE}")
+else()
+  message(FATAL_ERROR "Invalid XENDROID_PGO_MODE='${XENDROID_PGO_MODE}' (expected OFF, GENERATE, or USE)")
+endif()
+
 add_library(emu SHARED)
 set_target_properties(emu PROPERTIES OUTPUT_NAME "e")
 
@@ -65,6 +111,7 @@ target_sources(emu
         xe_android_util.cpp
         xe_opensles_audio_driver.cpp
         xe_opensles_audio_system.cpp
+        xe_pad_script.cpp
         xe_crash_record.cpp
         xe_system_xendroid.cpp
         xenia/src/xenia/app/emulator_window.cc

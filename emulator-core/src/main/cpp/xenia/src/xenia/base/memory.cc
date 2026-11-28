@@ -8,9 +8,16 @@
  */
 
 #include "xenia/base/memory.h"
+
+#include <mutex>
+
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
+
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 #if XE_ARCH_ARM64
 #include <arm_neon.h>
@@ -18,16 +25,52 @@
 
 DEFINE_bool(
     writable_executable_memory, true,
-    "Allow mapping memory with both write and execute access, for simulating "
-    "behavior on platforms where that's not supported",
+    "Allow RWX fallback when W^X dual-mapping is disabled or unavailable. "
+    "When false, strictly forbids RWX mappings and forces W^X dual-mapping "
+    "without running any RWX boot probe.",
+    "Memory");
+
+DEFINE_bool(
+    a64_wx_dual_mapping, true,
+    "Use W^X dual-mapping (r-xs + rw-s via memfd_create/ASharedMemory) for JIT "
+    "code cache and guest trampolines after live SELinux probe. Overridable on "
+    "Android via debug.xendroid.jit_wx=0|1.",
     "Memory");
 
 namespace xe {
 namespace memory {
 
+namespace {
+bool IsWxDualMappingRequested() {
+  static std::once_flag prop_once;
+  std::call_once(prop_once, []() {
+#if defined(__ANDROID__)
+    char prop_value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.jit_wx", prop_value) > 0) {
+      bool parsed = false;
+      if (ParseStrictBoolProp(prop_value, &parsed)) {
+        cvars::a64_wx_dual_mapping = parsed;
+        XELOGI("debug.xendroid.jit_wx: a64_wx_dual_mapping = {}",
+               parsed ? "true" : "false");
+      }
+    }
+#endif
+  });
+  return cvars::a64_wx_dual_mapping;
+}
+}  // namespace
+
+#if XE_PLATFORM_WIN32
+DualMappingWxBackend ProbeDualMappingWxSupport() {
+  return DualMappingWxBackend::kUnsupported;
+}
+#endif
+
 bool IsWritableExecutableMemoryPreferred() {
-  return IsWritableExecutableMemorySupported() &&
-         cvars::writable_executable_memory;
+  return ResolveWritableExecutableMemoryPreferred(
+      IsWxDualMappingRequested(), cvars::writable_executable_memory,
+      []() { return ProbeDualMappingWxSupport(); },
+      []() { return IsWritableExecutableMemorySupported(); });
 }
 
 using xe::swcache::CacheLine;

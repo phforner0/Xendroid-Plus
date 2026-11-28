@@ -28,6 +28,7 @@ namespace gpu {
 namespace vulkan {
 
 class VulkanCommandProcessor;
+class VulkanPipelineCache;
 
 class DeferredCommandBuffer {
  public:
@@ -35,7 +36,8 @@ class DeferredCommandBuffer {
                         size_t initial_size_bytes = 1024 * 1024);
 
   void Reset();
-  void Execute(VkCommandBuffer command_buffer);
+  void Execute(VkCommandBuffer command_buffer,
+               VulkanPipelineCache* pipeline_cache = nullptr);
   bool empty() const { return command_stream_size_ == 0; }
 
   // render_pass_begin->pNext of all barriers must be null.
@@ -115,20 +117,25 @@ class DeferredCommandBuffer {
     args.pipeline = pipeline;
   }
 
-  // Deferred-creation variant: records a STABLE pointer to a pipeline cache
-  // slot (a pipelines_ map node's Pipeline::pipeline field) instead of a
-  // handle value, dereferenced at Execute() time. The slot may still be
-  // VK_NULL_HANDLE at replay if asynchronous creation hasn't finished (or
-  // failed); in that case the bind is skipped and all graphics draws until the
-  // next successful graphics pipeline bind are dropped. Used only for guest
-  // graphics pipelines; the external / compute bind paths keep using the
-  // by-value CmdVkBindPipeline.
+  // Deferred-creation variant: either binds pipeline_at_record by value (when
+  // pipeline_slot is null) or resolves a stable VulkanPipelineCache::Pipeline*
+  // slot at Execute() time (with optional bounded wait/expedite when
+  // vulkan_async_pipeline_bind_on_replay is active). If the resolved handle is
+  // still VK_NULL_HANDLE at replay, the bind is skipped and all graphics draws
+  // until the next successful graphics pipeline bind are safely dropped.
   void CmdVkBindPipelineDeferred(VkPipelineBindPoint pipeline_bind_point,
-                                 VkPipeline pipeline_at_record) {
+                                 VkPipeline pipeline_at_record,
+                                 void* pipeline_slot = nullptr,
+                                 uint32_t replay_wait_ms = 0,
+                                 bool expedite_on_replay = false) {
     auto& args = *reinterpret_cast<ArgsVkBindPipelineDeferred*>(WriteCommand(
         Command::kVkBindPipelineDeferred, sizeof(ArgsVkBindPipelineDeferred)));
+    std::memset(&args, 0, sizeof(args));
     args.pipeline_bind_point = pipeline_bind_point;
     args.pipeline = pipeline_at_record;
+    args.pipeline_slot = pipeline_slot;
+    args.replay_wait_ms = replay_wait_ms;
+    args.expedite_on_replay = expedite_on_replay;
   }
 
   void CmdVkBindVertexBuffers(uint32_t first_binding, uint32_t binding_count,
@@ -854,6 +861,29 @@ class DeferredCommandBuffer {
     args.value = enable;
   }
 
+  // VK_KHR_push_descriptor: inline uniform-buffer descriptor push (avoids
+  // descriptor set allocation + vkUpdateDescriptorSets for set 1 constants).
+  void CmdVkPushDescriptorSetKHR(VkPipelineBindPoint pipeline_bind_point,
+                                 VkPipelineLayout layout, uint32_t set,
+                                 uint32_t buffer_count,
+                                 const VkDescriptorBufferInfo* buffer_infos) {
+    assert_true(buffer_count <= 8);
+    constexpr size_t header_size = xe::align(sizeof(ArgsVkPushDescriptorSetKHR),
+                                             alignof(VkDescriptorBufferInfo));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
+        Command::kVkPushDescriptorSetKHR,
+        header_size + sizeof(VkDescriptorBufferInfo) * buffer_count));
+    auto& args = *reinterpret_cast<ArgsVkPushDescriptorSetKHR*>(args_ptr);
+    args.pipeline_bind_point = pipeline_bind_point;
+    args.layout = layout;
+    args.set = set;
+    args.buffer_count = buffer_count;
+    if (buffer_count) {
+      std::memcpy(args_ptr + header_size, buffer_infos,
+                  sizeof(VkDescriptorBufferInfo) * buffer_count);
+    }
+  }
+
   void SetViewportClipEnabled(bool enabled) {
     viewport_clip_enabled_ = enabled;
   }
@@ -926,6 +956,7 @@ class DeferredCommandBuffer {
     kVkSetAlphaToOneEnableEXT,
     kVkSetLogicOpEnableEXT,
     kVkSetDepthBoundsTestEnable,
+    kVkPushDescriptorSetKHR,
     kCount,
   };
 
@@ -985,11 +1016,13 @@ class DeferredCommandBuffer {
 
   struct ArgsVkBindPipelineDeferred {
     VkPipelineBindPoint pipeline_bind_point;
-    // The slot's handle as observed at record time; the recorded draws'
-    // descriptor bindings only cover this pipeline's layout. Null when the
-    // async creation had not finished by then - a slot that fills in between
-    // record and Execute() must still drop its draws.
+    // The slot's handle as observed at record time when pipeline_slot is null.
     VkPipeline pipeline;
+    // Stable VulkanPipelineCache::Pipeline* resolved at Execute() when
+    // vulkan_async_pipeline_bind_on_replay is enabled (nullptr in legacy mode).
+    void* pipeline_slot;
+    uint32_t replay_wait_ms;
+    bool expedite_on_replay;
   };
 
   struct ArgsVkBindVertexBuffers {
@@ -1287,10 +1320,20 @@ class DeferredCommandBuffer {
     VkSampleMask sample_mask;
   };
 
+  struct ArgsVkPushDescriptorSetKHR {
+    VkPipelineBindPoint pipeline_bind_point;
+    VkPipelineLayout layout;
+    uint32_t set;
+    uint32_t buffer_count;
+    // Followed by aligned VkDescriptorBufferInfo[buffer_count].
+    static_assert(alignof(VkDescriptorBufferInfo) <= alignof(uintmax_t));
+  };
+
   void* WriteCommand(Command command, size_t arguments_size_bytes);
   void ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
                      size_t stream_remaining,
-                     bool& guest_graphics_pipeline_unready);
+                     bool& guest_graphics_pipeline_unready,
+                     VulkanPipelineCache* pipeline_cache);
 
  public:
   // Shrinks the last recorded begin-pass render area to the union of the
@@ -1300,10 +1343,16 @@ class DeferredCommandBuffer {
   void ShrinkRenderAreaToDrawn(uint32_t granularity_width,
                                uint32_t granularity_height);
 
+  // Expands the tracked drawn bounds to cover `rect` so ShrinkRenderAreaToDrawn
+  // never clips a pass-begin LOAD_OP_CLEAR or deferred resolve clear.
+  void ExpandRenderAreaToRect(const VkRect2D& rect) {
+    AccumulateDrawnRect(rect);
+  }
+
   // vulkan_replay_stats: what the replays sent to the driver, and how much of
   // it repeated the state already set in the same command buffer (the same
   // pipeline, descriptor sets, push constant bytes or dynamic state value).
-  static constexpr size_t kReplayStatCommandCount = 66;
+  static constexpr size_t kReplayStatCommandCount = 67;
   struct ReplayStats {
     uint64_t commands[kReplayStatCommandCount] = {};
     uint64_t redundant[kReplayStatCommandCount] = {};

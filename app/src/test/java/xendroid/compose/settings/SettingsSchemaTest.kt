@@ -1,6 +1,7 @@
 package xendroid.compose.settings
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -17,20 +18,24 @@ class SettingsSchemaTest {
     // less APU|mute and GPU|readback_memexport, which the core never defined (ajustes-2.md).
     // Display|host_present_from_non_ui_thread is intentionally absent (forced true natively).
     // Plus adds Vulkan|zerofg_mode, System link's Network|systemlink + Network|systemlink_peers (176),
-    // and the 19 Plus Ultra Track A/B/C/D canonical engine cvars: 195.
-    @Test fun total_entry_count_is_195() {
-        assertEquals(195, all.size)
+    // the 19 Plus Ultra Track A/B/C/D canonical engine cvars (195), the 2 Wave 1 mobile
+    // optimization cvars (GPU|gpu_texture_lod_bias, Vulkan|vulkan_android_present_divisor) (197),
+    // and the 3 Wave 2 mobile render/thermal/ADPF cvars (GPU|vulkan_defer_resolve_clears,
+    // GPU|vulkan_auto_vrs_thermal, CPU|adpf_cpu_performance_hint): 200,
+    // plus Wave 4 CPU|jit_warmup_jprof: 201.
+    @Test fun total_entry_count_is_201() {
+        assertEquals(201, all.size)
         assertEquals(
-            195,
+            201,
             all.count { it is Setting.Bool } + all.count { it is Setting.IntRange } +
                 all.count { it is Setting.ListChoice } + all.count { it is Setting.Action } + all.count { it is Setting.Text },
         )
     }
 
     @Test fun counts_by_type_match_verified_inventory() {
-        assertEquals(138, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra bool cvars
+        assertEquals(142, all.count { it is Setting.Bool })        // 120 + 18 Plus Ultra + 3 Wave 2 + 1 Wave 4 bool cvars
         assertEquals(20, all.count { it is Setting.IntRange })     // 14 + 6 new
-        assertEquals(32, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start
+        assertEquals(34, all.count { it is Setting.ListChoice })   // 31 + HID|jit_frame_start + 2 Wave 1 list cvars
         assertEquals(2, all.count { it is Setting.Action })
         assertEquals(3, all.count { it is Setting.Text })          // launch_module, cl, systemlink_peers
     }
@@ -48,13 +53,16 @@ class SettingsSchemaTest {
         i("APU|volume", 100, 0, 100)
         i("Kernel|stack_size_multiplier_hack", 1, 1, 8)
         listOf("GPU|async_shader_vs_interpreter", "GPU|async_shader_skip_draws", "GPU|pipeline_storage_precreate",
-            "Kernel|precise_guest_delays", "APU|apu_performance_hint", "HID|vibration", "HID|guide_button",
+            "Kernel|precise_guest_delays", "HID|vibration", "HID|guide_button",
             "GPU|readback_resolve_sync", "GPU|precise_interpolation", "Vulkan|vulkan_allow_reverse_z",
             "Vulkan|vulkan_dynamic_rendering", "Vulkan|vulkan_avoid_geometry_shaders", "Vulkan|vulkan_depth_unorm24",
-            "General|guest_crash_is_fatal").forEach { b(it, true) }
-        listOf("GPU|depth_bias_shader_offset", "GPU|memexport_enable", "UI|achievement_notification_position_by_game",
-            "Storage|mount_memory_unit", "Vulkan|vulkan_allow_present_mode_immediate",
+            "General|guest_crash_is_fatal", "Memory|writable_executable_memory").forEach { b(it, true) }
+        listOf("APU|apu_performance_hint", "GPU|depth_bias_shader_offset", "GPU|memexport_enable",
+            "UI|achievement_notification_position_by_game", "Storage|mount_memory_unit",
+            "Vulkan|vulkan_in_pass_resolve", "Vulkan|vulkan_allow_present_mode_immediate",
             "Vulkan|vulkan_allow_present_mode_mailbox").forEach { b(it, false) }
+        assertNull("Memory|a64_wx_dual_mapping stays TOML-only (default true in C++ and default_config.toml)",
+            SettingsSchema.byKey["Memory|a64_wx_dual_mapping"])
         assertEquals("0", (SettingsSchema.byKey["GPU|draw_resolution_scale_threshold"] as Setting.ListChoice).default)
         assertEquals("-1", (SettingsSchema.byKey["Kernel|console_type"] as Setting.ListChoice).default)
         val gamma = SettingsSchema.byKey["Kernel|kernel_display_gamma_power"] as Setting.ListChoice
@@ -149,7 +157,7 @@ class SettingsSchemaTest {
             assertEquals(0, it.min); assertEquals(100, it.max)
         }
         ir("APU|apu_max_queued_frames").let {
-            assertEquals(4, it.min); assertEquals(64, it.max)
+            assertEquals(4, it.min); assertEquals(64, it.max); assertEquals(12, it.default)
         }
     }
 
@@ -172,6 +180,75 @@ class SettingsSchemaTest {
     @Test fun jit_frame_start_defaults_to_off() {
         val s = SettingsSchema.byKey["HID|jit_frame_start"] as Setting.ListChoice
         assertEquals("0", s.default)
+    }
+
+    @Test fun wave1_mobile_opts_list_choices_match_contract() {
+        val lodBias = SettingsSchema.byKey["GPU|gpu_texture_lod_bias"] as Setting.ListChoice
+        assertEquals("0", lodBias.default)
+        assertEquals("Texture LOD bias", lodBias.title)
+        assertEquals(
+            listOf(
+                "0" to "Off (game default)",
+                "1" to "+1 (half-res mips)",
+                "2" to "+2 (quarter-res mips)",
+            ),
+            lodBias.options.map { it.value to it.label },
+        )
+        assertTrue(lodBias.desc.isNotBlank())
+        assertFalse(lodBias.key in SettingsSchema.playerKeys)
+
+        val presentDiv = SettingsSchema.byKey["Vulkan|vulkan_android_present_divisor"] as Setting.ListChoice
+        assertEquals("0", presentDiv.default)
+        assertEquals("Swapchain size divisor", presentDiv.title)
+        assertEquals(
+            listOf(
+                "0" to "Auto",
+                "1" to "Native panel",
+                "2" to "Half (÷2)",
+                "3" to "Third (÷3)",
+            ),
+            presentDiv.options.map { it.value to it.label },
+        )
+        assertTrue(presentDiv.desc.isNotBlank())
+        assertFalse(presentDiv.key in SettingsSchema.playerKeys)
+    }
+
+    @Test fun wave2_mobile_thermal_opts_match_contract() {
+        fun assertWave2Bool(key: String, expectedDefault: Boolean) {
+            val s = SettingsSchema.byKey[key] as? Setting.Bool
+            assertNotNull("missing Wave 2 setting: $key", s)
+            assertEquals(key, expectedDefault, s!!.default)
+            assertTrue("$key title must be non-blank", s.title.isNotBlank())
+            assertTrue("$key desc must be non-blank", s.desc.isNotBlank())
+            assertFalse("$key must not be in playerKeys", s.key in SettingsSchema.playerKeys)
+        }
+        assertWave2Bool("GPU|vulkan_defer_resolve_clears", true)
+        assertWave2Bool("GPU|vulkan_auto_vrs_thermal", false)
+        assertWave2Bool("CPU|adpf_cpu_performance_hint", false)
+        assertNull(SettingsSchema.byKey["Kernel|kernel_delay0_backoff"])
+    }
+
+    @Test fun wave4_jprof_and_toml_only_contract() {
+        val jprof = SettingsSchema.byKey["CPU|jit_warmup_jprof"] as? Setting.Bool
+        assertNotNull("missing Wave 4 setting: CPU|jit_warmup_jprof", jprof)
+        assertEquals(true, jprof!!.default)
+        assertTrue("CPU|jit_warmup_jprof title must be non-blank", jprof.title.isNotBlank())
+        assertTrue("CPU|jit_warmup_jprof desc must be non-blank", jprof.desc.isNotBlank())
+        assertFalse("CPU|jit_warmup_jprof must not be in playerKeys", jprof.key in SettingsSchema.playerKeys)
+
+        listOf(
+            "CPU|dse_cross_block_context",
+            "CPU|dse_cross_block_vec128",
+            "CPU|a64_loop_context_promotion",
+            "CPU|a64_loop_promote_max_regs",
+            "CPU|a64_loop_promote_defer_stores_across_memory",
+            "CPU|context_promote_vec128",
+            "CPU|jit_warmup_jprof_threads",
+            "CPU|jit_warmup_jprof_save_interval_ms",
+            "CPU|jit_warmup_jprof_save_batch",
+        ).forEach { key ->
+            assertNull("$key must stay TOML-only", SettingsSchema.byKey[key])
+        }
     }
 
     /** vulkan_texture_cache reads -1 (no override) and 0..5 (off, 1x..16x). */

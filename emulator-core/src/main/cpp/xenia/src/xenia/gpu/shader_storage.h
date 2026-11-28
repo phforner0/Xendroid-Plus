@@ -12,12 +12,139 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <mutex>
+#include <utility>
+
+namespace xe {
+namespace gpu {
+
+// Single-slot coalescing queue for VkPipelineCache snapshot saves.
+// If a newer snapshot arrives before the previous pending snapshot starts
+// running on the background writer thread, the superseded task is invoked with
+// execute=false so its temporary driver handle is destroyed without blocking or
+// doing disk I/O.
+class CoalescingSnapshotSlot {
+ public:
+  using Task = std::function<void(bool execute)>;
+
+  // Enqueues a new snapshot task, replacing any pending unstarted task.
+  // If closed (shutting down), immediately invokes task(false) so handles are
+  // cleaned up without leaking. Returns true if an older pending task was
+  // coalesced (superseded).
+  bool Enqueue(Task task) {
+    Task rejected;
+    Task superseded;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (closed_) {
+        rejected = std::move(task);
+      } else {
+        superseded = std::move(pending_);
+        pending_ = std::move(task);
+      }
+    }
+    if (rejected) {
+      rejected(false);
+      return false;
+    }
+    if (superseded) {
+      superseded(false);
+      return true;
+    }
+    return false;
+  }
+
+  // Swaps a new pending task in while returning any superseded task (or the
+  // incoming task itself if closed) for the caller to invoke with false
+  // outside any external lock.
+  Task SwapPending(Task task) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_) {
+      return task;
+    }
+    Task superseded = std::move(pending_);
+    pending_ = std::move(task);
+    return superseded;
+  }
+
+  Task Take() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Task task = std::move(pending_);
+    pending_ = nullptr;
+    return task;
+  }
+
+  void Close() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    closed_ = true;
+  }
+
+  void Reopen() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    closed_ = false;
+  }
+
+  bool HasPending() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<bool>(pending_);
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  Task pending_;
+  bool closed_ = false;
+};
+
+// Returns true only for Arm Mali proprietary drivers (VK_DRIVER_ID_ARM_PROPRIETARY
+// == 9, or pre-1.2 driverID == 0 with Arm vendorID 0x13B5), excluding Mesa
+// PanVK / malisx2 (driverID == 20).
+inline bool IsProprietaryMaliDriver(uint32_t vendor_id, uint32_t driver_id) {
+  constexpr uint32_t kVendorIdArm = 0x13B5;
+  constexpr uint32_t kDriverIdArmProprietary = 9;
+  return driver_id == kDriverIdArmProprietary ||
+         (driver_id == 0 && vendor_id == kVendorIdArm);
+}
+
+// Controls renderArea shrinking cleanly and reversibly per driver/cvar.
+inline bool ShouldShrinkRenderArea(bool tight_render_area,
+                                   bool tight_render_area_turnip,
+                                   bool render_area_dirty_extent,
+                                   bool is_turnip) {
+  if (render_area_dirty_extent) {
+    return true;
+  }
+  if (!tight_render_area) {
+    return false;
+  }
+  return !is_turnip || tight_render_area_turnip;
+}
+
+enum class ReplayPipelineBindOutcome {
+  kBind,
+  kDropDraws,
+};
+
+inline ReplayPipelineBindOutcome EvaluateReplayPipelineBind(
+    bool /*has_slot*/, bool resolved_non_null,
+    bool& guest_graphics_pipeline_unready) {
+  if (resolved_non_null) {
+    guest_graphics_pipeline_unready = false;
+    return ReplayPipelineBindOutcome::kBind;
+  }
+  guest_graphics_pipeline_unready = true;
+  return ReplayPipelineBindOutcome::kDropDraws;
+}
+
+}  // namespace gpu
+}  // namespace xe
+
+#ifndef XENIA_GPU_SHADER_STORAGE_PURE_LOGIC_ONLY
+
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <filesystem>
-#include <functional>
-#include <mutex>
 #include <set>
 #include <vector>
 
@@ -31,6 +158,9 @@
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/shader.h"
 #include "xenia/gpu/xenos.h"
+#if XE_PLATFORM_LINUX
+#include <sys/resource.h>
+#endif
 
 namespace xe {
 namespace gpu {
@@ -428,24 +558,35 @@ class ShaderStorageWriter {
     }
 
     // Start the write thread.
-    storage_write_thread_shutdown_ = false;
-    storage_write_thread_ =
-        xe::threading::Thread::Create({}, [this]() { WriteThread(); });
-    storage_write_thread_->set_name("Shader Storage Writer");
+    {
+      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+      pipeline_cache_save_slot_.Reopen();
+      storage_write_thread_shutdown_ = false;
+      storage_write_thread_ =
+          xe::threading::Thread::Create({}, [this]() { WriteThread(); });
+      storage_write_thread_->set_name("Shader Storage Writer");
+    }
 
     return true;
   }
 
-  // Shutdown storage: stops write thread, closes files.
+  // Shutdown storage: drains pending writes/saves, stops write thread, closes files.
   void ShutdownShaderStorage() {
-    if (storage_write_thread_) {
-      {
-        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-        storage_write_thread_shutdown_ = true;
-      }
+    std::unique_ptr<xe::threading::Thread> write_thread_to_join;
+    {
+      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+      pipeline_cache_save_slot_.Close();
+      storage_write_thread_shutdown_ = true;
+      write_thread_to_join = std::move(storage_write_thread_);
+    }
+    if (write_thread_to_join) {
       storage_write_request_cond_.notify_one();
-      xe::threading::Wait(storage_write_thread_.get(), false);
-      storage_write_thread_.reset();
+      xe::threading::Wait(write_thread_to_join.get(), false);
+      write_thread_to_join.reset();
+    }
+
+    if (auto leftover = pipeline_cache_save_slot_.Take()) {
+      leftover(false);
     }
 
     {
@@ -498,6 +639,37 @@ class ShaderStorageWriter {
     storage_write_request_cond_.notify_one();
   }
 
+  void QueuePipelineCacheSave(CoalescingSnapshotSlot::Task task) {
+    if (!task) {
+      return;
+    }
+    CoalescingSnapshotSlot::Task superseded;
+    bool reject_shutdown = false;
+    bool run_inline = false;
+    {
+      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+      if (storage_write_thread_shutdown_) {
+        reject_shutdown = true;
+      } else if (!storage_write_thread_) {
+        run_inline = true;
+      } else {
+        superseded = pipeline_cache_save_slot_.SwapPending(std::move(task));
+      }
+    }
+    if (reject_shutdown) {
+      task(false);
+      return;
+    }
+    if (run_inline) {
+      task(true);
+      return;
+    }
+    storage_write_request_cond_.notify_one();
+    if (superseded) {
+      superseded(false);
+    }
+  }
+
   void RequestFlush(bool flush_shaders, bool flush_pipelines) {
     bool need_notify = false;
     {
@@ -518,6 +690,9 @@ class ShaderStorageWriter {
 
  private:
   void WriteThread() {
+#if XE_PLATFORM_LINUX
+    setpriority(PRIO_PROCESS, 0, 10);
+#endif
     ShaderStoredHeader shader_header;
     std::memset(&shader_header, 0, sizeof(shader_header));
 
@@ -542,11 +717,9 @@ class ShaderStorageWriter {
       const Shader* shader = nullptr;
       TPipelineStoredDescription pipeline_description;
       bool write_pipeline = false;
+      CoalescingSnapshotSlot::Task pipeline_cache_task;
       {
         std::unique_lock<std::mutex> lock(storage_write_request_lock_);
-        if (storage_write_thread_shutdown_) {
-          return;
-        }
         if (!storage_write_shader_queue_.empty()) {
           shader = storage_write_shader_queue_.front();
           storage_write_shader_queue_.pop_front();
@@ -564,7 +737,12 @@ class ShaderStorageWriter {
           storage_write_flush_pipelines_ = false;
           flush_pipelines = true;
         }
-        if (!shader && !write_pipeline && !flush_shaders && !flush_pipelines) {
+        pipeline_cache_task = pipeline_cache_save_slot_.Take();
+        if (!shader && !write_pipeline && !pipeline_cache_task &&
+            !flush_shaders && !flush_pipelines) {
+          if (storage_write_thread_shutdown_) {
+            return;
+          }
           storage_write_request_cond_.wait(lock);
           continue;
         }
@@ -599,6 +777,10 @@ class ShaderStorageWriter {
           XELOGE("Failed to write pipeline description to storage");
         }
       }
+
+      if (pipeline_cache_task) {
+        pipeline_cache_task(true);
+      }
     }
   }
 
@@ -614,6 +796,7 @@ class ShaderStorageWriter {
   std::condition_variable storage_write_request_cond_;
   std::deque<const Shader*> storage_write_shader_queue_;
   std::deque<TPipelineStoredDescription> storage_write_pipeline_queue_;
+  CoalescingSnapshotSlot pipeline_cache_save_slot_;
   bool storage_write_flush_shaders_ = false;
   bool storage_write_flush_pipelines_ = false;
   bool storage_write_thread_shutdown_ = false;
@@ -621,5 +804,7 @@ class ShaderStorageWriter {
 
 }  // namespace gpu
 }  // namespace xe
+
+#endif  // XENIA_GPU_SHADER_STORAGE_PURE_LOGIC_ONLY
 
 #endif  // XENIA_GPU_SHADER_STORAGE_H_

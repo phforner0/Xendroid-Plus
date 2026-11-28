@@ -50,4 +50,37 @@ class DriverPackageInstallerTest {
         assertArrayEquals(elf(1), previous.library.readBytes())
         assertFalse(root.listFiles()!!.any { it.name.startsWith(".install-") })
     }
+    @Test fun nestedFolderWithWindowsPathsAndHelperSosInstallsAndRejectsNestedEscape() {
+        val nestedZip = folder.newFile().also { f ->
+            ZipOutputStream(f.outputStream()).use { zip ->
+                zip.putNextEntry(ZipEntry("./")); zip.closeEntry()
+                zip.putNextEntry(ZipEntry("ExynosTools_V2.0\\meta.json"))
+                zip.write("{\"libraryName\":\"vulkan.xclipse.so\"}".toByteArray())
+                zip.closeEntry()
+                zip.putNextEntry(ZipEntry("ExynosTools_V2.0\\vulkan.xclipse.so"))
+                zip.write(elf(9))
+                zip.closeEntry()
+                zip.putNextEntry(ZipEntry("ExynosTools_V2.0\\libhelper.so"))
+                zip.write(elf(10))
+                zip.closeEntry()
+            }
+        }
+        val installed = DriverPackageInstaller(folder.newFolder()).install(nestedZip)
+        assertEquals("vulkan.xclipse.so", installed.library.name)
+        assertArrayEquals(elf(9), installed.library.readBytes())
+
+        val nestedEscape = folder.newFile().also { f ->
+            ZipOutputStream(f.outputStream()).use { zip ->
+                zip.putNextEntry(ZipEntry("sub/meta.json"))
+                zip.write("{\"libraryName\":\"../libvulkan.so\"}".toByteArray())
+                zip.closeEntry()
+                zip.putNextEntry(ZipEntry("libvulkan.so"))
+                zip.write(elf(3))
+                zip.closeEntry()
+            }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DriverPackageInstaller(folder.newFolder()).install(nestedEscape)
+        }
+    }
 }

@@ -1410,6 +1410,17 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   height_used = std::min(
       GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples), height_used);
 
+  struct ScopedCreateHeightHint {
+    uint32_t& slot;
+    uint32_t prev;
+    ScopedCreateHeightHint(uint32_t& s, uint32_t hint) : slot(s), prev(s) {
+      slot = hint;
+    }
+    ~ScopedCreateHeightHint() { slot = prev; }
+  };
+  ScopedCreateHeightHint create_height_hint_guard(
+      create_render_target_height_hint_, height_used);
+
   RenderTargetKey rt_keys[1 + xenos::kMaxColorRenderTargets] = {};
   RenderTarget* rts[1 + xenos::kMaxColorRenderTargets] = {};
 
@@ -1498,7 +1509,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.host_2x = uint32_t(host_2x);
     if (!interlock_barrier_only) {
       RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
-      if (!render_target) {
+      if (!render_target ||
+          !EnsureRenderTargetHeight(render_target, height_used)) {
         return false;
       }
       rts[rt_bit_index] = render_target;
@@ -1527,7 +1539,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
     if (IsHostDepthCurrent(rt_keys[0], 0, alias_length_tiles)) {
       rts[0] = GetOrCreateRenderTarget(rt_keys[0]);
-      if (!rts[0]) {
+      if (!rts[0] || !EnsureRenderTargetHeight(rts[0], height_used)) {
         return false;
       }
     } else {
@@ -1753,6 +1765,17 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                 last_update_used_render_targets_,
                 sizeof(last_update_accumulated_render_targets_));
     are_accumulated_render_targets_valid_ = true;
+  }
+
+  // Ensure every attachment carried forward in the accumulated pass binding
+  // also meets height_used so the framebuffer extent (min across bound RTs)
+  // never clips draws into taller siblings.
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    RenderTarget* accumulated_rt = last_update_accumulated_render_targets_[i];
+    if (accumulated_rt &&
+        !EnsureRenderTargetHeight(accumulated_rt, height_used)) {
+      return false;
+    }
   }
 
   return true;
@@ -2180,6 +2203,20 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
   }
 
+  const uint32_t needed_clear_height =
+      clear_rectangle.y_pixels + clear_rectangle.height_pixels;
+  struct ScopedClearCreateHeightHint {
+    uint32_t& slot;
+    uint32_t prev;
+    ScopedClearCreateHeightHint(uint32_t& s, uint32_t hint)
+        : slot(s), prev(s) {
+      slot = hint;
+    }
+    ~ScopedClearCreateHeightHint() { slot = prev; }
+  };
+  ScopedClearCreateHeightHint clear_height_hint_guard(
+      create_render_target_height_hint_, needed_clear_height);
+
   RenderTargetKey depth_render_target_key;
   RenderTarget* depth_render_target = nullptr;
   if (depth_clear_length_tiles) {
@@ -2193,8 +2230,10 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     depth_render_target_key.host_2x =
         uint32_t(GetHostMsaaSamples(msaa_samples) != msaa_samples);
     depth_render_target = GetOrCreateRenderTarget(depth_render_target_key);
-    if (!depth_render_target) {
-      // Failed to create the depth render target, don't clear it.
+    if (!depth_render_target ||
+        !EnsureRenderTargetHeight(depth_render_target, needed_clear_height)) {
+      // Failed to create or grow the depth render target, don't clear it.
+      depth_render_target = nullptr;
       depth_render_target_key = RenderTargetKey();
       depth_clear_length_tiles = 0;
     }
@@ -2212,8 +2251,10 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     color_render_target_key.host_2x =
         uint32_t(GetHostMsaaSamples(msaa_samples) != msaa_samples);
     color_render_target = GetOrCreateRenderTarget(color_render_target_key);
-    if (!color_render_target) {
-      // Failed to create the color render target, don't clear it.
+    if (!color_render_target ||
+        !EnsureRenderTargetHeight(color_render_target, needed_clear_height)) {
+      // Failed to create or grow the color render target, don't clear it.
+      color_render_target = nullptr;
       color_render_target_key = RenderTargetKey();
       color_clear_length_tiles = 0;
     }
@@ -2315,8 +2356,11 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
   render_target_key.pitch_tiles_at_32bpp = kPitchTilesAt32bpp;
   render_target_key.resource_format =
       uint32_t(GetColorResourceFormat(color_format));
+  const uint32_t prev_hint = create_render_target_height_hint_;
+  create_render_target_height_hint_ = kHeight;
   RenderTarget* render_target = GetOrCreateRenderTarget(render_target_key);
-  if (!render_target) {
+  create_render_target_height_hint_ = prev_hint;
+  if (!render_target || !EnsureRenderTargetHeight(render_target, kHeight)) {
     return nullptr;
   }
   // Change ownership, but don't transfer the contents - they will be replaced

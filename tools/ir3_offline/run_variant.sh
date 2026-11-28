@@ -33,3 +33,9 @@ LD_PRELOAD=$MESA_BUILD/src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so \
   "$BUILD/ir3stats" "$BUILD/partner.vert.spv" "$BUILD/partner.frag.spv" \
   "$WORK/spv/$v"/*.spv > "$WORK/stats/$v.csv" 2> "$WORK/stats/$v.err"
 echo "$v: $(tail -n 1 "$WORK/stats/$v.err"); spirv-val failures: $bad"
+if command -v "${MALIOC:-malioc}" >/dev/null 2>&1; then
+  MALI_CORE=${MALI_CORE:-Mali-G720}
+  python3 "$HERE/../xendroid-bench.py" shader-offline "$WORK/spv/$v" \
+    --malioc "${MALIOC:-malioc}" --mali-core "$MALI_CORE" \
+    --out "$WORK/stats/${v}_mali" || true
+fi

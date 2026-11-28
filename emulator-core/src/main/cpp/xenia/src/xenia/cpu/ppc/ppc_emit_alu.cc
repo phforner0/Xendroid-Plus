@@ -1194,8 +1194,9 @@ int InstrEmit_sradx(PPCHIRBuilder& f, const InstrData& i) {
 
   // CA is set if any bits are shifted out of the right and if the result
   // is negative.
-  Value* ca =
-      f.And(f.IsTrue(f.Shr(rt, 63)), f.CompareNE(f.Shl(v, clamp_sh), rt));
+  Value* shifted_out = f.Or(f.IsTrue(f.And(sh, f.LoadConstantInt8(0x40))),
+                            f.CompareNE(f.Shl(v, clamp_sh), rt));
+  Value* ca = f.And(f.IsTrue(f.Shr(rt, 63)), shifted_out);
   f.StoreCA(ca);
 
   f.StoreGPR(i.X.RA, v);
@@ -1254,8 +1255,9 @@ int InstrEmit_srawx(PPCHIRBuilder& f, const InstrData& i) {
 
   // CA is set if any bits are shifted out of the right and if the result
   // is negative.
-  Value* ca =
-      f.And(f.IsTrue(f.Shr(rt, 31)), f.CompareNE(f.Shl(v, clamp_sh), rt));
+  Value* shifted_out = f.Or(f.IsTrue(f.And(sh, f.LoadConstantInt8(0x20))),
+                            f.CompareNE(f.Shl(v, clamp_sh), rt));
+  Value* ca = f.And(f.IsTrue(f.Shr(rt, 31)), shifted_out);
   f.StoreCA(ca);
 
   v = f.SignExtend(v, INT64_TYPE);

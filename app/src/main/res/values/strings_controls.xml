@@ -154,6 +154,8 @@
     <string name="xd_ct_right">Right</string>
     <string name="xd_ct_game_gets">What the game gets</string>
     <string name="xd_ct_dz_core">Core dead zone</string>
+    <string name="xd_ct_outer_dz">Stick outer dead zone</string>
+    <string name="xd_ct_outer_dz_hint">Scales short-throw handheld sticks (e.g. 0.82 → 1.00 so sprinting works in FPS games)</string>
     <string name="xd_ct_hold_b">Hold to leave</string>
     <string name="xd_pc_sub">For a game open on another phone</string>
     <string name="xd_pc_vibration">Vibration on this phone</string>

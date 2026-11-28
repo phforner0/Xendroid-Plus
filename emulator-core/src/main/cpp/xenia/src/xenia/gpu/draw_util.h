@@ -625,6 +625,12 @@ struct ResolveCopyShaderInfo {
 extern const ResolveCopyShaderInfo
     resolve_copy_shader_info[size_t(ResolveCopyShaderIndex::kCount)];
 
+void GetResolveCopyShaderGroupCount(ResolveCopyShaderIndex shader,
+                                    uint32_t width, uint32_t height,
+                                    bool prefer_64x1_workgroup,
+                                    uint32_t& group_count_x_out,
+                                    uint32_t& group_count_y_out);
+
 struct ResolveCopyShaderConstants {
   // When the destination base is not needed (not binding the entire shared
   // memory buffer - with resoluion scaling, for instance), only the
@@ -731,7 +737,7 @@ struct ResolveInfo {
   ResolveCopyShaderIndex GetCopyShader(
       uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
       ResolveCopyShaderConstants& constants_out, uint32_t& group_count_x_out,
-      uint32_t& group_count_y_out) const;
+      uint32_t& group_count_y_out, bool prefer_64x1_workgroup = false) const;
 
   bool IsClearingDepth() const {
     return rb_copy_control.depth_clear_enable != 0;

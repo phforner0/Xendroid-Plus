@@ -674,6 +674,21 @@ class RenderTargetCache {
 
   virtual RenderTarget* CreateRenderTarget(RenderTargetKey key) = 0;
 
+  // Ensures a host render target has at least `needed_guest_height` guest pixel
+  // rows allocated on the host (for backends supporting row-on-demand growth).
+  // Default no-op preserves D3D12/Metal behavior unchanged.
+  virtual bool EnsureRenderTargetHeight(RenderTarget* render_target,
+                                        uint32_t needed_guest_height) {
+    return true;
+  }
+
+  // Optional initial guest height hint set around GetOrCreateRenderTarget()
+  // calls so row-on-demand backends can allocate directly at the required
+  // height without an immediate first-use reallocation.
+  uint32_t create_render_target_height_hint() const {
+    return create_render_target_height_hint_;
+  }
+
   // Whether depth buffer is encoded differently on the host, thus after
   // aliasing naively, precision may be lost - host depth must only be
   // overwritten if the new guest value is different than the current host depth
@@ -1050,6 +1065,7 @@ class RenderTargetCache {
     Transfer::Rectangle rectangle;
   };
   std::unordered_map<uint32_t, ResolveClearState> resolve_cleared_render_targets_;
+  uint32_t create_render_target_height_hint_ = 0;
 };
 
 }  // namespace gpu

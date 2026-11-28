@@ -35,6 +35,7 @@ enum class InGameAction(val kind: RowKind) {
     /** Stretch the picture to the whole screen from the next start (the core's fullscreen stretch). */
     STRETCH(RowKind.TOGGLE),
     EXTERNAL_DISPLAY(RowKind.BUTTON),
+    SECONDARY_DASHBOARD(RowKind.TOGGLE),
     /** 15h: a margin around the picture on a TV that cuts the edges (overscan). */
     TV_MARGIN(RowKind.CYCLE),
     /** U01: the driver the game runs on, against the one selected (read-only). */
@@ -119,7 +120,7 @@ val inGamePageGroups: Map<InGamePage, List<MenuGroup>> = mapOf(
     InGamePage.GRAPHICS to listOf(
         MenuGroup(R.string.menu_group_picture, listOf(InGameAction.DISPLAY_MODE, InGameAction.SCALING_EFFECT,
             InGameAction.ANTIALIASING, InGameAction.SHARPNESS, InGameAction.DITHER, InGameAction.COLOR_FILTER, InGameAction.STRETCH)),
-        MenuGroup(R.string.menu_group_tv, listOf(InGameAction.EXTERNAL_DISPLAY, InGameAction.TV_MARGIN)),
+        MenuGroup(R.string.menu_group_tv, listOf(InGameAction.EXTERNAL_DISPLAY, InGameAction.SECONDARY_DASHBOARD, InGameAction.TV_MARGIN)),
         MenuGroup(R.string.menu_group_frame_generation, listOf(InGameAction.ZEROFG, InGameAction.WINFG, InGameAction.WINFG_PRESET, InGameAction.LSFG,
             InGameAction.LSFG_MULTIPLIER, InGameAction.LSFG_TARGET, InGameAction.IMPORT_LSFG_DLL, InGameAction.CLEAR_LSFG_CACHE)),
         MenuGroup(R.string.menu_group_driver, listOf(InGameAction.DRIVER_INFO)),

@@ -153,9 +153,30 @@ class ExportResolver {
   void SetFunctionMapping(const std::string_view module_name, uint16_t ordinal,
                           ExportTrampoline trampoline);
 
+  bool hle_census_active() const { return hle_census_active_; }
+  void set_hle_census_active(bool active) { hle_census_active_ = active; }
+
+  bool log_high_frequency_kernel_calls() const {
+    return log_high_frequency_kernel_calls_ptr_ &&
+           *log_high_frequency_kernel_calls_ptr_;
+  }
+  void set_log_high_frequency_kernel_calls_ptr(const bool* ptr) {
+    log_high_frequency_kernel_calls_ptr_ = ptr;
+  }
+
+  ExportTrampoline rtl_leave_cs_wake_trampoline() const {
+    return rtl_leave_cs_wake_trampoline_;
+  }
+  void set_rtl_leave_cs_wake_trampoline(ExportTrampoline fn) {
+    rtl_leave_cs_wake_trampoline_ = fn;
+  }
+
  private:
   std::vector<Table> tables_;
   std::vector<Export*> all_exports_by_name_;
+  bool hle_census_active_ = false;
+  const bool* log_high_frequency_kernel_calls_ptr_ = nullptr;
+  ExportTrampoline rtl_leave_cs_wake_trampoline_ = nullptr;
 };
 
 }  // namespace cpu

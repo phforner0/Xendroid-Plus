@@ -278,6 +278,21 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p,
   decoded_out.length = sizeof(uint32_t);
   uint32_t instruction = *reinterpret_cast<const uint32_t*>(p);
 
+  // ARMv8.3-A FEAT_LRCPC: LDAPR Wt, [Xn|SP] (emitted for 32-bit TSO scalar
+  // loads when a64_lrcpc_tso=true). Encoding: 10 111000 10 1 11111 1100 00 Rn Rt.
+  if ((instruction & 0xFFFFFC00u) == 0xB8BFC000u) {
+    decoded_out.is_load = true;
+    decoded_out.value_reg =
+        DecodedLoadStore::kArm64ValueRegX0 + (instruction & 31u);
+    if (decoded_out.value_reg == DecodedLoadStore::kArm64ValueRegZero) {
+      decoded_out.is_constant = true;
+      decoded_out.constant = 0;
+    }
+    decoded_out.mem_has_base = true;
+    decoded_out.mem_base_reg = (instruction >> 5) & 31u;
+    return true;
+  }
+
   // Literal loading (PC-relative) is not handled.
 
   if ((instruction & kArm64LoadStoreAnyFMask) != kArm64LoadStoreAnyFixed) {

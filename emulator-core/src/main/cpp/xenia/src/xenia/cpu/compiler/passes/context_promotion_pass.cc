@@ -27,18 +27,12 @@ DEFINE_bool(full_optimization_even_with_debug, false,
             "CPU");
 
 DEFINE_bool(
-    context_promote_vec128, false,
+    context_promote_vec128, true,
     "Promote VMX (VEC128) context loads/stores to SSA values and strip dead "
     "VEC128 context stores, letting the backend keep vectors in host "
-    "registers - upstream behavior from before 2026-01-25, when upstream "
-    "excluded VEC128 to work around undiagnosed instability in some games. "
-    "Off like upstream: with it on, Halo 4 (4D530919) poses the Chief's and "
-    "the enemies' bodies wrong in gameplay (legs bent up, ragdoll limbs), "
-    "the range-keyed validity tracking notwithstanding. It bought nothing "
-    "measurable either: Forza Horizon at the parked reference scene ran the "
-    "same 30 fps and the same instructions per frame on its busiest guest "
-    "thread with it off. Forced off by disable_context_promotion.",
+    "registers. Forced off by disable_context_promotion.",
     "CPU");
+UPDATE_from_bool(context_promote_vec128, 2026, 11, 24, 3, false);
 
 DECLARE_bool(disable_context_promotion);
 
@@ -181,8 +175,10 @@ void ContextPromotionPass::PromoteBlock(Block* block) {
   Instr* i = block->instr_head;
   while (i) {
     auto next = i->next;
-    if (i->opcode->flags & OPCODE_FLAG_VOLATILE) {
-      // Volatile instruction - requires all context values be flushed.
+    if ((i->opcode->flags & OPCODE_FLAG_VOLATILE) ||
+        i->opcode == &OPCODE_CONTEXT_BARRIER_info) {
+      // Volatile instruction or context barrier - requires all context values
+      // be flushed.
       validity.reset();
     } else if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
       const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
@@ -230,17 +226,13 @@ void ContextPromotionPass::RemoveDeadStoresBlock(Block* block) {
   Instr* i = block->instr_tail;
   while (i) {
     Instr* prev = i->prev;
-    if (i->opcode->flags & (OPCODE_FLAG_VOLATILE | OPCODE_FLAG_BRANCH)) {
-      // Volatile instruction - requires all context values be flushed.
+    if ((i->opcode->flags &
+         (OPCODE_FLAG_VOLATILE | OPCODE_FLAG_BRANCH | OPCODE_FLAG_MEMORY)) ||
+        i->opcode == &OPCODE_CONTEXT_BARRIER_info) {
+      // Volatile, branch, memory (guest accesses can fault and SEH handlers
+      // serialize and restore the full PPCContext including v[0..127]), or
+      // context barrier - requires all context values to be preserved.
       validity.reset();
-    } else if (i->opcode->flags & OPCODE_FLAG_MEMORY) {
-      // A guest access can fault, and the guest's handlers see the registers
-      // in the context. Vector registers are left out, as keeping their stores
-      // is what costs frame time.
-      constexpr uint32_t v_begin = offsetof(ppc::PPCContext, v);
-      constexpr uint32_t v_end = v_begin + sizeof(ppc::PPCContext::v);
-      validity.reset(0, v_begin);
-      validity.reset(v_end, validity.size());
     } else if (i->opcode == &OPCODE_LOAD_CONTEXT_info) {
       // A load that survived PromoteBlock is a live use of these bytes:
       // earlier stores overlapping it must be kept. (PromoteBlock folds

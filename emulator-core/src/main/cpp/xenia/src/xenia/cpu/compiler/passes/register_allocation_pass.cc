@@ -10,6 +10,7 @@
 #include "xenia/cpu/compiler/passes/register_allocation_pass.h"
 
 #include <cstring>
+#include <unordered_map>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -108,10 +109,54 @@ bool RegisterAllocationPass::Run(HIRBuilder* builder) {
       cvars::a64_call_aware_volatile_gprs && !tracing_compiled &&
       usage_sets_.int_set && usage_sets_.int_set->set->volatile_mask != 0;
 
+  struct BlockPinInfo {
+    const hir::LoopPromotionRegion* region = nullptr;
+    const hir::Instr* loop_end_instr = nullptr;
+  };
+  std::unordered_map<const hir::Block*, BlockPinInfo> pinned_blocks;
+  const auto& loop_plan = builder->loop_promotion_plan();
+  if (!loop_plan.empty()) {
+    for (const auto& region : loop_plan.regions) {
+      for (const auto& span : region.block_spans) {
+        if (span.block) {
+          pinned_blocks[span.block] = {&region, span.loop_end_instr};
+        }
+      }
+    }
+  }
+
   auto block = builder->first_block();
   while (block) {
     // Reset all state.
     PrepareBlockState();
+
+    const BlockPinInfo* active_pin = nullptr;
+    if (!pinned_blocks.empty()) {
+      auto pin_it = pinned_blocks.find(block);
+      if (pin_it != pinned_blocks.end() && pin_it->second.loop_end_instr) {
+        active_pin = &pin_it->second;
+        const auto* region = active_pin->region;
+        if (region->reserved_gpr_mask && usage_sets_.int_set) {
+          for (uint32_t idx = 0; idx < usage_sets_.int_set->count; ++idx) {
+            if (region->reserved_gpr_mask & (1u << idx)) {
+              usage_sets_.int_set->availability.set(idx, false);
+            }
+          }
+        }
+        if (region->reserved_vec_mask) {
+          for (uint32_t idx = 0; idx < 32; ++idx) {
+            if (region->reserved_vec_mask & (1u << idx)) {
+              if (usage_sets_.vec_set && idx < usage_sets_.vec_set->count) {
+                usage_sets_.vec_set->availability.set(idx, false);
+              }
+              if (usage_sets_.float_set && idx < usage_sets_.float_set->count) {
+                usage_sets_.float_set->availability.set(idx, false);
+              }
+            }
+          }
+        }
+      }
+    }
 
     block_base_ordinal_ = block->instr_head ? block->instr_head->ordinal : 0;
     if (volatile_gprs_enabled_ && block->instr_head) {
@@ -203,6 +248,31 @@ bool RegisterAllocationPass::Run(HIRBuilder* builder) {
             return false;
           }
         }
+      }
+
+      if (active_pin && instr == active_pin->loop_end_instr &&
+          instr->next != nullptr) {
+        const auto* region = active_pin->region;
+        if (region->reserved_gpr_mask && usage_sets_.int_set) {
+          for (uint32_t idx = 0; idx < usage_sets_.int_set->count; ++idx) {
+            if (region->reserved_gpr_mask & (1u << idx)) {
+              usage_sets_.int_set->availability.set(idx, true);
+            }
+          }
+        }
+        if (region->reserved_vec_mask) {
+          for (uint32_t idx = 0; idx < 32; ++idx) {
+            if (region->reserved_vec_mask & (1u << idx)) {
+              if (usage_sets_.vec_set && idx < usage_sets_.vec_set->count) {
+                usage_sets_.vec_set->availability.set(idx, true);
+              }
+              if (usage_sets_.float_set && idx < usage_sets_.float_set->count) {
+                usage_sets_.float_set->availability.set(idx, true);
+              }
+            }
+          }
+        }
+        active_pin = nullptr;
       }
 
       instr = instr->next;
@@ -470,7 +540,8 @@ bool FindContextResidence(const Value* value, const Value::Use* next_use,
   const uint32_t size = static_cast<uint32_t>(GetTypeSize(value->type));
   const Instr* i = residence->next;
   for (; i && i != reload_before; i = i->next) {
-    if (i->opcode->flags & OPCODE_FLAG_VOLATILE) {
+    if ((i->opcode->flags & OPCODE_FLAG_VOLATILE) ||
+        i->opcode == &OPCODE_CONTEXT_BARRIER_info) {
       return false;
     }
     if (i->opcode != &OPCODE_STORE_CONTEXT_info) {

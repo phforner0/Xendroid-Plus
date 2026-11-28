@@ -11,6 +11,8 @@
 #define XENIA_CPU_FUNCTION_H_
 
 #include <memory>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 #include "xenia/cpu/function_debug_info.h"
@@ -136,6 +138,7 @@ class GuestFunction : public Function {
   }
   FunctionTraceData& trace_data() { return trace_data_; }
   std::vector<SourceMapEntry>& source_map() { return source_map_; }
+  std::mutex& source_map_mutex() const { return source_map_mutex_; }
 
   ExternHandler extern_handler() const { return extern_handler_; }
   Export* export_data() const { return export_data_; }
@@ -149,6 +152,26 @@ class GuestFunction : public Function {
   uintptr_t MapGuestAddressToMachineCode(uint32_t guest_address) const;
   uint32_t MapMachineCodeToGuestAddress(uintptr_t host_address) const;
 
+  void AddJumpTable(uint32_t bctr_address, std::vector<uint32_t> targets) {
+    for (auto& entry : jump_tables_) {
+      if (entry.first == bctr_address) {
+        entry.second = std::move(targets);
+        return;
+      }
+    }
+    jump_tables_.emplace_back(bctr_address, std::move(targets));
+  }
+  const std::vector<uint32_t>* LookupJumpTableTargets(
+      uint32_t bctr_address) const {
+    for (const auto& entry : jump_tables_) {
+      if (entry.first == bctr_address) {
+        return &entry.second;
+      }
+    }
+    return nullptr;
+  }
+  void ClearJumpTables() { jump_tables_.clear(); }
+
   bool Call(ThreadState* thread_state, uint32_t return_address) override;
 
  protected:
@@ -157,7 +180,9 @@ class GuestFunction : public Function {
  protected:
   std::unique_ptr<FunctionDebugInfo> debug_info_;
   FunctionTraceData trace_data_;
+  mutable std::mutex source_map_mutex_;
   std::vector<SourceMapEntry> source_map_;
+  std::vector<std::pair<uint32_t, std::vector<uint32_t>>> jump_tables_;
   ExternHandler extern_handler_ = nullptr;
   Export* export_data_ = nullptr;
 };

@@ -5,7 +5,8 @@
 #include <algorithm>
 
 #include <android/log.h>
-#include <dlfcn.h>
+
+#include "xenia/base/android_thermal.h"
 
 #define GOV_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "LsfgGovernor", __VA_ARGS__)
 
@@ -40,32 +41,8 @@ constexpr float kThermalDecaySeconds = 1.0f;
 // made the governor refuse on a device that was working exactly as intended.
 // It now only stops GROWING at SEVERE and only gives frames back at CRITICAL,
 // leaving the device's own thermal management as the authority.
-constexpr int kThermalBlock    = 4;  // CRITICAL: give generations back
-constexpr int kThermalNoGrowth = 3;  // SEVERE: keep what we have, stop probing
-
-using PFN_AThermal_acquireManager = void* (*)();
-using PFN_AThermal_getCurrentThermalStatus = int (*)(void*);
-
-void* thermalManager() {
-    static void* manager = [] () -> void* {
-        void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
-        if (!lib) return nullptr;
-        auto acquire = (PFN_AThermal_acquireManager)dlsym(lib, "AThermal_acquireManager");
-        return acquire ? acquire() : nullptr;
-    }();
-    return manager;
-}
-
-int readThermalStatus() {
-    void* manager = thermalManager();
-    if (!manager) return -1;
-    static auto get = [] () -> PFN_AThermal_getCurrentThermalStatus {
-        void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
-        return lib ? (PFN_AThermal_getCurrentThermalStatus)
-                     dlsym(lib, "AThermal_getCurrentThermalStatus") : nullptr;
-    }();
-    return get ? get(manager) : -1;
-}
+constexpr int kThermalBlock    = xe::kThermalStatusCritical; // CRITICAL: give generations back
+constexpr int kThermalNoGrowth = xe::kThermalStatusSevere;   // SEVERE: keep what we have, stop probing
 
 float phaseSeconds(std::chrono::steady_clock::time_point a,
                    std::chrono::steady_clock::time_point b) {
@@ -122,7 +99,7 @@ void ProbeGovernor::pollThermal(Clock::time_point now) {
     if (haveThermalPoll_ && phaseSeconds(lastThermalPoll_, now) < kThermalPollSeconds) return;
     lastThermalPoll_ = now;
     haveThermalPoll_ = true;
-    thermal_ = readThermalStatus();
+    thermal_ = xe::ReadAndroidThermalStatus();
 }
 
 uint32_t ProbeGovernor::cap(uint32_t requested, float sourceRate, float loopRate) {

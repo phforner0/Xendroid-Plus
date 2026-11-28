@@ -23,8 +23,10 @@
 #include "xenia/base/threading.h"
 #include "xe_audio_block_renderer.h"
 #include "xe_audio_buffer_tuner.h"
+#include "xe_audio_sanity.h"
 
 DECLARE_uint32(apu_aaudio_buffer_bursts);
+DECLARE_bool(apu_audio_sanity_log);
 
 namespace xe {
 namespace apu {
@@ -47,6 +49,10 @@ class AAudioAudioDriver : public AudioDriver {
   void SetVolume(float volume) override;
   size_t GetQueuedFrameCount() override;
   bool ReportsQueuedFrameCount() const override { return true; }
+  void SetTargetQueueDepth(size_t blocks) override {
+    target_queue_depth_.store(static_cast<uint32_t>(blocks),
+                              std::memory_order_relaxed);
+  }
   void SubmitFrame(float* frame) override;
   void Shutdown() override;
 
@@ -174,6 +180,17 @@ class AAudioAudioDriver : public AudioDriver {
 
   // Per-driver volume (XMP): written by other threads, read by the callback.
   std::atomic<float> driver_volume_{1.0f};
+  std::atomic<uint32_t> target_queue_depth_{4};
+
+  // Callback-owned sanity tracker; published via relaxed atomics to recovery_thread_.
+  xendroid::AudioSanityTracker audio_sanity_;
+  uint32_t sanity_frames_accum_ = 0;
+  std::atomic<uint32_t> sanity_rms_milli_{0};
+  std::atomic<uint32_t> sanity_peak_milli_{0};
+  std::atomic<uint64_t> sanity_silence_ms_{0};
+  std::atomic<uint64_t> sanity_clipped_{0};
+  std::atomic<uint64_t> sanity_nans_{0};
+  std::atomic<bool> sanity_ready_{false};
 };
 
 }  // namespace aaudio

@@ -73,6 +73,10 @@ inline void atomic_store_release(int32_t new_value, volatile int32_t* value) {
 inline void atomic_store_release(uint32_t new_value, volatile uint32_t* value) {
   _InterlockedExchange(reinterpret_cast<volatile long*>(value), new_value);
 }
+// Atomic load with relaxed semantics
+inline int32_t atomic_load_relaxed(const volatile int32_t* value) {
+  return *value;
+}
 
 #else
 
@@ -113,6 +117,10 @@ inline void atomic_store_release(int32_t new_value, volatile int32_t* value) {
 }
 inline void atomic_store_release(uint32_t new_value, volatile uint32_t* value) {
   __atomic_store_n(value, new_value, __ATOMIC_RELEASE);
+}
+// Atomic load with relaxed semantics
+inline int32_t atomic_load_relaxed(const volatile int32_t* value) {
+  return __atomic_load_n(value, __ATOMIC_RELAXED);
 }
 
 inline int32_t atomic_exchange_add(int32_t amount, volatile int32_t* value) {

@@ -11,6 +11,7 @@ Verifies two invariants:
 
 from __future__ import annotations
 
+import importlib.util
 import pathlib
 import re
 import sys
@@ -109,6 +110,24 @@ def main() -> int:
         f"check-cvar-updates: OK ({total} update(s) checked, "
         f"kLastCommittedUpdateDate={ly:04d}-{lm:02d}-{ld:02d} {lh:02d})"
     )
+
+    parity_script = ROOT / "tools" / "check-settings-cvar-parity.py"
+    if parity_script.is_file():
+        spec = importlib.util.spec_from_file_location(
+            "check_settings_cvar_parity", parity_script
+        )
+        if spec is None or spec.loader is None:
+            print(f"ERROR: failed to load {parity_script}", file=sys.stderr)
+            return 1
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        parity_rc, parity_errors, parity_summary = module.check_parity()
+        if parity_rc != 0:
+            for err in parity_errors:
+                print(f"ERROR: {err}", file=sys.stderr)
+            return parity_rc
+        print(parity_summary)
+
     return 0
 
 

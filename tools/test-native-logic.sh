@@ -35,7 +35,7 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
     arch=(-mssse3)
 fi
 flags=(-std=c++20 -O1 -Wall "${arch[@]}" -I "$cpp" -I "$cpp/xenia" -I "$cpp/xenia/src" -I "$test/stubs")
-for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test changed_settings_test frame_stats_test audio_buffer_tuner_test audio_block_renderer_test xex_header_test fatx_package_name_test socket_option_test xnet_startup_test structured_jumps_test draw_export_tracker_test gpu_compat_perf_test xam_live_signin_test jit_frame_start_test; do
+for name in presentation_runtime_test pipeline_cache_file_test vblank_pacer_test changed_settings_test frame_stats_test audio_buffer_tuner_test audio_block_renderer_test xex_header_test fatx_package_name_test socket_option_test xnet_startup_test structured_jumps_test draw_export_tracker_test gpu_compat_perf_test xam_live_signin_test jit_frame_start_test bench_tools_logic_test; do
     "${cxx[@]}" "${flags[@]}" "$test/$name.cc" -o "$build/$name"
 done
 # C01: the crash record is a source file of its own (signal-handler code).
@@ -57,6 +57,7 @@ done
 "$build/gpu_compat_perf_test"
 "$build/xam_live_signin_test"
 "$build/jit_frame_start_test"
+"$build/bench_tools_logic_test"
 "$build/crash_record_test" "$build/crash-record-scratch"
 "$build/string_key_test"
 "${cxx[@]}" "${flags[@]}" "$test/lote16_upstream_test.cc" \
@@ -65,6 +66,47 @@ done
 "$build/lote16_upstream_test" "$cpp/xenia/src/xenia/cpu/backend/a64"
 "${cxx[@]}" "${flags[@]}" -pthread "$test/shader_translation_wait_test.cc" -o "$build/shader_translation_wait_test"
 "$build/shader_translation_wait_test" "$cpp/xenia/src/xenia"
+"${cxx[@]}" "${flags[@]}" "$test/hotfix_032_test.cc" -o "$build/hotfix_032_test"
+"$build/hotfix_032_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" "$test/wave1_native_port_opts_test.cc" -o "$build/wave1_native_port_opts_test"
+"$build/wave1_native_port_opts_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" "$test/wave2_native_port_opts_test.cc" -o "$build/wave2_native_port_opts_test"
+"$build/wave2_native_port_opts_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/wave3_jit_hle_logic_test.cc" -o "$build/wave3_jit_hle_logic_test"
+"$build/wave3_jit_hle_logic_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/wave4_crossblock_jprof_logic_test.cc" -o "$build/wave4_crossblock_jprof_logic_test"
+"$build/wave4_crossblock_jprof_logic_test" "$cpp" "$build/wave4-scratch"
+"${cxx[@]}" "${flags[@]}" "$test/wave5_universal_perf_test.cc" -o "$build/wave5_universal_perf_test"
+"$build/wave5_universal_perf_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -pthread "$test/gpu_pipeline_async_test.cc" -o "$build/gpu_pipeline_async_test"
+"$build/gpu_pipeline_async_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -pthread "$test/gpu_zerocopy_upload_test.cc" -o "$build/gpu_zerocopy_upload_test"
+"$build/gpu_zerocopy_upload_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -pthread "$test/gpu_draw_cuts_test.cc" -o "$build/gpu_draw_cuts_test"
+"$build/gpu_draw_cuts_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" "$test/wave6_cpu_kernel_edge_test.cc" -o "$build/wave6_cpu_kernel_edge_test"
+"$build/wave6_cpu_kernel_edge_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/audio_adpf_logic_test.cc" -o "$build/audio_adpf_logic_test"
+"$build/audio_adpf_logic_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" "$test/gpu_resolve_opts_test.cc" -o "$build/gpu_resolve_opts_test"
+"$build/gpu_resolve_opts_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -pthread "$test/gpu_submit_worker_test.cc" -o "$build/gpu_submit_worker_test"
+"$build/gpu_submit_worker_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -pthread "$test/gpu_pm4_ib_cache_test.cc" -o "$build/gpu_pm4_ib_cache_test"
+"$build/gpu_pm4_ib_cache_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" "$test/wave6_onda4a_rt_quirks_test.cc" -o "$build/wave6_onda4a_rt_quirks_test"
+"$build/wave6_onda4a_rt_quirks_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" "$test/wave6_onda4b_wx_a64_test.cc" -o "$build/wave6_onda4b_wx_a64_test"
+"$build/wave6_onda4b_wx_a64_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -I "$cpp/xenia/third_party/Vulkan-Headers/include" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/wave6_onda4c_platform_test.cc" -o "$build/wave6_onda4c_platform_test"
+"$build/wave6_onda4c_platform_test" "$cpp"
+# Wave 7 Onda 1 (1A GPU P0 hardening, 1B CPU/W^X/POSIX P0, 1C platform/present_timing P0).
+"${cxx[@]}" "${flags[@]}" -pthread "$test/wave7_onda1a_gpu_p0_test.cc" -o "$build/wave7_onda1a_gpu_p0_test"
+"$build/wave7_onda1a_gpu_p0_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -pthread "$test/wave7_onda1b_cpu_wx_test.cc" -o "$build/wave7_onda1b_cpu_wx_test"
+"$build/wave7_onda1b_cpu_wx_test" "$cpp"
+"${cxx[@]}" "${flags[@]}" -I "$cpp/xenia/third_party/Vulkan-Headers/include" -DXE_DISABLE_ANDROID_DLOPEN=1 "$test/wave7_onda1c_platform_present_test.cc" -o "$build/wave7_onda1c_platform_present_test"
+"$build/wave7_onda1c_platform_present_test" "$root"
 # Host threads and APC delivery (Thread::QueueUserCallback) on the fork's Android
 # path (XE_PLATFORM_xendroid), so only with the NDK; Xenia's headers need clang.
 if [[ -n "${XENDROID_NDK:-}" ]]; then

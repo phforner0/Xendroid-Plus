@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 
 #include "xenia/base/logging.h"
@@ -28,6 +30,7 @@ DECLARE_path(log_file);
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
+#include "xenia/cpu/ppc/ppc_hle_memory.h"
 #include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/ppc/ppc_scanner.h"
 #include "xenia/cpu/processor.h"
@@ -43,6 +46,8 @@ DEFINE_bool(disable_context_promotion, false,
 
 DECLARE_bool(debug);
 DECLARE_bool(store_all_context_values);
+DECLARE_bool(ppc_hle_memory_ops);
+DECLARE_string(ppc_hle_memory_functions);
 
 namespace xe {
 namespace cpu {
@@ -160,10 +165,16 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // compiler_->AddPass(std::make_unique<passes::DeadStoreEliminationPass>());
   // if (validate)
   // compiler_->AddPass(std::make_unique<passes::ValidationPass>());
-  // After context promotion, which turned same-block CR loads into SSA uses,
-  // so only reads that cross blocks keep a CR store live.
-  compiler_->AddPass(std::make_unique<passes::DeadCRStoreEliminationPass>());
+  // After context promotion, eliminate dead cross-block context stores and
+  // any computations that only fed them, then promote hot small-loop context
+  // slots into pinned host registers before register allocation.
+  compiler_->AddPass(
+      std::make_unique<passes::DeadContextStoreEliminationPass>());
   compiler_->AddPass(std::make_unique<passes::DeadCodeEliminationPass>());
+  if (validate) {
+    compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  }
+  compiler_->AddPass(std::make_unique<passes::LoopContextPromotionPass>());
   if (validate) {
     compiler_->AddPass(std::make_unique<passes::ValidationPass>());
   }
@@ -326,6 +337,42 @@ bool PPCTranslator::Translate(GuestFunction* function,
     return false;
   }
 
+  HleMemoryOp hle_memory_op = HleMemoryOp::kNone;
+  if (cvars::ppc_hle_memory_ops &&
+      !frontend_->processor()->IsDynamicCodeModule(function->module()) &&
+      function->behavior() == Function::Behavior::kDefault &&
+      function->has_end_address() &&
+      function->end_address() >= function->address()) {
+    Module* module = function->module();
+    const size_t total_words =
+        (function->end_address() - function->address()) / 4 + 1;
+    const size_t word_count = std::min<size_t>(total_words, 128);
+    if (word_count >= 4) {
+      std::array<uint32_t, 128> be_words{};
+      size_t read_words = 0;
+      for (size_t idx = 0; idx < word_count; ++idx) {
+        const uint32_t addr =
+            function->address() + static_cast<uint32_t>(idx * 4);
+        const uint8_t* code_ptr = module->TranslateCode(addr);
+        if (!code_ptr) {
+          break;
+        }
+        be_words[read_words++] = xe::load_and_swap<uint32_t>(code_ptr);
+      }
+      if (read_words == word_count) {
+        uint64_t sig_hash = 0;
+        hle_memory_op = MatchHleMemorySignature(
+            function->address(), be_words.data(), read_words,
+            cvars::ppc_hle_memory_functions, &sig_hash);
+        if (hle_memory_op != HleMemoryOp::kNone) {
+          XELOGI("PPC HLE: matched {} at {:08X} ({} words, hash {:016X})",
+                 HleMemoryOpName(hle_memory_op), function->address(),
+                 read_words, sig_hash);
+        }
+      }
+    }
+  }
+
   // A dump target inside the function, known now that its extent is.
   if (!dump_this_function &&
       IsDumpTarget(function->address(), function->end_address())) {
@@ -373,7 +420,7 @@ bool PPCTranslator::Translate(GuestFunction* function,
       frontend_->processor()->backend()->trace_instr_available()) {
     emit_flags |= PPCHIRBuilder::EMIT_DEBUG_COMMENTS;
   }
-  if (!builder_->Emit(function, emit_flags)) {
+  if (!builder_->Emit(function, emit_flags, hle_memory_op)) {
     return false;
   }
 

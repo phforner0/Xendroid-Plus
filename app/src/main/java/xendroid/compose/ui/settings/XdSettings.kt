@@ -351,7 +351,7 @@ fun optionText(context: Context, s: Setting.ListChoice, value: String, english: 
         "GPU|draw_resolution_scale_threshold" -> value.toIntOrNull()?.let { if (it == 0) t(R.string.set_option_off) else context.getString(R.string.xd_opt_up_to_px, it) } ?: english
         "Console|user_language" -> java.util.Locale(english).displayLanguage.replaceFirstChar { it.titlecase() }.ifBlank { english }
         "Console|user_country" -> java.util.Locale("", english).displayCountry.ifBlank { english }
-        else -> english
+        else -> listOptionStringRes(s.key, value)?.let(::t) ?: english
     }
 }
 

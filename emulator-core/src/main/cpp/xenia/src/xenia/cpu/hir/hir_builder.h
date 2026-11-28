@@ -42,6 +42,74 @@ enum FunctionAttributes {
   FUNCTION_ATTRIB_DYNAMIC_CODE = (1 << 3),
 };
 
+// Metadata attached by LoopContextPromotionPass for RegisterAllocationPass
+// and backend emitters (reset in HIRBuilder::Reset).
+struct LoopPromotedSlot {
+  uint32_t offset = 0;
+  uint32_t size = 0;
+  uint32_t host_reg_index = 0;
+  bool is_vec = false;
+  bool is_float = false;
+  bool written = false;
+};
+
+struct LoopBlockSpan {
+  Block* block = nullptr;
+  Instr* loop_end_instr = nullptr;
+};
+
+struct LoopEntryPoint {
+  Block* preheader_block = nullptr;
+  bool before_first_block = false;
+};
+
+struct LoopExitEdge {
+  Block* exit_block = nullptr;
+  Instr* after_instr = nullptr;
+  uint32_t store_slot_mask = 0;
+};
+
+struct LoopFlushPoint {
+  Instr* before_instr = nullptr;
+  uint32_t flush_slot_mask = 0;
+};
+
+struct LoopPromotionRegion {
+  uint32_t id = 0;
+  Block* header = nullptr;
+  std::vector<LoopPromotedSlot> slots;
+  std::vector<LoopBlockSpan> block_spans;
+  std::vector<LoopEntryPoint> entry_points;
+  std::vector<LoopExitEdge> exit_points;
+  std::vector<LoopFlushPoint> flush_points;
+  uint32_t reserved_gpr_mask = 0;
+  uint32_t reserved_vec_mask = 0;
+};
+
+struct LoopPromotionPlan {
+  std::vector<LoopPromotionRegion> regions;
+  bool empty() const { return regions.empty(); }
+  void clear() { regions.clear(); }
+  bool ReferencesInstr(const Instr* instr) const {
+    if (!instr) {
+      return false;
+    }
+    for (const auto& r : regions) {
+      for (const auto& fp : r.flush_points) {
+        if (fp.before_instr == instr) {
+          return true;
+        }
+      }
+      for (const auto& ep : r.exit_points) {
+        if (ep.after_instr == instr) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+};
+
 class HIRBuilder {
   SimpleFreelist<Instr> free_instrs_;
   SimpleFreelist<Value> free_values_;
@@ -86,6 +154,16 @@ class HIRBuilder {
   void RemoveEdge(Edge* edge);
   void RemoveBlock(Block* block);
   void MergeAdjacentBlocks(Block* left, Block* right);
+  Block* InsertBlockBefore(Block* target);
+  Block* InsertBlockAfter(Block* target);
+  void AppendBranchToLabel(Block* src, Label* target,
+                           uint16_t branch_flags = 0);
+  void AppendReturn(Block* src);
+
+  LoopPromotionPlan& loop_promotion_plan() { return loop_promotion_plan_; }
+  const LoopPromotionPlan& loop_promotion_plan() const {
+    return loop_promotion_plan_;
+  }
 
   Instr* AllocateInstruction();
 
@@ -349,6 +427,7 @@ class HIRBuilder {
   Block* block_head_;
   Block* block_tail_;
   Block* current_block_;
+  LoopPromotionPlan loop_promotion_plan_;
 };
 
 }  // namespace hir

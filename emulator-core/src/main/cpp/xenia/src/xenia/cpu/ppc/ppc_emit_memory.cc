@@ -12,9 +12,11 @@
 #include <stddef.h>
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
+#include "xenia/cpu/ppc/ppc_stack_skew_guard.h"
 
 DEFINE_bool(
     disable_prefetch_and_cachecontrol, true,
@@ -50,6 +52,12 @@ DEFINE_bool(no_reserved_ops, false,
             "load/store impl",
             "CPU");
 
+DEFINE_bool(
+    a64_skip_stack_skew_fixup, true,
+    "Skip the 0xE0000000 physical skew fixup on proven r1 + simm16 stack "
+    "accesses on 16 KB Android devices.",
+    "CPU");
+
 namespace xe {
 namespace cpu {
 namespace ppc {
@@ -58,6 +66,14 @@ namespace ppc {
 using namespace xe::cpu::hir;
 
 using xe::cpu::hir::Value;
+
+inline uint32_t StackSkewLoadStoreFlag(uint32_t ra, int64_t simm) {
+  return (cvars::a64_skip_stack_skew_fixup &&
+          xe::memory::allocation_granularity() > 0x1000 &&
+          IsSafeStackDispAccess(ra, simm, false))
+             ? LOAD_STORE_NO_PHYSICAL_SKEW
+             : 0u;
+}
 
 Value* CalculateEA(PPCHIRBuilder& f, uint32_t ra, uint32_t rb) {
   return f.Add(f.LoadGPR(ra), f.LoadGPR(rb));
@@ -105,8 +121,11 @@ int InstrEmit_lbz(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.D.RA);
   }
 
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
-  Value* rt = f.ZeroExtend(f.LoadOffset(b, offset, INT8_TYPE), INT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.ZeroExtend(
+      f.LoadOffset(b, offset, INT8_TYPE, StackSkewLoadStoreFlag(i.D.RA, simm)),
+      INT64_TYPE);
   f.StoreGPR(i.D.RT, rt);
   return 0;
 }
@@ -116,8 +135,11 @@ int InstrEmit_lbzu(PPCHIRBuilder& f, const InstrData& i) {
   // RT <- i56.0 || MEM(EA, 1)
   // RA <- EA
   Value* ra = f.LoadGPR(i.D.RA);
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
-  Value* rt = f.ZeroExtend(f.LoadOffset(ra, offset, INT8_TYPE), INT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.ZeroExtend(
+      f.LoadOffset(ra, offset, INT8_TYPE, StackSkewLoadStoreFlag(i.D.RA, simm)),
+      INT64_TYPE);
   f.StoreGPR(i.D.RT, rt);
   StoreEA(f, i.D.RA, f.Add(ra, offset));
   return 0;
@@ -161,9 +183,12 @@ int InstrEmit_lha(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.D.RA);
   }
 
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
-  Value* rt =
-      f.SignExtend(f.ByteSwap(f.LoadOffset(b, offset, INT16_TYPE)), INT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.SignExtend(
+      f.ByteSwap(f.LoadOffset(b, offset, INT16_TYPE,
+                              StackSkewLoadStoreFlag(i.D.RA, simm))),
+      INT64_TYPE);
   f.StoreGPR(i.D.RT, rt);
   return 0;
 }
@@ -173,9 +198,12 @@ int InstrEmit_lhau(PPCHIRBuilder& f, const InstrData& i) {
   // RT <- EXTS(MEM(EA, 2))
   // RA <- EA
   Value* ra = f.LoadGPR(i.D.RA);
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
-  Value* rt = f.SignExtend(f.ByteSwap(f.LoadOffset(ra, offset, INT16_TYPE)),
-                           INT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.SignExtend(
+      f.ByteSwap(f.LoadOffset(ra, offset, INT16_TYPE,
+                              StackSkewLoadStoreFlag(i.D.RA, simm))),
+      INT64_TYPE);
   f.StoreGPR(i.D.RT, rt);
   StoreEA(f, i.D.RA, f.Add(ra, offset));
   return 0;
@@ -219,9 +247,12 @@ int InstrEmit_lhz(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.D.RA);
   }
 
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
-  Value* rt =
-      f.ZeroExtend(f.ByteSwap(f.LoadOffset(b, offset, INT16_TYPE)), INT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.ZeroExtend(
+      f.ByteSwap(f.LoadOffset(b, offset, INT16_TYPE,
+                              StackSkewLoadStoreFlag(i.D.RA, simm))),
+      INT64_TYPE);
   f.StoreGPR(i.D.RT, rt);
   return 0;
 }
@@ -231,9 +262,12 @@ int InstrEmit_lhzu(PPCHIRBuilder& f, const InstrData& i) {
   // RT <- i48.0 || MEM(EA, 2)
   // RA <- EA
   Value* ra = f.LoadGPR(i.D.RA);
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
-  Value* rt = f.ZeroExtend(f.ByteSwap(f.LoadOffset(ra, offset, INT16_TYPE)),
-                           INT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.ZeroExtend(
+      f.ByteSwap(f.LoadOffset(ra, offset, INT16_TYPE,
+                              StackSkewLoadStoreFlag(i.D.RA, simm))),
+      INT64_TYPE);
   f.StoreGPR(i.D.RT, rt);
   StoreEA(f, i.D.RA, f.Add(ra, offset));
   return 0;
@@ -277,9 +311,12 @@ int InstrEmit_lwa(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.DS.RA);
   }
 
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.DS.DS << 2));
-  Value* rt =
-      f.SignExtend(f.ByteSwap(f.LoadOffset(b, offset, INT32_TYPE)), INT64_TYPE);
+  const int64_t simm = XEEXTS16(i.DS.DS << 2);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.SignExtend(
+      f.ByteSwap(f.LoadOffset(b, offset, INT32_TYPE,
+                              StackSkewLoadStoreFlag(i.DS.RA, simm))),
+      INT64_TYPE);
   f.StoreGPR(i.DS.RT, rt);
   return 0;
 }
@@ -322,9 +359,12 @@ int InstrEmit_lwz(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.D.RA);
   }
 
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
-  Value* rt =
-      f.ZeroExtend(f.ByteSwap(f.LoadOffset(b, offset, INT32_TYPE)), INT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.ZeroExtend(
+      f.ByteSwap(f.LoadOffset(b, offset, INT32_TYPE,
+                              StackSkewLoadStoreFlag(i.D.RA, simm))),
+      INT64_TYPE);
   f.StoreGPR(i.D.RT, rt);
   return 0;
 }
@@ -334,9 +374,12 @@ int InstrEmit_lwzu(PPCHIRBuilder& f, const InstrData& i) {
   // RT <- i32.0 || MEM(EA, 4)
   // RA <- EA
   Value* ra = f.LoadGPR(i.D.RA);
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
-  Value* rt = f.ZeroExtend(f.ByteSwap(f.LoadOffset(ra, offset, INT32_TYPE)),
-                           INT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.ZeroExtend(
+      f.ByteSwap(f.LoadOffset(ra, offset, INT32_TYPE,
+                              StackSkewLoadStoreFlag(i.D.RA, simm))),
+      INT64_TYPE);
   f.StoreGPR(i.D.RT, rt);
   StoreEA(f, i.D.RA, f.Add(ra, offset));
   return 0;
@@ -380,8 +423,10 @@ int InstrEmit_ld(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.DS.RA);
   }
 
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.DS.DS << 2));
-  Value* rt = f.ByteSwap(f.LoadOffset(b, offset, INT64_TYPE));
+  const int64_t simm = XEEXTS16(i.DS.DS << 2);
+  Value* offset = f.LoadConstantInt64(simm);
+  Value* rt = f.ByteSwap(f.LoadOffset(b, offset, INT64_TYPE,
+                                      StackSkewLoadStoreFlag(i.DS.RA, simm)));
   f.StoreGPR(i.DS.RT, rt);
   return 0;
 }
@@ -390,8 +435,10 @@ int InstrEmit_ldu(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + EXTS(DS || 0b00)
   // RT <- MEM(EA, 8)
   // RA <- EA
-  Value* ea = CalculateEA_i(f, i.DS.RA, XEEXTS16(i.DS.DS << 2));
-  Value* rt = f.ByteSwap(f.Load(ea, INT64_TYPE));
+  const int64_t simm = XEEXTS16(i.DS.DS << 2);
+  Value* ea = CalculateEA_i(f, i.DS.RA, static_cast<uint64_t>(simm));
+  Value* rt = f.ByteSwap(
+      f.Load(ea, INT64_TYPE, StackSkewLoadStoreFlag(i.DS.RA, simm)));
   f.StoreGPR(i.DS.RT, rt);
   StoreEA(f, i.DS.RA, ea);
   return 0;
@@ -437,8 +484,10 @@ int InstrEmit_stb(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.D.RA);
   }
 
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
-  f.StoreOffset(b, offset, f.Truncate(f.LoadGPR(i.D.RT), INT8_TYPE));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
+  f.StoreOffset(b, offset, f.Truncate(f.LoadGPR(i.D.RT), INT8_TYPE),
+                StackSkewLoadStoreFlag(i.D.RA, simm));
   return 0;
 }
 
@@ -446,8 +495,10 @@ int InstrEmit_stbu(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + EXTS(D)
   // MEM(EA, 1) <- (RS)[56:63]
   // RA <- EA
-  Value* ea = CalculateEA_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  f.Store(ea, f.Truncate(f.LoadGPR(i.D.RT), INT8_TYPE));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  f.Store(ea, f.Truncate(f.LoadGPR(i.D.RT), INT8_TYPE),
+          StackSkewLoadStoreFlag(i.D.RA, simm));
   StoreEA(f, i.D.RA, ea);
   return 0;
 }
@@ -488,9 +539,11 @@ int InstrEmit_sth(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.D.RA);
   }
 
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
   f.StoreOffset(b, offset,
-                f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT), INT16_TYPE)));
+                f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT), INT16_TYPE)),
+                StackSkewLoadStoreFlag(i.D.RA, simm));
   return 0;
 }
 
@@ -498,8 +551,10 @@ int InstrEmit_sthu(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + EXTS(D)
   // MEM(EA, 2) <- (RS)[48:63]
   // RA <- EA
-  Value* ea = CalculateEA_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  f.Store(ea, f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT), INT16_TYPE)));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  f.Store(ea, f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT), INT16_TYPE)),
+          StackSkewLoadStoreFlag(i.D.RA, simm));
   StoreEA(f, i.D.RA, ea);
   return 0;
 }
@@ -539,9 +594,11 @@ int InstrEmit_stw(PPCHIRBuilder& f, const InstrData& i) {
   } else {
     b = f.LoadGPR(i.D.RA);
   }
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* offset = f.LoadConstantInt64(simm);
   f.StoreOffset(b, offset,
-                f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT), INT32_TYPE)));
+                f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT), INT32_TYPE)),
+                StackSkewLoadStoreFlag(i.D.RA, simm));
 
   return 0;
 }
@@ -554,10 +611,13 @@ int InstrEmit_stmw(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.D.RA);
   }
 
+  const int64_t simm = XEEXTS16(i.D.DS);
+  const uint32_t skew_flag = StackSkewLoadStoreFlag(i.D.RA, simm);
   for (uint32_t j = 0; j < 32 - i.D.RT; ++j) {
-    Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS) + j * 4);
+    Value* offset = f.LoadConstantInt64(simm + j * 4);
     f.StoreOffset(b, offset,
-                  f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT + j), INT32_TYPE)));
+                  f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT + j), INT32_TYPE)),
+                  skew_flag);
   }
   return 0;
 }
@@ -566,8 +626,10 @@ int InstrEmit_stwu(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + EXTS(D)
   // MEM(EA, 4) <- (RS)[32:63]
   // RA <- EA
-  Value* ea = CalculateEA_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  f.Store(ea, f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT), INT32_TYPE)));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  f.Store(ea, f.ByteSwap(f.Truncate(f.LoadGPR(i.D.RT), INT32_TYPE)),
+          StackSkewLoadStoreFlag(i.D.RA, simm));
   StoreEA(f, i.D.RA, ea);
   return 0;
 }
@@ -608,8 +670,10 @@ int InstrEmit_std(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.DS.RA);
   }
 
-  Value* offset = f.LoadConstantInt64(XEEXTS16(i.DS.DS << 2));
-  f.StoreOffset(b, offset, f.ByteSwap(f.LoadGPR(i.DS.RT)));
+  const int64_t simm = XEEXTS16(i.DS.DS << 2);
+  Value* offset = f.LoadConstantInt64(simm);
+  f.StoreOffset(b, offset, f.ByteSwap(f.LoadGPR(i.DS.RT)),
+                StackSkewLoadStoreFlag(i.DS.RA, simm));
   return 0;
 }
 
@@ -617,8 +681,10 @@ int InstrEmit_stdu(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + EXTS(DS || 0b00)
   // MEM(EA, 8) <- (RS)
   // RA <- EA
-  Value* ea = CalculateEA_i(f, i.DS.RA, XEEXTS16(i.DS.DS << 2));
-  f.Store(ea, f.ByteSwap(f.LoadGPR(i.DS.RT)));
+  const int64_t simm = XEEXTS16(i.DS.DS << 2);
+  Value* ea = CalculateEA_i(f, i.DS.RA, static_cast<uint64_t>(simm));
+  f.Store(ea, f.ByteSwap(f.LoadGPR(i.DS.RT)),
+          StackSkewLoadStoreFlag(i.DS.RA, simm));
   StoreEA(f, i.DS.RA, ea);
   return 0;
 }
@@ -732,13 +798,16 @@ int InstrEmit_lmw(PPCHIRBuilder& f, const InstrData& i) {
     b = f.LoadGPR(i.D.RA);
   }
 
+  const int64_t simm = XEEXTS16(i.D.DS);
+  const uint32_t skew_flag = StackSkewLoadStoreFlag(i.D.RA, simm);
   for (uint32_t j = 0; j < 32 - i.D.RT; ++j) {
     if (i.D.RT + j == i.D.RA) {
       continue;
     }
-    Value* offset = f.LoadConstantInt64(XEEXTS16(i.D.DS) + j * 4);
-    Value* rt = f.ZeroExtend(f.ByteSwap(f.LoadOffset(b, offset, INT32_TYPE)),
-                             INT64_TYPE);
+    Value* offset = f.LoadConstantInt64(simm + j * 4);
+    Value* rt = f.ZeroExtend(
+        f.ByteSwap(f.LoadOffset(b, offset, INT32_TYPE, skew_flag)),
+        INT64_TYPE);
     f.StoreGPR(i.D.RT + j, rt);
   }
   return 0;
@@ -906,8 +975,11 @@ int InstrEmit_lfd(PPCHIRBuilder& f, const InstrData& i) {
   //   b <- (RA)
   // EA <- b + EXTS(D)
   // FRT <- MEM(EA, 8)
-  Value* ea = CalculateEA_0_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  Value* rt = f.Cast(f.ByteSwap(f.Load(ea, INT64_TYPE)), FLOAT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_0_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  Value* rt = f.Cast(
+      f.ByteSwap(f.Load(ea, INT64_TYPE, StackSkewLoadStoreFlag(i.D.RA, simm))),
+      FLOAT64_TYPE);
   f.StoreFPR(i.D.RT, rt);
   return 0;
 }
@@ -916,8 +988,11 @@ int InstrEmit_lfdu(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + EXTS(D)
   // FRT <- MEM(EA, 8)
   // RA <- EA
-  Value* ea = CalculateEA_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  Value* rt = f.Cast(f.ByteSwap(f.Load(ea, INT64_TYPE)), FLOAT64_TYPE);
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  Value* rt = f.Cast(
+      f.ByteSwap(f.Load(ea, INT64_TYPE, StackSkewLoadStoreFlag(i.D.RA, simm))),
+      FLOAT64_TYPE);
   f.StoreFPR(i.D.RT, rt);
   StoreEA(f, i.D.RA, ea);
   return 0;
@@ -1009,8 +1084,11 @@ int InstrEmit_lfs(PPCHIRBuilder& f, const InstrData& i) {
   //   b <- (RA)
   // EA <- b + EXTS(D)
   // FRT <- DOUBLE(MEM(EA, 4))
-  Value* ea = CalculateEA_0_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  Value* rt = UnpackSingleKeepNaN(f, f.ByteSwap(f.Load(ea, INT32_TYPE)));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_0_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  Value* rt = UnpackSingleKeepNaN(
+      f, f.ByteSwap(
+             f.Load(ea, INT32_TYPE, StackSkewLoadStoreFlag(i.D.RA, simm))));
   f.StoreFPR(i.D.RT, rt);
   return 0;
 }
@@ -1019,8 +1097,11 @@ int InstrEmit_lfsu(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + EXTS(D)
   // FRT <- DOUBLE(MEM(EA, 4))
   // RA <- EA
-  Value* ea = CalculateEA_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  Value* rt = UnpackSingleKeepNaN(f, f.ByteSwap(f.Load(ea, INT32_TYPE)));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  Value* rt = UnpackSingleKeepNaN(
+      f, f.ByteSwap(
+             f.Load(ea, INT32_TYPE, StackSkewLoadStoreFlag(i.D.RA, simm))));
   f.StoreFPR(i.D.RT, rt);
   StoreEA(f, i.D.RA, ea);
   return 0;
@@ -1059,8 +1140,10 @@ int InstrEmit_stfd(PPCHIRBuilder& f, const InstrData& i) {
   //   b <- (RA)
   // EA <- b + EXTS(D)
   // MEM(EA, 8) <- (FRS)
-  Value* ea = CalculateEA_0_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  f.Store(ea, f.ByteSwap(f.Cast(f.LoadFPR(i.D.RT), INT64_TYPE)));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_0_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  f.Store(ea, f.ByteSwap(f.Cast(f.LoadFPR(i.D.RT), INT64_TYPE)),
+          StackSkewLoadStoreFlag(i.D.RA, simm));
   return 0;
 }
 
@@ -1068,8 +1151,10 @@ int InstrEmit_stfdu(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + EXTS(D)
   // MEM(EA, 8) <- (FRS)
   // RA <- EA
-  Value* ea = CalculateEA_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  f.Store(ea, f.ByteSwap(f.Cast(f.LoadFPR(i.D.RT), INT64_TYPE)));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  f.Store(ea, f.ByteSwap(f.Cast(f.LoadFPR(i.D.RT), INT64_TYPE)),
+          StackSkewLoadStoreFlag(i.D.RA, simm));
   StoreEA(f, i.D.RA, ea);
   return 0;
 }
@@ -1116,8 +1201,10 @@ int InstrEmit_stfs(PPCHIRBuilder& f, const InstrData& i) {
   //   b <- (RA)
   // EA <- b + EXTS(D)
   // MEM(EA, 4) <- SINGLE(FRS)
-  Value* ea = CalculateEA_0_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  f.Store(ea, f.ByteSwap(PackSingleKeepNaN(f, f.LoadFPR(i.D.RT))));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_0_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  f.Store(ea, f.ByteSwap(PackSingleKeepNaN(f, f.LoadFPR(i.D.RT))),
+          StackSkewLoadStoreFlag(i.D.RA, simm));
   return 0;
 }
 
@@ -1125,8 +1212,10 @@ int InstrEmit_stfsu(PPCHIRBuilder& f, const InstrData& i) {
   // EA <- (RA) + EXTS(D)
   // MEM(EA, 4) <- SINGLE(FRS)
   // RA <- EA
-  Value* ea = CalculateEA_i(f, i.D.RA, XEEXTS16(i.D.DS));
-  f.Store(ea, f.ByteSwap(PackSingleKeepNaN(f, f.LoadFPR(i.D.RT))));
+  const int64_t simm = XEEXTS16(i.D.DS);
+  Value* ea = CalculateEA_i(f, i.D.RA, static_cast<uint64_t>(simm));
+  f.Store(ea, f.ByteSwap(PackSingleKeepNaN(f, f.LoadFPR(i.D.RT))),
+          StackSkewLoadStoreFlag(i.D.RA, simm));
   StoreEA(f, i.D.RA, ea);
   return 0;
 }

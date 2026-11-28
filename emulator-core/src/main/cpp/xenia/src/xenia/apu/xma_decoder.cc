@@ -14,6 +14,7 @@
 #include "xenia/apu/xma_context_master.h"
 #include "xenia/apu/xma_context_new.h"
 #include "xenia/apu/xma_context_old.h"
+#include "../../../../xe_audio_adpf_logic.h"
 
 #include "xenia/base/cvar.h"
 #if XE_PLATFORM_xendroid
@@ -223,6 +224,10 @@ void XmaDecoder::WorkerThreadMain() {
     XELOGW("XMA Decoder: setpriority(-12) failed: errno {} ({})", errno,
            std::strerror(errno));
   }
+  const xendroid::ScopedAudioAdpfThread xma_adpf_tid(
+      xendroid::GlobalAudioAdpfThreadRegistry(),
+      xendroid::AudioAdpfThreadRole::kXmaDecoder,
+      static_cast<int32_t>(xe::threading::current_thread_system_id()));
 #endif
   // Whether decode keeps up. If this thread is saturated, the guest mixer has
   // nothing to submit and the audio queue drains even though the audio worker
@@ -317,7 +322,10 @@ void XmaDecoder::WorkerThreadMain() {
       resume_fence_.Wait();
     }
 
-    if (did_work) {
+    if (did_work &&
+        (!cvars::xma_worker_enabled_contexts_only ||
+         xendroid::HasAnyEnabledXmaContext(enabled_context_mask_,
+                                           kEnabledContextMaskWords))) {
       continue;
     }
     if (cvars::apu_aaudio_log_stats) {

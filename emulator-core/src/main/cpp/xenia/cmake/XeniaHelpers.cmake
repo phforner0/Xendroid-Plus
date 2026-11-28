@@ -467,26 +467,54 @@ function(xe_test_suite name base_path)
     return()
   endif()
 
-  add_executable(${name}
-    ${_test_sources}
-    ${PROJECT_SOURCE_DIR}/tools/build/src/test_suite_main.cc
-  )
+  if(EXISTS "${PROJECT_SOURCE_DIR}/tools/build/src/test_suite_main.cc")
+    add_executable(${name}
+      ${_test_sources}
+      ${PROJECT_SOURCE_DIR}/tools/build/src/test_suite_main.cc
+    )
 
-  if(WIN32)
-    target_sources(${name} PRIVATE
-      ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_win.cc)
+    if(WIN32)
+      target_sources(${name} PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_win.cc)
+    else()
+      target_sources(${name} PRIVATE
+        ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_posix.cc)
+    endif()
+
+    target_include_directories(${name} PRIVATE
+      ${PROJECT_SOURCE_DIR}/tools/build
+      ${PROJECT_SOURCE_DIR}/tools/build/src
+      ${PROJECT_SOURCE_DIR}/tools/build/third_party/catch/include
+    )
   else()
-    target_sources(${name} PRIVATE
-      ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_posix.cc)
+    set(_catch_main_src "${CMAKE_CURRENT_BINARY_DIR}/${name}_catch_main.cc")
+    if(EXISTS "${PROJECT_SOURCE_DIR}/third_party/catch/single_include/catch2/catch.hpp")
+      set(_catch_main_inc "third_party/catch/single_include/catch2/catch.hpp")
+    else()
+      set(_catch_main_inc "third_party/catch/include/catch.hpp")
+    endif()
+    set(_catch_main_content "#define CATCH_CONFIG_MAIN\n#include \"${_catch_main_inc}\"\n")
+    set(_catch_main_needs_write TRUE)
+    if(EXISTS "${_catch_main_src}")
+      file(READ "${_catch_main_src}" _existing_catch_main)
+      if(_existing_catch_main STREQUAL "${_catch_main_content}")
+        set(_catch_main_needs_write FALSE)
+      endif()
+    endif()
+    if(_catch_main_needs_write)
+      file(WRITE "${_catch_main_src}" "${_catch_main_content}")
+    endif()
+    add_executable(${name}
+      ${_test_sources}
+      ${_catch_main_src}
+    )
+    target_include_directories(${name} PRIVATE
+      ${PROJECT_SOURCE_DIR}/third_party/catch/include
+    )
   endif()
 
   target_compile_definitions(${name} PRIVATE
     "XE_TEST_SUITE_NAME=\"${name}\""
-  )
-  target_include_directories(${name} PRIVATE
-    ${PROJECT_SOURCE_DIR}/tools/build
-    ${PROJECT_SOURCE_DIR}/tools/build/src
-    ${PROJECT_SOURCE_DIR}/tools/build/third_party/catch/include
   )
   if(ARG_LINKS)
     target_link_libraries(${name} PRIVATE ${ARG_LINKS})

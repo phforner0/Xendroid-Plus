@@ -9,28 +9,62 @@
 
 #include "xenia/cpu/backend/a64/a64_emitter.h"
 
+#include <atomic>
+#include <bit>
 #include <cstring>
 #include <unordered_set>
 
 #include "xenia/base/debugging.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_code_cache.h"
+#include "xenia/cpu/backend/a64/a64_direct_call.h"
 #include "xenia/cpu/backend/a64/a64_function.h"
+#include "xenia/cpu/backend/a64/a64_hle_sync_layout.h"
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
+#include "xenia/cpu/backend/a64/a64_stack_skew_analysis.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 #include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/export_resolver.h"
 #include "xenia/cpu/hir/hir_builder.h"
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/ppc/ppc_stack_skew_guard.h"
 #include "xenia/cpu/processor.h"
 
 DECLARE_int64(a64_max_stackpoints);
 DECLARE_bool(a64_enable_host_guest_stack_synchronization);
 DECLARE_bool(a64_near_branches);
+DECLARE_bool(a64_direct_calls);
+DECLARE_bool(a64_skip_stack_skew_fixup);
+DECLARE_bool(a64_align_hot_code);
+
+DEFINE_bool(
+    a64_indirect_call_pic, true,
+    "Enable 1-slot monomorphic PIC for indirect guest calls (bctrl) using "
+    "2-stage 1-word atomic CMODX patching. Overridable on Android via "
+    "debug.xendroid.a64_indirect_call_pic=0|1.",
+    "CPU");
+
+DEFINE_bool(
+    a64_lrcpc_tso, false,
+    "Use ARMv8.3-A FEAT_LRCPC (ldaprb/ldaprh/ldapr) for scalar LOAD and "
+    "LOAD_OFFSET when a64_guest_memory_tso is enabled and HWCAP_LRCPC is "
+    "present. Kept off by default: ARMv8.3+LSE2 LDAPR still raises an "
+    "Alignment Fault (SIGBUS) on unaligned guest loads crossing a 16-byte "
+    "boundary. Overridable on Android via debug.xendroid.a64_lrcpc_tso=0|1.",
+    "CPU");
+
+DEFINE_bool(
+    a64_skip_low_addr_skew_fixup, false,
+    "Extend 16 KB host physical-skew fixup elision to proven < 0xA0000000 "
+    "constant/lis and SDA (r13) addresses. Overridable on Android via "
+    "debug.xendroid.a64_low_addr_skew=0|1.",
+    "CPU");
 
 DEFINE_bool(
     log_safepoint_pc, false,
@@ -48,6 +82,13 @@ DEFINE_bool(
     "ARM reorders all of those, which a guest race the console's or an x86 "
     "host's ordering hides can need. Slow; diagnostic only. Takes effect for "
     "code translated afterwards.",
+    "CPU");
+
+DEFINE_bool(
+    a64_inline_hle_sync, true,
+    "Emit inline AArch64 fast-paths for uncontended high-frequency HLE sync "
+    "exports (IRQL, CriticalSection, SpinLock), falling back to C++ handlers "
+    "on contention/validation edge cases or when hle_census is enabled.",
     "CPU");
 
 namespace xe {
@@ -74,6 +115,28 @@ static uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
   XELOGE("undefined extern call to {:08X} {}", function->address(),
          function->name());
   return 0;
+}
+
+static bool MakesCall(const hir::HIRBuilder* builder) {
+  for (const auto* block = builder->first_block(); block; block = block->next) {
+    for (const auto* instr = block->instr_head; instr; instr = instr->next) {
+      switch (instr->GetOpcodeNum()) {
+        case hir::OPCODE_CALL:
+        case hir::OPCODE_CALL_TRUE:
+        case hir::OPCODE_CALL_INDIRECT:
+        case hir::OPCODE_CALL_INDIRECT_TRUE:
+        case hir::OPCODE_CALL_EXTERN:
+        case hir::OPCODE_TRAP:
+        case hir::OPCODE_TRAP_TRUE:
+        case hir::OPCODE_DEBUG_BREAK:
+        case hir::OPCODE_DEBUG_BREAK_TRUE:
+          return true;
+        default:
+          break;
+      }
+    }
+  }
+  return false;
 }
 
 // Max host code per translated guest function. 1 MiB was too small for large,
@@ -108,7 +171,16 @@ A64Emitter::A64Emitter(A64Backend* backend, XbyakA64Allocator* allocator)
       allocator_(allocator),
       feature_flags_(arm64::GetFeatureFlags()) {}
 
-A64Emitter::~A64Emitter() = default;
+A64Emitter::~A64Emitter() { ResetPerFunctionState(); }
+
+bool A64Emitter::UseLrcpcForTsoLoad(const hir::Instr* instr) const {
+  if (!instr || !instr->dest) {
+    return false;
+  }
+  return ShouldUseLrcpcForTsoLoad(cvars::a64_guest_memory_tso,
+                                  cvars::a64_lrcpc_tso, feature_flags_,
+                                  instr->GetOpcodeNum(), instr->dest->type);
+}
 
 bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
                       uint32_t debug_info_flags, FunctionDebugInfo* debug_info,
@@ -131,37 +203,96 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
   // an unencodable operand needs catching here too. Conditional branches are
   // emitted direct first; a function too large for them to reach across is
   // emitted again with the long-range form.
+  bool uses_no_skew = false;
+  bool has_unsafe_r1_write = false;
+  AnalyzeStackSkewSafety(builder, &uses_no_skew, &has_unsafe_r1_write);
+  auto* a64_fn = static_cast<A64Function*>(function);
+  const bool forbid_skew_skip =
+      a64_fn->forbid_stack_skew_skip() ||
+      backend_->IsStackSkewSkipForbidden(function->address());
+  if (forbid_skew_skip) {
+    a64_fn->set_forbid_stack_skew_skip(true);
+  }
+  const bool allow_skew_skip =
+      xe::memory::allocation_granularity() > 0x1000 &&
+      cvars::a64_skip_stack_skew_fixup && !forbid_skew_skip &&
+      !has_unsafe_r1_write;
+  if (uses_no_skew && !allow_skew_skip) {
+    StripNoPhysicalSkewFlags(builder);
+    uses_no_skew = false;
+  }
+  uses_stack_skew_skip_ = allow_skew_skip && uses_no_skew;
+  uses_r13_skew_guard_ = false;
+  r13_skew_guard_needs_low_bound_ = false;
+  if (xe::memory::allocation_granularity() > 0x1000 &&
+      cvars::a64_skip_low_addr_skew_fixup && !forbid_skew_skip) {
+    LowAddrSkewSummary low_addr_summary{};
+    MarkLowAddrNoPhysicalSkew(builder, &low_addr_summary);
+    if (low_addr_summary.marked_r13_ops > 0) {
+      uses_r13_skew_guard_ = true;
+      r13_skew_guard_needs_low_bound_ =
+          low_addr_summary.r13_requires_negative_headroom;
+    }
+  }
+  uses_stackpoints_ = MakesCall(builder);
+
   EmitFunctionInfo func_info = {};
   bool emitted = false;
   // Once: it turns every local into its stack offset (a constant of another
   // type), so a second emission must reuse the layout, not redo it.
   const size_t stack_size = LayOutLocals(builder);
-  for (bool near_branches : {bool(cvars::a64_near_branches), false}) {
-    // Reset state.
-    near_branches_ = near_branches;
-    stack_size_ = StackLayout::GUEST_STACK_SIZE;
-    source_map_arena_.Reset();
-    tail_code_.clear();
-    fpcr_mode_ = FPCRMode::Unknown;
-    func_info = {};
-    try {
-      emitted = Emit(builder, stack_size, func_info);
-    } catch (const Xbyak_aarch64::Error& e) {
-      if (IsNearBranchOutOfRange(e)) {
-        XELOGI(
-            "A64: guest function {:08X} too large for direct branches, "
-            "emitted again with long-range ones",
-            current_guest_function_);
-        ResetPerFunctionState();
-        continue;
-      }
-      XELOGE("A64: assembler error while emitting guest function {:08X}: {}",
-             current_guest_function_, e.what());
-      emitted = false;
+  {
+    auto emitter_scope = code_cache_->EnterCodeEmitter();
+    size_t host_page = xe::memory::page_size();
+    if (host_page < 4096u || (host_page & (host_page - 1u)) != 0) {
+      host_page = 4096u;
     }
-    break;
+    for (bool near_branches : {bool(cvars::a64_near_branches), false}) {
+      // Reset state.
+      near_branches_ = near_branches;
+      stack_size_ = StackLayout::GUEST_STACK_SIZE;
+      source_map_arena_.Reset();
+      tail_code_.clear();
+      pending_direct_calls_.clear();
+      pending_indirect_call_pics_.clear();
+      if (cvars::a64_align_hot_code) {
+        // Under parallel compilation (active_emitters > 1), the bump hint
+        // cannot predict the final page offset; use SIZE_MAX sentinel to keep
+        // 32 B alignment invariant without speculative page-split NOP drift.
+        entry_offset_mod_4k_ =
+            code_cache_->active_emitters() == 1
+                ? (code_cache_->predicted_next_code_offset(64u) &
+                   (host_page - 1u))
+                : SIZE_MAX;
+      } else {
+        entry_offset_mod_4k_ = 0u;
+      }
+      fpcr_mode_ = FPCRMode::Unknown;
+      func_info = {};
+      try {
+        emitted = Emit(builder, stack_size, func_info);
+      } catch (const Xbyak_aarch64::Error& e) {
+        if (IsNearBranchOutOfRange(e)) {
+          XELOGI(
+              "A64: guest function {:08X} too large for direct branches, "
+              "emitted again with long-range ones",
+              current_guest_function_);
+          ResetPerFunctionState();
+          continue;
+        }
+        XELOGE("A64: assembler error while emitting guest function {:08X}: {}",
+               current_guest_function_, e.what());
+        emitted = false;
+      }
+      break;
+    }
   }
   near_branches_ = false;
+  uses_stack_skew_skip_ = false;
+  uses_r13_skew_guard_ = false;
+  r13_skew_guard_needs_low_bound_ = false;
+  entry_offset_mod_4k_ = 0;
+  uses_stackpoints_ = true;
   if (!emitted) {
     // Emplace only runs on success, so a failed compile has to reset too.
     ResetPerFunctionState();
@@ -179,7 +310,13 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
 }
 
 bool A64Emitter::IsNearBranchOutOfRange(const Xbyak_aarch64::Error& e) const {
-  return near_branches_ && int(e) == Xbyak_aarch64::ERR_LABEL_IS_TOO_FAR;
+  // Conditional branches throw ERR_LABEL_IS_TOO_FAR past +-1 MiB, while
+  // PC-relative `adr` in near-branch tails (PIC / stack-sync) throws
+  // ERR_ILLEGAL_IMM_RANGE past +-1 MiB. Both retry cleanly with
+  // near_branches_ = false (genuine bad immediates still fail on pass 2).
+  return near_branches_ &&
+         (int(e) == Xbyak_aarch64::ERR_LABEL_IS_TOO_FAR ||
+          int(e) == Xbyak_aarch64::ERR_ILLEGAL_IMM_RANGE);
 }
 
 size_t A64Emitter::LayOutLocals(hir::HIRBuilder* builder) {
@@ -241,6 +378,56 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
   // Record stackpoint for longjmp recovery.
   PushStackpoint();
 
+  if (uses_stack_skew_skip_ || uses_r13_skew_guard_) {
+    // Guard entry r1 against [0x70000000, 0x7F000000) and/or entry r13 (SDA)
+    // against < 0x90000000 (with >= 0x00100000 when negative offsets exist).
+    // On a 16 KB host, any call entering outside the safe range pops the frame
+    // and re-emits this function without LOAD_STORE_NO_PHYSICAL_SKEW.
+    auto& fallback_label = AddToTail([](A64Emitter& e, Label&) {
+      e.PopStackpoint();
+      e.ldr(e.x0,
+            ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+      e.ldr(e.x30,
+            ptr(e.sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
+      if (e.stack_size() <= 4095) {
+        e.add(e.sp, e.sp, static_cast<uint32_t>(e.stack_size()));
+      } else {
+        e.mov(e.x17, static_cast<uint64_t>(e.stack_size()));
+        e.add(e.sp, e.sp, e.x17, UXTX);
+      }
+      e.mov(e.w16, e.current_guest_function());
+      e.mov(e.x9, reinterpret_cast<uint64_t>(
+                      e.backend()->reemit_without_stack_skew_thunk()));
+      e.br(e.x9);
+    });
+    if (uses_stack_skew_skip_) {
+      static_assert(kR1ContextOffset < 16380,
+                    "r[1] offset must fit A64 ldr unsigned imm12");
+      ldr(w17, ptr(x20, static_cast<uint32_t>(kR1ContextOffset)));
+      mov(w16, ppc::kGuestStackRangeBegin);
+      sub(w17, w17, w16);
+      mov(w16, ppc::kGuestStackRangeEnd - ppc::kGuestStackRangeBegin);
+      cmp(w17, w16);
+      b(HS, fallback_label);
+    }
+    if (uses_r13_skew_guard_) {
+      static_assert(kR13ContextOffset < 16380,
+                    "r[13] offset must fit A64 ldr unsigned imm12");
+      ldr(w17, ptr(x20, static_cast<uint32_t>(kR13ContextOffset)));
+      if (r13_skew_guard_needs_low_bound_) {
+        mov(w16, kLowAddrSdaMinWithNegOffset);
+        sub(w17, w17, w16);
+        mov(w16, kLowAddrSdaCeiling - kLowAddrSdaMinWithNegOffset);
+        cmp(w17, w16);
+        b(HS, fallback_label);
+      } else {
+        mov(w16, kLowAddrSdaCeiling);
+        cmp(w17, w16);
+        b(HS, fallback_label);
+      }
+    }
+  }
+
   // ========================================================================
   // BODY
   // ========================================================================
@@ -262,6 +449,110 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
   label_cache_.push_back(epilog_label_ptr);
   epilog_label_ = epilog_label_ptr;
 
+  // Prepare read-only loop promotion lookup tables for this emission attempt.
+  const auto& loop_plan = builder->loop_promotion_plan();
+  std::vector<const hir::LoopPromotionRegion*> pre_first_block_entries;
+  std::unordered_map<const hir::Block*, const hir::LoopPromotionRegion*>
+      preheader_entries;
+  std::unordered_map<const hir::Block*,
+                     std::pair<const hir::LoopPromotionRegion*, uint32_t>>
+      exit_blocks;
+  std::unordered_map<const hir::Instr*,
+                     std::pair<const hir::LoopPromotionRegion*, uint32_t>>
+      after_instr_exits;
+  std::unordered_map<const hir::Instr*,
+                     std::pair<const hir::LoopPromotionRegion*, uint32_t>>
+      flush_before_instrs;
+  std::unordered_map<const hir::Block*,
+                     std::pair<const hir::LoopPromotionRegion*, const hir::Instr*>>
+      loop_body_blocks;
+
+  if (!loop_plan.empty()) {
+    for (const auto& region : loop_plan.regions) {
+      for (const auto& entry : region.entry_points) {
+        if (entry.before_first_block) {
+          pre_first_block_entries.push_back(&region);
+        } else if (entry.preheader_block) {
+          preheader_entries[entry.preheader_block] = &region;
+        }
+      }
+      for (const auto& exit_edge : region.exit_points) {
+        if (exit_edge.exit_block) {
+          exit_blocks[exit_edge.exit_block] = {&region,
+                                               exit_edge.store_slot_mask};
+        } else if (exit_edge.after_instr) {
+          after_instr_exits[exit_edge.after_instr] = {
+              &region, exit_edge.store_slot_mask};
+        }
+      }
+      for (const auto& fp : region.flush_points) {
+        if (fp.before_instr) {
+          flush_before_instrs[fp.before_instr] = {&region, fp.flush_slot_mask};
+        }
+      }
+      for (const auto& span : region.block_spans) {
+        if (span.block && span.loop_end_instr) {
+          loop_body_blocks[span.block] = {&region, span.loop_end_instr};
+        }
+      }
+    }
+  }
+
+  for (const auto* region : pre_first_block_entries) {
+    EmitLoadPinnedSlots(*region);
+  }
+
+  // Identify loop header blocks (targets of HIR back-edges or loop_promotion_plan
+  // headers) when hot-code alignment is active so we can align them to 32 B and
+  // nudge headers landing in the last 64 B of a 4 KB page across the boundary.
+  std::unordered_set<const hir::Block*> loop_header_blocks;
+  if (cvars::a64_align_hot_code) {
+    if (!loop_plan.empty()) {
+      for (const auto& region : loop_plan.regions) {
+        if (region.header) {
+          loop_header_blocks.insert(region.header);
+        }
+      }
+    }
+    std::unordered_map<const hir::Block*, size_t> block_order;
+    size_t idx = 0;
+    for (const hir::Block* b = builder->first_block(); b; b = b->next) {
+      block_order.emplace(b, idx++);
+    }
+    idx = 0;
+    for (const hir::Block* b = builder->first_block(); b; b = b->next, ++idx) {
+      for (const hir::Edge* e = b->outgoing_edge_head; e;
+           e = e->outgoing_next) {
+        if (e->dest) {
+          auto it = block_order.find(e->dest);
+          if (it != block_order.end() && it->second <= idx) {
+            loop_header_blocks.insert(e->dest);
+          }
+        }
+      }
+      for (const hir::Instr* bi = b->instr_tail; bi; bi = bi->prev) {
+        const hir::Opcode bop = bi->GetOpcodeNum();
+        const hir::Block* target_block = nullptr;
+        if (bop == hir::OPCODE_BRANCH && bi->src1.label) {
+          target_block = bi->src1.label->block;
+        } else if ((bop == hir::OPCODE_BRANCH_TRUE ||
+                    bop == hir::OPCODE_BRANCH_FALSE) &&
+                   bi->src2.label) {
+          target_block = bi->src2.label->block;
+        } else if (bop != hir::OPCODE_COMMENT &&
+                   bop != hir::OPCODE_SOURCE_OFFSET) {
+          break;
+        }
+        if (target_block) {
+          auto it = block_order.find(target_block);
+          if (it != block_order.end() && it->second <= idx) {
+            loop_header_blocks.insert(target_block);
+          }
+        }
+      }
+    }
+  }
+
   // Walk HIR blocks and emit ARM64 instructions.
   auto block = builder->first_block();
   synchronize_stack_on_next_instruction_ = false;
@@ -269,6 +560,20 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
     // Reset FPCR tracking on each block entry (we don't know which
     // predecessor ran, so mode is unknown).
     ForgetFpcrMode();
+
+    // Align loop headers BEFORE binding labels so back-edges land on the
+    // aligned instruction and fall-through entries slide cleanly over NOPs.
+    if (!loop_header_blocks.empty() && loop_header_blocks.count(block) != 0) {
+      const bool allow_page_nudge =
+          entry_offset_mod_4k_ != SIZE_MAX &&
+          code_cache_->active_emitters() == 1;
+      const size_t pad_bytes = ComputeLoopHeaderAlignmentPaddingForPage(
+          getSize(), allow_page_nudge ? entry_offset_mod_4k_ : 0u,
+          xe::memory::page_size(), allow_page_nudge);
+      for (size_t i = 0; i < pad_bytes; i += sizeof(uint32_t)) {
+        nop();
+      }
+    }
 
     // Bind all labels targeting this block.
     auto label = block->label_head;
@@ -278,6 +583,29 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
     }
     // A compare hands its flags only to a branch in its own block.
     ResetSequenceHandoffs();
+
+    if (!preheader_entries.empty()) {
+      auto pre_it = preheader_entries.find(block);
+      if (pre_it != preheader_entries.end()) {
+        EmitLoadPinnedSlots(*pre_it->second);
+      }
+    }
+    if (!exit_blocks.empty()) {
+      auto exit_it = exit_blocks.find(block);
+      if (exit_it != exit_blocks.end()) {
+        EmitStorePinnedSlots(*exit_it->second.first, exit_it->second.second);
+      }
+    }
+
+    const hir::LoopPromotionRegion* active_loop_region = nullptr;
+    const hir::Instr* active_loop_end = nullptr;
+    if (!loop_body_blocks.empty()) {
+      auto body_it = loop_body_blocks.find(block);
+      if (body_it != loop_body_blocks.end()) {
+        active_loop_region = body_it->second.first;
+        active_loop_end = body_it->second.second;
+      }
+    }
 
     // Process each instruction in the block.
     const hir::Instr* instr = block->instr_head;
@@ -294,12 +622,20 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
           EnsureSynchronizedGuestAndHostStack();
         }
       }
+      if (!flush_before_instrs.empty()) {
+        auto flush_it = flush_before_instrs.find(instr);
+        if (flush_it != flush_before_instrs.end()) {
+          EmitStorePinnedSlots(*flush_it->second.first,
+                               flush_it->second.second);
+        }
+      }
       const hir::Instr* new_tail = instr;
       bool selected = false;
       const bool handoff_pending = sequence_handoff_pending();
       const hir::Opcode opcode = instr->GetOpcodeNum();
+      const bool use_lrcpc_tso = UseLrcpcForTsoLoad(instr);
       const bool tso_load =
-          cvars::a64_guest_memory_tso &&
+          cvars::a64_guest_memory_tso && !use_lrcpc_tso &&
           (opcode == hir::OPCODE_LOAD || opcode == hir::OPCODE_LOAD_OFFSET ||
            opcode == hir::OPCODE_LVL || opcode == hir::OPCODE_LVR ||
            opcode == hir::OPCODE_RESERVED_LOAD);
@@ -310,7 +646,15 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
         dmb(ISHST);
       }
       try {
-        selected = SelectSequence(this, instr, &new_tail);
+        if (active_loop_region &&
+            (opcode == hir::OPCODE_LOAD_CONTEXT ||
+             opcode == hir::OPCODE_STORE_CONTEXT) &&
+            TryEmitPinnedContextInstr(instr, *active_loop_region)) {
+          selected = true;
+          new_tail = instr->next;
+        } else {
+          selected = SelectSequence(this, instr, &new_tail);
+        }
       } catch (const Xbyak_aarch64::Error& e) {
         if (IsNearBranchOutOfRange(e)) {
           throw;  // Emitted again with long-range branches.
@@ -344,6 +688,17 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
       }
       if (tso_load) {
         dmb(ISHLD);
+      }
+      if (!after_instr_exits.empty()) {
+        auto after_it = after_instr_exits.find(instr);
+        if (after_it != after_instr_exits.end()) {
+          EmitStorePinnedSlots(*after_it->second.first,
+                               after_it->second.second);
+        }
+      }
+      if (active_loop_region && instr == active_loop_end) {
+        active_loop_region = nullptr;
+        active_loop_end = nullptr;
       }
       instr = new_tail;
     }
@@ -392,12 +747,14 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
   // ========================================================================
   // TAIL CODE
   // ========================================================================
-  for (auto& tail_item : tail_code_) {
-    // ARM64 instructions are always 4-byte aligned, so alignment is mostly
-    // a no-op unless we want cache-line alignment for hot paths.
-    L(tail_item.label);
+  for (size_t tail_idx = 0; tail_idx < tail_code_.size(); ++tail_idx) {
+    // Index-based iteration and copied callback: a tail emitter may append to
+    // tail_code_ (reallocating the vector). AddToTail binds its heap-stable
+    // NewCachedLabel() at the start of the wrapped callback.
+    auto func = tail_code_[tail_idx].func;
+    Label unused_label;
     try {
-      tail_item.func(*this, tail_item.label);
+      func(*this, unused_label);
     } catch (const Xbyak_aarch64::Error& e) {
       if (IsNearBranchOutOfRange(e)) {
         throw;  // Emitted again with long-range branches.
@@ -416,6 +773,14 @@ bool A64Emitter::Emit(hir::HIRBuilder* builder, size_t stack_size,
   // LITERAL POOL
   // ========================================================================
   if (!FlushV128ConstPool(false)) {
+    return false;
+  }
+
+  // Never publish machine code with unresolved xbyak labels (an unbound
+  // forward branch stays encoded as offset +0, e.g. `b.ne .+0` infinite loop).
+  if (hasUndefinedLabel()) {
+    XELOGE("A64: unresolved label(s) after emitting guest function {:08X}",
+           current_guest_function_);
     return false;
   }
 
@@ -450,6 +815,49 @@ void* A64Emitter::Emplace(const EmitFunctionInfo& func_info,
         new_execute_address, new_write_address);
   }
 
+  if (function && !pending_direct_calls_.empty()) {
+    const uintptr_t base_rx = reinterpret_cast<uintptr_t>(new_execute_address);
+    for (const auto& entry : pending_direct_calls_) {
+      const uintptr_t call_site_rx = base_rx + entry.branch_code_offset;
+      const uintptr_t tail_stub_rx =
+          entry.stub_code_offset != SIZE_MAX
+              ? (base_rx + entry.stub_code_offset)
+              : 0;
+      uint32_t* rw_slot = code_cache_->WriteSlotForExecuteAddress(call_site_rx);
+      if (!rw_slot) {
+        continue;
+      }
+      const uint32_t original_stub_insn = *rw_slot;
+      code_cache_->RegisterDirectCallSite(entry.target_guest_addr, call_site_rx,
+                                          original_stub_insn, entry.is_tail,
+                                          tail_stub_rx);
+      if (entry.target_fn) {
+        uint8_t* target_code =
+            static_cast<A64Function*>(entry.target_fn)->machine_code();
+        if (target_code) {
+          code_cache_->BackpatchDirectCallSites(entry.target_guest_addr,
+                                                target_code);
+        }
+      }
+    }
+  }
+
+  if (function && !pending_indirect_call_pics_.empty()) {
+    const uintptr_t base_rx = reinterpret_cast<uintptr_t>(new_execute_address);
+    for (const auto& entry : pending_indirect_call_pics_) {
+      if (entry.fallback_code_offset == SIZE_MAX) {
+        continue;
+      }
+      code_cache_->RegisterIndirectCallPicSite(
+          base_rx + entry.gate_code_offset,
+          base_rx + entry.cmp_lo_code_offset,
+          base_rx + entry.cmp_hi_code_offset,
+          base_rx + entry.call_op_code_offset,
+          base_rx + entry.fallback_code_offset, entry.is_tail,
+          function->address());
+    }
+  }
+
   // In xbyak_aarch64, labels are resolved at define time (backpatching),
   // so all relative offsets are already correct. We just need to reset
   // the codegen state for the next function.
@@ -461,6 +869,8 @@ void* A64Emitter::Emplace(const EmitFunctionInfo& func_info,
 void A64Emitter::ResetPerFunctionState() {
   reset();
   tail_code_.clear();
+  pending_direct_calls_.clear();
+  pending_indirect_call_pics_.clear();
 
   // Clean up cached labels.
   epilog_label_ = nullptr;
@@ -599,6 +1009,128 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   const bool rewritable = processor()->dynamic_code_enabled() &&
                           code_cache_->has_indirection_table() &&
                           !code_cache_->HasIndirectionSlot(function->address());
+  if (cvars::a64_direct_calls && !rewritable &&
+      code_cache_->has_indirection_table() &&
+      code_cache_->HasIndirectionSlot(function->address())) {
+    const uint32_t target_guest_addr = function->address();
+    const bool is_tail = (instr->flags & hir::CALL_TAIL) != 0;
+    const bool encoded_indirection = code_cache_->encoded_indirection();
+    if (!is_tail) {
+      const uint64_t patch_thunk =
+          reinterpret_cast<uint64_t>(backend()->patch_direct_call_thunk());
+      const size_t call_idx = pending_direct_calls_.size();
+      Label& tail_stub_label = AddToTail(
+          [call_idx, target_guest_addr, patch_thunk, encoded_indirection](
+              A64Emitter& e, Label&) {
+            e.SetPendingDirectCallStubOffset(call_idx, e.getSize());
+            Label do_patch;
+            // Entry instruction is patched to NOP if target is > +-128 MiB so
+            // subsequent calls bypass PatchDirectCallThunk via indirection.
+            e.CodeGenerator::b(do_patch);
+
+            e.mov(e.w16, target_guest_addr);
+            if (!encoded_indirection) {
+              e.ldr(e.w9, ptr(e.x16, static_cast<uint32_t>(0)));
+            } else {
+              Label external_target;
+              Label indirection_ready;
+
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   indirection_table_base_bias))));
+              e.add(e.x14, e.x14, e.w16, UXTW);
+              e.ldr(e.w9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.tbnz(e.w9, 31, external_target);
+
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   code_cache_execute_base))));
+              e.add(e.x9, e.x14, e.w9, UXTW);
+              e.CodeGenerator::b(indirection_ready);
+
+              e.L(external_target);
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   external_indirection_table_base))));
+              e.lsl(e.x15, e.x15, 3);
+              e.add(e.x14, e.x14, e.x15);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+
+              e.L(indirection_ready);
+            }
+            e.br(e.x9);
+
+            e.L(do_patch);
+            e.mov(e.w16, target_guest_addr);
+            e.mov(e.x9, patch_thunk);
+            e.br(e.x9);
+          });
+      ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
+      const size_t branch_code_offset = getSize();
+      bl(tail_stub_label);
+      synchronize_stack_on_next_instruction_ = true;
+      pending_direct_calls_.push_back(
+          {branch_code_offset, SIZE_MAX, target_guest_addr, function, false});
+    } else {
+      Label& tail_stub_label = AddToTail(
+          [target_guest_addr, encoded_indirection](A64Emitter& e, Label&) {
+            e.mov(e.w16, target_guest_addr);
+            if (!encoded_indirection) {
+              e.ldr(e.w9, ptr(e.x16, static_cast<uint32_t>(0)));
+            } else {
+              Label external_target;
+              Label indirection_ready;
+
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   indirection_table_base_bias))));
+              e.add(e.x14, e.x14, e.w16, UXTW);
+              e.ldr(e.w9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.tbnz(e.w9, 31, external_target);
+
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   code_cache_execute_base))));
+              e.add(e.x9, e.x14, e.w9, UXTW);
+              e.CodeGenerator::b(indirection_ready);
+
+              e.L(external_target);
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   external_indirection_table_base))));
+              e.lsl(e.x15, e.x15, 3);
+              e.add(e.x14, e.x14, e.x15);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+
+              e.L(indirection_ready);
+            }
+            e.br(e.x9);
+          });
+      PopStackpoint();
+      ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+      ldr(x30, ptr(sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
+      if (stack_size() <= 4095) {
+        add(sp, sp, static_cast<uint32_t>(stack_size()));
+      } else {
+        mov(x17, static_cast<uint64_t>(stack_size()));
+        add(sp, sp, x17, UXTX);
+      }
+      const size_t branch_code_offset = getSize();
+      b(tail_stub_label);
+      pending_direct_calls_.push_back(
+          {branch_code_offset, SIZE_MAX, target_guest_addr, function, true});
+    }
+    return;
+  }
+
   if (fn->machine_code() && !rewritable) {
     // Direct call — function is already compiled.
     mov(x9, reinterpret_cast<uint64_t>(fn->machine_code()));
@@ -700,6 +1232,180 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
     ldr(w0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
     cmp(target_w, w0);
     b(EQ, epilog_label());
+  }
+
+  // 1-slot monomorphic PIC for virtual/indirect calls (bctrl) using 2-stage
+  // 1-word atomic CMODX publication (gate: b pic_miss_stub -> NOP).
+  // Tail indirect calls (bctr) stay on the standard tail-call path so dynamic
+  // code enabled later (EnableDynamicCode) never enters dynamic lookup after
+  // popping the current stack frame and stackpoint.
+  const bool is_tail_call = (instr->flags & hir::CALL_TAIL) != 0;
+  if (cvars::a64_indirect_call_pic && !is_tail_call &&
+      !(instr->flags & hir::CALL_POSSIBLE_RETURN) &&
+      code_cache_->has_indirection_table() && near_branches_) {
+    if (target_w.getIdx() != w16.getIdx()) {
+      mov(w16, target_w);
+    }
+    Label& gate_label = NewCachedLabel();
+    Label& pic_done = NewCachedLabel();
+    const size_t pic_idx = pending_indirect_call_pics_.size();
+    const bool dynamic_code = processor()->dynamic_code_enabled();
+    const bool encoded_indirection = code_cache_->encoded_indirection();
+    const uint64_t patch_pic_thunk =
+        reinterpret_cast<uint64_t>(backend()->patch_indirect_call_pic_thunk());
+    const uint64_t resolve_thunk =
+        reinterpret_cast<uint64_t>(backend()->resolve_function_thunk());
+
+    Label& pic_fallback_lookup = AddToTail(
+        [pic_idx, &pic_done, is_tail_call, dynamic_code, encoded_indirection,
+         resolve_thunk](A64Emitter& e, Label&) {
+          e.SetPendingIndirectCallPicFallbackOffset(pic_idx, e.getSize());
+          Label* target_ready = nullptr;
+          if (dynamic_code) {
+            target_ready = &e.NewCachedLabel();
+            Label& resolve_natively = e.NewCachedLabel();
+            e.mov(e.w14, e.code_cache_->indirection_guest_base());
+            e.sub(e.w14, e.w16, e.w14);
+            e.mov(e.w15, e.code_cache_->indirection_guest_size());
+            e.cmp(e.w14, e.w15);
+            e.b(HS, resolve_natively);
+
+            if (!encoded_indirection) {
+              e.ldr(e.w9, ptr(e.x16, static_cast<uint32_t>(0)));
+            } else {
+              Label external_target;
+              Label indirection_ready;
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   indirection_table_base_bias))));
+              e.add(e.x14, e.x14, e.w16, UXTW);
+              e.ldr(e.w9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.tbnz(e.w9, 31, external_target);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   code_cache_execute_base))));
+              e.add(e.x9, e.x14, e.w9, UXTW);
+              e.CodeGenerator::b(indirection_ready);
+              e.L(external_target);
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   external_indirection_table_base))));
+              e.lsl(e.x15, e.x15, 3);
+              e.add(e.x14, e.x14, e.x15);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.L(indirection_ready);
+            }
+            e.CodeGenerator::b(*target_ready);
+
+            e.L(resolve_natively);
+            e.EmitDynamicCallLookup(is_tail_call);
+            e.L(*target_ready);
+          } else {
+            Label uncovered;
+            Label slot_ready;
+            if (e.code_cache_->indirection_guest_base() == 0x80000000u &&
+                e.code_cache_->indirection_guest_size() == 0x1FFFFFFFu) {
+              e.eor(e.w14, e.w16, 0x80000000u);
+              e.tst(e.w14, 0xE0000000u);
+              e.b_near(NE, uncovered);
+            } else {
+              e.mov(e.w14, e.code_cache_->indirection_guest_base());
+              e.sub(e.w14, e.w16, e.w14);
+              e.mov(e.w15, e.code_cache_->indirection_guest_size());
+              e.cmp(e.w14, e.w15);
+              e.b_near(HS, uncovered);
+            }
+            if (!encoded_indirection) {
+              e.ldr(e.w9, ptr(e.x16, static_cast<uint32_t>(0)));
+            } else {
+              Label external_target;
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   indirection_table_base_bias))));
+              e.add(e.x14, e.x14, e.w16, UXTW);
+              e.ldr(e.w9, ptr(e.x14, static_cast<uint32_t>(0)));
+              e.tbnz(e.w9, 31, external_target);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   code_cache_execute_base))));
+              e.add(e.x9, e.x14, e.w9, UXTW);
+              e.CodeGenerator::b(slot_ready);
+              e.L(external_target);
+              e.and_(e.w15, e.w9, A64CodeCache::kIndirectionExternalIndexMask);
+              e.ldr(e.x14,
+                    ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                   A64BackendContext,
+                                   external_indirection_table_base))));
+              e.lsl(e.x15, e.x15, 3);
+              e.add(e.x14, e.x14, e.x15);
+              e.ldr(e.x9, ptr(e.x14, static_cast<uint32_t>(0)));
+            }
+            e.CodeGenerator::b(slot_ready);
+            e.L(uncovered);
+            e.mov(e.x9, resolve_thunk);
+            e.L(slot_ready);
+          }
+          if (!is_tail_call) {
+            e.ldr(e.x0, ptr(e.sp, static_cast<uint32_t>(
+                                      StackLayout::GUEST_CALL_RET_ADDR)));
+            e.adr(e.x30, pic_done);
+          }
+          e.br(e.x9);
+        });
+
+    Label& pic_miss_stub = AddToTail(
+        [&gate_label, &pic_done, is_tail_call, patch_pic_thunk](A64Emitter& e,
+                                                                Label&) {
+          if (!is_tail_call) {
+            e.adr(e.x30, pic_done);
+          }
+          e.adr(e.x17, gate_label);
+          e.mov(e.x9, patch_pic_thunk);
+          e.br(e.x9);
+        });
+
+    if (is_tail_call) {
+      PopStackpoint();
+      ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_RET_ADDR)));
+      ldr(x30, ptr(sp, static_cast<uint32_t>(StackLayout::HOST_RET_ADDR)));
+      if (stack_size() <= 4095) {
+        add(sp, sp, static_cast<uint32_t>(stack_size()));
+      } else {
+        mov(x17, static_cast<uint64_t>(stack_size()));
+        add(sp, sp, x17, UXTX);
+      }
+    } else {
+      ldr(x0, ptr(sp, static_cast<uint32_t>(StackLayout::GUEST_CALL_RET_ADDR)));
+    }
+
+    L(gate_label);
+    const size_t gate_code_offset = getSize();
+    CodeGenerator::b(pic_miss_stub);
+    const size_t cmp_lo_code_offset = getSize();
+    movz(w14, 0);
+    const size_t cmp_hi_code_offset = getSize();
+    movk(w14, 0, 16);
+    cmp(w16, w14);
+    b_near(NE, pic_fallback_lookup);
+    const size_t call_op_code_offset = getSize();
+    if (is_tail_call) {
+      CodeGenerator::b(pic_fallback_lookup);
+    } else {
+      CodeGenerator::bl(pic_fallback_lookup);
+      L(pic_done);
+      synchronize_stack_on_next_instruction_ = true;
+    }
+
+    pending_indirect_call_pics_.push_back(
+        {gate_code_offset, cmp_lo_code_offset, cmp_hi_code_offset,
+         call_op_code_offset, SIZE_MAX, is_tail_call});
+    return;
   }
 
   // Load host code address from indirection table.
@@ -886,6 +1592,9 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
     auto extern_function = static_cast<const GuestFunction*>(function);
     if (extern_function->extern_handler()) {
       undefined = false;
+      if (TryEmitInlineHleSync(extern_function, thunk_offset)) {
+        return;
+      }
       // GuestToHostThunk: x0=target, x1=arg0
       mov(x0, reinterpret_cast<uint64_t>(extern_function->extern_handler()));
       ldr(x1, ptr(GetContextReg(), static_cast<int32_t>(offsetof(
@@ -899,6 +1608,282 @@ void A64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
     mov(x1, reinterpret_cast<uint64_t>(function));
     CallNativeSafe(reinterpret_cast<void*>(&UndefinedCallExtern));
   }
+}
+
+bool A64Emitter::TryEmitInlineHleSync(const GuestFunction* extern_function,
+                                      uint32_t thunk_offset) {
+  const Export* exp = extern_function->export_data();
+  if (!exp || !exp->name) {
+    return false;
+  }
+  ExportResolver* resolver = processor_ ? processor_->export_resolver() : nullptr;
+  const InlineHleSyncKind kind = ClassifyInlineHleSync(exp->name);
+  const bool census_active = resolver && resolver->hle_census_active();
+  const bool log_hf =
+      resolver && resolver->log_high_frequency_kernel_calls();
+  const bool logging_active = IsInlineHleSyncLoggingActive(
+      exp->tags, ExportTag::kLog, ExportTag::kLogResult,
+      ExportTag::kHighFrequency, log_hf);
+  const ExportTrampoline wake_fn =
+      resolver ? resolver->rtl_leave_cs_wake_trampoline() : nullptr;
+  if (!ShouldEmitInlineHleSync(cvars::a64_inline_hle_sync, census_active,
+                               logging_active, wake_fn != nullptr, kind)) {
+    return false;
+  }
+  static std::atomic<bool> logged_first_inline_hle_sync{false};
+  if (!logged_first_inline_hle_sync.exchange(true, std::memory_order_relaxed)) {
+    XELOGI("A64Emitter: inline HLE sync fast-path active (first export={})",
+           exp->name);
+  }
+
+  constexpr int32_t r3_off = static_cast<int32_t>(offsetof(ppc::PPCContext, r[3]));
+  constexpr int32_t r4_off = static_cast<int32_t>(offsetof(ppc::PPCContext, r[4]));
+  constexpr int32_t r13_off = static_cast<int32_t>(offsetof(ppc::PPCContext, r[13]));
+  const bool gran_shift_guard = xe::memory::allocation_granularity() > 0x1000;
+
+  Label slow;
+  Label done;
+
+  auto emit_guest_ptr_guard = [&](const WReg& w_addr, bool require_align4,
+                                  Label& target_slow) {
+    cbz_near(w_addr, target_slow);
+    if (require_align4) {
+      tst(w_addr, 3);
+      b_near(NE, target_slow);
+    }
+    if (gran_shift_guard) {
+      mov(w17, kGuestPhysicalShiftBoundary);
+      cmp(w_addr, w17);
+      b_near(HS, target_slow);
+    }
+  };
+
+  auto emit_fallback_call = [&](void* target_fn) {
+    mov(x0, reinterpret_cast<uint64_t>(target_fn));
+    ldr(x1, ptr(GetContextReg(), static_cast<int32_t>(offsetof(
+                                     ppc::PPCContext, kernel_state))));
+    ldr(x9, ptr(x19, thunk_offset));
+    blr(x9);
+  };
+
+  switch (kind) {
+    case InlineHleSyncKind::kKeRaiseIrqlToDpcLevel: {
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, false, slow);
+      add(x3, x21, w1, UXTW);
+      ldrb(w0, ptr(x3, kKpcrCurrentIrqlOffset));
+      cmp(w0, 2);
+      b_near(HI, slow);
+      mov(w2, 2);
+      strb(w2, ptr(x3, kKpcrCurrentIrqlOffset));
+      str(x0, ptr(x20, r3_off));
+      b(done);
+      break;
+    }
+    case InlineHleSyncKind::kKfLowerIrql: {
+      ldrb(w0, ptr(x20, r3_off));
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, false, slow);
+      add(x3, x21, w1, UXTW);
+      ldrb(w2, ptr(x3, kKpcrCurrentIrqlOffset));
+      cmp(w0, w2);
+      b_near(HI, slow);
+      strb(w0, ptr(x3, kKpcrCurrentIrqlOffset));
+      b(done);
+      break;
+    }
+    case InlineHleSyncKind::kRtlEnterCriticalSection:
+    case InlineHleSyncKind::kRtlTryEnterCriticalSection: {
+      const bool is_try =
+          kind == InlineHleSyncKind::kRtlTryEnterCriticalSection;
+      Label cas_retry;
+      Label check_recursive;
+      Label rec_retry;
+      Label contended;
+
+      ldr(w0, ptr(x20, r3_off));
+      emit_guest_ptr_guard(w0, true, slow);
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, true, slow);
+      add(x2, x21, w0, UXTW);
+      add(x3, x21, w1, UXTW);
+      ldr(w4, ptr(x3, kKpcrCurrentThreadOffset));
+      cbz_near(w4, slow);
+
+      add(x14, x2, kRtlCsLockCountOffset);
+      mov(w15, static_cast<uint32_t>(-1));
+      L(cas_retry);
+      ldaxr(w16, ptr(x14));
+      cmp(w16, w15);
+      b_near(NE, check_recursive);
+      stlxr(w17, wzr, ptr(x14));
+      cbnz_near(w17, cas_retry);
+
+      mov(w16, 0x01000000u);
+      str(w16, ptr(x2, kRtlCsRecursionCountOffset));
+      str(w4, ptr(x2, kRtlCsOwningThreadOffset));
+      if (is_try) {
+        mov(x16, 1);
+        str(x16, ptr(x20, r3_off));
+      }
+      b(done);
+
+      L(check_recursive);
+      clrex(15);
+      ldr(w16, ptr(x2, kRtlCsOwningThreadOffset));
+      cmp(w16, w4);
+      b_near(NE, is_try ? contended : slow);
+
+      L(rec_retry);
+      ldaxr(w16, ptr(x14));
+      add(w16, w16, 1);
+      stlxr(w17, w16, ptr(x14));
+      cbnz_near(w17, rec_retry);
+      ldr(w16, ptr(x2, kRtlCsRecursionCountOffset));
+      rev(w16, w16);
+      add(w16, w16, 1);
+      rev(w16, w16);
+      str(w16, ptr(x2, kRtlCsRecursionCountOffset));
+      if (is_try) {
+        mov(x16, 1);
+        str(x16, ptr(x20, r3_off));
+      }
+      b(done);
+
+      if (is_try) {
+        L(contended);
+        str(xzr, ptr(x20, r3_off));
+        b(done);
+      }
+      break;
+    }
+    case InlineHleSyncKind::kRtlLeaveCriticalSection: {
+      Label recursive_leave;
+      Label dec_retry;
+      Label rec_dec_retry;
+
+      ldr(w0, ptr(x20, r3_off));
+      emit_guest_ptr_guard(w0, true, slow);
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, true, slow);
+      add(x2, x21, w0, UXTW);
+      add(x3, x21, w1, UXTW);
+      ldr(w4, ptr(x3, kKpcrCurrentThreadOffset));
+      cbz_near(w4, slow);
+
+      ldr(w15, ptr(x2, kRtlCsOwningThreadOffset));
+      cmp(w15, w4);
+      b_near(NE, slow);
+
+      ldr(w15, ptr(x2, kRtlCsRecursionCountOffset));
+      add(x14, x2, kRtlCsLockCountOffset);
+      mov(w16, 0x01000000u);
+      cmp(w15, w16);
+      b_near(NE, recursive_leave);
+
+      str(wzr, ptr(x2, kRtlCsRecursionCountOffset));
+      str(wzr, ptr(x2, kRtlCsOwningThreadOffset));
+      L(dec_retry);
+      ldaxr(w15, ptr(x14));
+      sub(w15, w15, 1);
+      stlxr(w17, w15, ptr(x14));
+      cbnz_near(w17, dec_retry);
+      cmn(w15, 1);
+      b_near(EQ, done);
+
+      emit_fallback_call(reinterpret_cast<void*>(wake_fn));
+      b(done);
+
+      L(recursive_leave);
+      rev(w15, w15);
+      cmp(w15, 1);
+      b_near(LE, slow);
+      sub(w15, w15, 1);
+      rev(w15, w15);
+      str(w15, ptr(x2, kRtlCsRecursionCountOffset));
+      L(rec_dec_retry);
+      ldaxr(w15, ptr(x14));
+      sub(w15, w15, 1);
+      stlxr(w17, w15, ptr(x14));
+      cbnz_near(w17, rec_dec_retry);
+      b(done);
+      break;
+    }
+    case InlineHleSyncKind::kKeAcquireSpinLockAtRaisedIrql:
+    case InlineHleSyncKind::kKfAcquireSpinLock: {
+      const bool change_irql = kind == InlineHleSyncKind::kKfAcquireSpinLock;
+      Label spin_retry;
+      Label spin_contended;
+
+      ldr(w0, ptr(x20, r3_off));
+      emit_guest_ptr_guard(w0, true, slow);
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, false, slow);
+      add(x2, x21, w0, UXTW);
+      if (change_irql) {
+        add(x3, x21, w1, UXTW);
+        ldrb(w4, ptr(x3, kKpcrCurrentIrqlOffset));
+        cmp(w4, 2);
+        b_near(HI, slow);
+      }
+      rev(w14, w1);
+      L(spin_retry);
+      ldaxr(w15, ptr(x2));
+      cbnz_near(w15, spin_contended);
+      stlxr(w17, w14, ptr(x2));
+      cbnz_near(w17, spin_retry);
+
+      if (change_irql) {
+        mov(w16, 2);
+        strb(w16, ptr(x3, kKpcrCurrentIrqlOffset));
+        str(x4, ptr(x20, r3_off));
+      }
+      b(done);
+
+      L(spin_contended);
+      clrex(15);
+      break;
+    }
+    case InlineHleSyncKind::kKeReleaseSpinLockFromRaisedIrql:
+    case InlineHleSyncKind::kKfReleaseSpinLock: {
+      const bool change_irql = kind == InlineHleSyncKind::kKfReleaseSpinLock;
+      Label skip_irql;
+
+      ldr(w0, ptr(x20, r3_off));
+      emit_guest_ptr_guard(w0, true, slow);
+      ldr(w1, ptr(x20, r13_off));
+      emit_guest_ptr_guard(w1, false, slow);
+      add(x2, x21, w0, UXTW);
+      ldr(w15, ptr(x2));
+      rev(w16, w1);
+      cmp(w15, w16);
+      b_near(NE, slow);
+
+      if (change_irql) {
+        ldr(w4, ptr(x20, r4_off));
+        cmp(w4, 2);
+        b_near(HS, skip_irql);
+        add(x3, x21, w1, UXTW);
+        ldrb(w14, ptr(x3, kKpcrCurrentIrqlOffset));
+        cmp(w4, w14);
+        b_near(HI, slow);
+        stlr(wzr, ptr(x2));
+        strb(w4, ptr(x3, kKpcrCurrentIrqlOffset));
+        b(done);
+        L(skip_irql);
+      }
+      stlr(wzr, ptr(x2));
+      b(done);
+      break;
+    }
+    case InlineHleSyncKind::kNone:
+      return false;
+  }
+
+  L(slow);
+  emit_fallback_call(reinterpret_cast<void*>(extern_function->extern_handler()));
+  L(done);
+  return true;
 }
 
 void A64Emitter::EmitDynamicCallLookup(bool tail, bool direct) {
@@ -1045,11 +2030,22 @@ bool A64Emitter::ChangeFpcrMode(FPCRMode new_mode, bool already_set) {
 }
 
 Label& A64Emitter::AddToTail(TailEmitCallback callback, uint32_t alignment) {
+  // Allocate a heap-stable Label in label_cache_ rather than returning a
+  // reference to tail_code_.back().label: tail_code_ is a std::vector that
+  // reallocates whenever a second AddToTail() runs before the first Label& is
+  // used (e.g. CallIndirect PIC registering pic_fallback_lookup followed by
+  // pic_miss_stub). A dangling Label& writes a fresh id into freed memory and
+  // leaves `b.ne pic_fallback_lookup` permanently unbound as `b.ne .+0`.
+  Label& stable_label = NewCachedLabel();
   TailEmitter tail;
   tail.alignment = alignment;
-  tail.func = std::move(callback);
+  tail.func = [cb = std::move(callback), &stable_label](A64Emitter& e,
+                                                        Label&) {
+    e.L(stable_label);
+    cb(e, stable_label);
+  };
   tail_code_.push_back(std::move(tail));
-  return tail_code_.back().label;
+  return stable_label;
 }
 
 Label& A64Emitter::NewCachedLabel() {
@@ -1197,7 +2193,8 @@ void A64Emitter::HandleStackpointOverflowError(ppc::PPCContext* context) {
 }
 
 void A64Emitter::PushStackpoint() {
-  if (!cvars::a64_enable_host_guest_stack_synchronization) {
+  if (!cvars::a64_enable_host_guest_stack_synchronization ||
+      !uses_stackpoints_) {
     return;
   }
   // x8 = stackpoints array, w9 = current depth
@@ -1242,7 +2239,8 @@ void A64Emitter::PushStackpoint() {
 }
 
 void A64Emitter::PopStackpoint() {
-  if (!cvars::a64_enable_host_guest_stack_synchronization) {
+  if (!cvars::a64_enable_host_guest_stack_synchronization ||
+      !uses_stackpoints_) {
     return;
   }
   // Decrement current_stackpoint_depth.
@@ -1295,6 +2293,295 @@ void A64Emitter::EnsureSynchronizedGuestAndHostStack() {
   b(sync_label);
 
   L(return_from_sync);
+}
+
+void A64Emitter::EmitLoadPinnedSlots(const hir::LoopPromotionRegion& region) {
+  for (const auto& s : region.slots) {
+    if (s.is_vec) {
+      ldr(QReg(vec_reg_map_[s.host_reg_index]), ptr(x20, s.offset));
+    } else if (s.is_float) {
+      ldr(DReg(vec_reg_map_[s.host_reg_index]), ptr(x20, s.offset));
+    } else {
+      ldr(XReg(gpr_reg_map_[s.host_reg_index]), ptr(x20, s.offset));
+    }
+  }
+}
+
+void A64Emitter::EmitStorePinnedSlots(const hir::LoopPromotionRegion& region,
+                                      uint32_t slot_mask) {
+  for (size_t idx = 0; idx < region.slots.size(); ++idx) {
+    if (!(slot_mask & (1u << idx))) {
+      continue;
+    }
+    const auto& s = region.slots[idx];
+    if (s.is_vec) {
+      str(QReg(vec_reg_map_[s.host_reg_index]), ptr(x20, s.offset));
+    } else if (s.is_float) {
+      str(DReg(vec_reg_map_[s.host_reg_index]), ptr(x20, s.offset));
+    } else {
+      str(XReg(gpr_reg_map_[s.host_reg_index]), ptr(x20, s.offset));
+    }
+  }
+}
+
+namespace {
+
+bool IsMovi64ImmLocal(uint64_t value) {
+  if (value == 0 || value == ~uint64_t(0)) {
+    return true;
+  }
+  for (int shift = 0; shift < 8; ++shift) {
+    const uint8_t shift_u8 = static_cast<uint8_t>(value >> (shift * 8));
+    if (shift_u8 != 0 && shift_u8 != 0xFF) {
+      return false;
+    }
+  }
+  return true;
+}
+
+constexpr bool IsFmov32ImmLocal(float f32) {
+  const uint32_t u32 = std::bit_cast<uint32_t, float>(f32);
+  int32_t exp = ((u32 >> 23) & 0xff) - 127;
+  int64_t mantissa = u32 & 0x7fffff;
+  if (mantissa & 0x7ffff) {
+    return false;
+  }
+  if (exp < -3 || exp > 4) {
+    return false;
+  }
+  mantissa >>= 19;
+  return (mantissa & 0b1111) == mantissa;
+}
+
+constexpr bool IsFmov64ImmLocal(double f64) {
+  const uint64_t u64 = std::bit_cast<uint64_t, double>(f64);
+  int32_t exp = ((u64 >> 52) & 0x7ff) - 1023;
+  int64_t mantissa = u64 & 0xfffffffffffffULL;
+  if (mantissa & 0xffffffffffffULL) {
+    return false;
+  }
+  if (exp < -3 || exp > 4) {
+    return false;
+  }
+  mantissa >>= 48;
+  return (mantissa & 0b1111) == mantissa;
+}
+
+void LoadV128ConstLocal(A64Emitter& e, int vreg_idx, const vec128_t& val) {
+  if (!val.low && !val.high) {
+    e.movi(VReg2D(vreg_idx), 0);
+    return;
+  } else if (val.low == ~uint64_t(0) && val.high == ~uint64_t(0)) {
+    e.movi(VReg2D(vreg_idx), ~0ULL);
+    return;
+  }
+
+  bool all_equal_u8 = true;
+  const uint8_t splat_u8 = val.u8[0];
+  for (unsigned i = 1; i < 16; ++i) {
+    if (val.u8[i] != splat_u8) {
+      all_equal_u8 = false;
+      break;
+    }
+  }
+  if (all_equal_u8) {
+    e.movi(VReg(vreg_idx).b16, static_cast<uint8_t>(splat_u8));
+    return;
+  }
+
+  bool all_equal_u16 = true;
+  const uint16_t splat_u16 = val.u16[0];
+  for (unsigned i = 1; i < 8; ++i) {
+    if (val.u16[i] != splat_u16) {
+      all_equal_u16 = false;
+      break;
+    }
+  }
+  if (all_equal_u16) {
+    if ((splat_u16 & 0xFF'00) == 0) {
+      e.movi(VReg(vreg_idx).h8, static_cast<uint8_t>(splat_u16 >> 0), LSL, 0);
+    } else if ((splat_u16 & 0x00'FF) == 0) {
+      e.movi(VReg(vreg_idx).h8, static_cast<uint8_t>(splat_u16 >> 8), LSL, 8);
+    } else if ((splat_u16 & 0xFF'00) == 0xFF'00) {
+      e.mvni(VReg(vreg_idx).h8, ~static_cast<uint8_t>(splat_u16 >> 0) & 0xFF,
+             LSL, 0);
+    } else if ((splat_u16 & 0x00'FF) == 0x00'FF) {
+      e.mvni(VReg(vreg_idx).h8, ~static_cast<uint8_t>(splat_u16 >> 8) & 0xFF,
+             LSL, 8);
+    } else {
+      e.ldr(QReg(vreg_idx), e.GetV128ConstLabel(val));
+    }
+    return;
+  }
+
+  bool all_equal_u32 = true;
+  const uint32_t splat_u32 = val.u32[0];
+  const float splat_f32 = val.f32[0];
+  for (unsigned i = 1; i < 4; ++i) {
+    if (val.u32[i] != splat_u32) {
+      all_equal_u32 = false;
+      break;
+    }
+  }
+  if (all_equal_u32) {
+    if ((splat_u32 & 0xFF'FF'FF'00) == 0) {
+      e.movi(VReg(vreg_idx).s4, static_cast<uint8_t>(splat_u32 >> 0), LSL, 0);
+    } else if ((splat_u32 & 0xFF'FF'00'FF) == 0) {
+      e.movi(VReg(vreg_idx).s4, static_cast<uint8_t>(splat_u32 >> 8), LSL, 8);
+    } else if ((splat_u32 & 0xFF'00'FF'FF) == 0) {
+      e.movi(VReg(vreg_idx).s4, static_cast<uint8_t>(splat_u32 >> 16), LSL, 16);
+    } else if ((splat_u32 & 0x00'FF'FF'FF) == 0) {
+      e.movi(VReg(vreg_idx).s4, static_cast<uint8_t>(splat_u32 >> 24), LSL, 24);
+    } else if ((splat_u32 & 0xFF'FF'FF'00) == 0xFF'FF'FF'00) {
+      e.mvni(VReg(vreg_idx).s4, ~static_cast<uint8_t>(splat_u32 >> 0) & 0xFF,
+             LSL, 0);
+    } else if ((splat_u32 & 0xFF'FF'00'FF) == 0xFF'FF'00'FF) {
+      e.mvni(VReg(vreg_idx).s4, ~static_cast<uint8_t>(splat_u32 >> 8) & 0xFF,
+             LSL, 8);
+    } else if ((splat_u32 & 0xFF'00'FF'FF) == 0xFF'00'FF'FF) {
+      e.mvni(VReg(vreg_idx).s4, ~static_cast<uint8_t>(splat_u32 >> 16) & 0xFF,
+             LSL, 16);
+    } else if ((splat_u32 & 0x00'FF'FF'FF) == 0x00'FF'FF'FF) {
+      e.mvni(VReg(vreg_idx).s4, ~static_cast<uint8_t>(splat_u32 >> 24) & 0xFF,
+             LSL, 24);
+    } else if (IsFmov32ImmLocal(splat_f32)) {
+      e.fmov(VReg(vreg_idx).s4, splat_f32);
+    } else {
+      e.ldr(QReg(vreg_idx), e.GetV128ConstLabel(val));
+    }
+    return;
+  }
+
+  const bool all_equal_u64 = val.low == val.high;
+  const double splat_f64 = val.f64[0];
+  if (all_equal_u64) {
+    if (IsMovi64ImmLocal(val.low)) {
+      e.movi(VReg2D(vreg_idx), val.low);
+    } else if (IsFmov64ImmLocal(splat_f64)) {
+      e.fmov(VReg(vreg_idx).d2, splat_f64);
+    } else {
+      e.ldr(QReg(vreg_idx), e.GetV128ConstLabel(val));
+    }
+    return;
+  }
+
+  e.ldr(QReg(vreg_idx), e.GetV128ConstLabel(val));
+}
+
+}  // namespace
+
+bool A64Emitter::TryEmitPinnedContextInstr(
+    const hir::Instr* instr, const hir::LoopPromotionRegion& region) {
+  const hir::Opcode opcode = instr->GetOpcodeNum();
+  if (opcode == hir::OPCODE_LOAD_CONTEXT) {
+    const uint32_t offset = static_cast<uint32_t>(instr->src1.offset);
+    const uint32_t size =
+        static_cast<uint32_t>(hir::GetTypeSize(instr->dest->type));
+    for (const auto& s : region.slots) {
+      if (s.offset != offset || s.size != size) {
+        continue;
+      }
+      if (s.is_vec) {
+        if (instr->dest->type != hir::VEC128_TYPE) {
+          return false;
+        }
+        const uint32_t dst_idx =
+            MapReg(instr->dest, vec_reg_map_, VEC_COUNT, "vec");
+        const uint32_t host_idx = vec_reg_map_[s.host_reg_index];
+        if (dst_idx != host_idx) {
+          orr(VReg(dst_idx).b16, VReg(host_idx).b16, VReg(host_idx).b16);
+        }
+        return true;
+      } else if (s.is_float) {
+        if (instr->dest->type != hir::FLOAT64_TYPE) {
+          return false;
+        }
+        const uint32_t dst_idx =
+            MapReg(instr->dest, vec_reg_map_, VEC_COUNT, "vec");
+        const uint32_t host_idx = vec_reg_map_[s.host_reg_index];
+        if (dst_idx != host_idx) {
+          fmov(DReg(dst_idx), DReg(host_idx));
+        }
+        return true;
+      } else {
+        if (instr->dest->type != hir::INT64_TYPE) {
+          return false;
+        }
+        const uint32_t dst_idx =
+            MapReg(instr->dest, gpr_reg_map_, GPR_COUNT, "gpr");
+        const uint32_t host_idx = gpr_reg_map_[s.host_reg_index];
+        if (dst_idx != host_idx) {
+          mov(XReg(dst_idx), XReg(host_idx));
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (opcode == hir::OPCODE_STORE_CONTEXT) {
+    const uint32_t offset = static_cast<uint32_t>(instr->src1.offset);
+    const hir::Value* val = instr->src2.value;
+    const uint32_t size = static_cast<uint32_t>(hir::GetTypeSize(val->type));
+    for (const auto& s : region.slots) {
+      if (s.offset != offset || s.size != size) {
+        continue;
+      }
+      if (s.is_vec) {
+        if (val->type != hir::VEC128_TYPE) {
+          return false;
+        }
+        const uint32_t host_idx = vec_reg_map_[s.host_reg_index];
+        if (val->IsConstant()) {
+          LoadV128ConstLocal(*this, static_cast<int>(host_idx),
+                             val->constant.v128);
+        } else {
+          const uint32_t src_idx = MapReg(val, vec_reg_map_, VEC_COUNT, "vec");
+          if (src_idx != host_idx) {
+            orr(VReg(host_idx).b16, VReg(src_idx).b16, VReg(src_idx).b16);
+          }
+        }
+        return true;
+      } else if (s.is_float) {
+        if (val->type != hir::FLOAT64_TYPE) {
+          return false;
+        }
+        const uint32_t host_idx = vec_reg_map_[s.host_reg_index];
+        if (val->IsConstant()) {
+          union {
+            double d;
+            uint64_t u;
+          } c;
+          c.d = val->constant.f64;
+          mov(x0, c.u);
+          fmov(DReg(host_idx), x0);
+        } else {
+          const uint32_t src_idx = MapReg(val, vec_reg_map_, VEC_COUNT, "vec");
+          if (src_idx != host_idx) {
+            fmov(DReg(host_idx), DReg(src_idx));
+          }
+        }
+        return true;
+      } else {
+        if (val->type != hir::INT64_TYPE) {
+          return false;
+        }
+        const uint32_t host_idx = gpr_reg_map_[s.host_reg_index];
+        if (val->IsConstant()) {
+          mov(XReg(host_idx), val->constant.u64);
+        } else {
+          const uint32_t src_idx = MapReg(val, gpr_reg_map_, GPR_COUNT, "gpr");
+          if (src_idx != host_idx) {
+            mov(XReg(host_idx), XReg(src_idx));
+          }
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  return false;
 }
 
 }  // namespace a64

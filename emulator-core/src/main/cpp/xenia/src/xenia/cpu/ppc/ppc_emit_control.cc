@@ -11,12 +11,17 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
+#include "xenia/cpu/ppc/ppc_stack_skew_guard.h"
 
 #include <stddef.h>
+#include <vector>
+
+DECLARE_bool(a64_skip_stack_skew_fixup);
 // chrispy: added this, we can have simpler control flow and do dce on the
 // inputs
 DEFINE_bool(ignore_trap_instructions, true,
@@ -72,15 +77,27 @@ static bool TryInlineGprlrSaverest(PPCHIRBuilder& f, uint64_t cia,
     return false;
   }
   Value* r1 = f.LoadGPR(1);
+  const bool allow_skew_flag = cvars::a64_skip_stack_skew_fixup &&
+                               xe::memory::allocation_granularity() > 0x1000;
   if (function->IsSave() && lk && (cvars::inline_gprlr_saverest_parts & 1)) {
     // bl __savegprlr_N: LR <- cia+4 architecturally, though the real return
     // path goes through the r12 slot the restore reloads.
     for (int r = n; r <= 31; ++r) {
-      Value* offset = f.LoadConstantInt64(-0x98 + 8 * (r - 14));
-      f.StoreOffset(r1, offset, f.ByteSwap(f.LoadGPR(r)));
+      const int64_t disp = -0x98 + 8 * (r - 14);
+      Value* offset = f.LoadConstantInt64(disp);
+      const uint32_t flags =
+          (allow_skew_flag && IsSafeStackDispAccess(1, disp, false))
+              ? LOAD_STORE_NO_PHYSICAL_SKEW
+              : 0u;
+      f.StoreOffset(r1, offset, f.ByteSwap(f.LoadGPR(r)), flags);
     }
+    const uint32_t lr_store_flags =
+        (allow_skew_flag && IsSafeStackDispAccess(1, -8, false))
+            ? LOAD_STORE_NO_PHYSICAL_SKEW
+            : 0u;
     f.StoreOffset(r1, f.LoadConstantInt64(-8),
-                  f.ByteSwap(f.Truncate(f.LoadGPR(12), INT32_TYPE)));
+                  f.ByteSwap(f.Truncate(f.LoadGPR(12), INT32_TYPE)),
+                  lr_store_flags);
     f.StoreLR(f.LoadConstantUint64(cia + 4));
     return true;
   }
@@ -89,11 +106,21 @@ static bool TryInlineGprlrSaverest(PPCHIRBuilder& f, uint64_t cia,
     // b __restgprlr_N: reload the frame, then return through the restored LR
     // exactly as a translated blr would.
     for (int r = n; r <= 31; ++r) {
-      Value* offset = f.LoadConstantInt64(-0x98 + 8 * (r - 14));
-      f.StoreGPR(r, f.ByteSwap(f.LoadOffset(r1, offset, INT64_TYPE)));
+      const int64_t disp = -0x98 + 8 * (r - 14);
+      Value* offset = f.LoadConstantInt64(disp);
+      const uint32_t flags =
+          (allow_skew_flag && IsSafeStackDispAccess(1, disp, false))
+              ? LOAD_STORE_NO_PHYSICAL_SKEW
+              : 0u;
+      f.StoreGPR(r, f.ByteSwap(f.LoadOffset(r1, offset, INT64_TYPE, flags)));
     }
+    const uint32_t lr_load_flags =
+        (allow_skew_flag && IsSafeStackDispAccess(1, -8, false))
+            ? LOAD_STORE_NO_PHYSICAL_SKEW
+            : 0u;
     Value* ret = f.ZeroExtend(
-        f.ByteSwap(f.LoadOffset(r1, f.LoadConstantInt64(-8), INT32_TYPE)),
+        f.ByteSwap(f.LoadOffset(r1, f.LoadConstantInt64(-8), INT32_TYPE,
+                                lr_load_flags)),
         INT64_TYPE);
     f.StoreGPR(12, ret);
     f.StoreLR(ret);
@@ -359,6 +386,43 @@ int InstrEmit_bcctrx(PPCHIRBuilder& f, const InstrData& i) {
   // NOTE: the condition bits are reversed!
   // 01234 (docs)
   // 43210 (real)
+
+  if (i.code == 0x4E800420) {
+    const auto* targets = f.function()->LookupJumpTableTargets(i.address);
+    if (targets && !targets->empty()) {
+      const uint32_t func_start = f.function()->address();
+      const uint32_t func_end = f.function()->end_address();
+      bool all_in_bounds = true;
+      for (uint32_t target : *targets) {
+        if ((target & 3u) != 0u || target < func_start || target > func_end) {
+          all_in_bounds = false;
+          break;
+        }
+      }
+      if (all_in_bounds) {
+        std::vector<Label*> labels;
+        labels.reserve(targets->size());
+        bool all_labels_valid = true;
+        for (uint32_t target : *targets) {
+          Label* label = f.LookupLabel(target);
+          if (!label) {
+            all_labels_valid = false;
+            break;
+          }
+          labels.push_back(label);
+        }
+        if (all_labels_valid) {
+          for (size_t idx = 0; idx < targets->size(); ++idx) {
+            Value* ctr = f.Truncate(f.LoadCTR(), INT32_TYPE);
+            Value* target_const = f.LoadConstantUint32((*targets)[idx]);
+            f.BranchTrue(f.CompareEQ(ctr, target_const), labels[idx]);
+          }
+          f.CallIndirect(f.LoadCTR(), CALL_TAIL);
+          return 0;
+        }
+      }
+    }
+  }
 
   Value* cond_ok = NULL;
   bool not_cond_ok = false;

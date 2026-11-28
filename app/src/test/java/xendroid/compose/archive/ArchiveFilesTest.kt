@@ -18,11 +18,31 @@ class ArchiveFilesTest {
     }
     @Test fun traversalAndCaseCollisionsAreRejectedBeforeTheyCanEscape() {
         for (entries in listOf(arrayOf("../outside" to byteArrayOf(1)),
+            arrayOf("..\\outside" to byteArrayOf(1)),
+            arrayOf("/etc/passwd" to byteArrayOf(1)),
+            arrayOf("\\etc\\passwd" to byteArrayOf(1)),
+            arrayOf("C:\\evil" to byteArrayOf(1)),
+            arrayOf("dir/./../outside" to byteArrayOf(1)),
             arrayOf("dir/file" to byteArrayOf(1), "DIR/FILE" to byteArrayOf(2)))) {
             val dest = folder.newFolder()
             assertThrows(IllegalArgumentException::class.java) { ArchiveFiles.unpack(archive(*entries), dest, ArchiveLimits()) }
             assertFalse(File(folder.root, "outside").exists())
         }
+    }
+    @Test fun backslashSeparatorsAndLeadingDotSlashEntriesUnpackCleanly() {
+        val f = folder.newFile().also { file ->
+            ZipOutputStream(file.outputStream()).use { zip ->
+                zip.putNextEntry(ZipEntry("./")); zip.closeEntry()
+                zip.putNextEntry(ZipEntry("sub\\")); zip.closeEntry()
+                zip.putNextEntry(ZipEntry("./meta.json")); zip.write("{}".toByteArray()); zip.closeEntry()
+                zip.putNextEntry(ZipEntry("sub\\file.bin")); zip.write(byteArrayOf(7, 8)); zip.closeEntry()
+            }
+        }
+        val dest = folder.newFolder()
+        val unpacked = ArchiveFiles.unpack(f, dest, ArchiveLimits())
+        assertEquals(2, unpacked.size)
+        assertEquals("{}", File(dest, "meta.json").readText())
+        assertArrayEquals(byteArrayOf(7, 8), File(dest, "sub/file.bin").readBytes())
     }
     @Test fun actualDecodedBytesAndEntryCountAreBounded() {
         val archive = archive("large" to ByteArray(4096))

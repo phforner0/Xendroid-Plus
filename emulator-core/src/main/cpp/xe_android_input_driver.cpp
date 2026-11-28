@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 #include "xe_jit_frame_start.h"
+#include "xe_pad_script.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/frame_stats.h"
 #include "xenia/base/logging.h"
@@ -285,6 +287,34 @@ X_RESULT AndroidInputDriver::GetState(uint32_t user_index,
         default:
           break;
       }
+    }
+  }
+
+  if (user_index == 0) {
+    bool script_active = false;
+    uint16_t script_buttons = 0;
+    float script_axes[6] = {};
+    xendroid::PadScriptSnapshot(script_active, script_buttons, script_axes);
+    if (script_active) {
+      buttons |= script_buttons;
+      auto to_i16 = [](float v) -> int16_t {
+        const float clamped = std::clamp(v, -1.0f, 1.0f);
+        return clamped >= 0.0f ? int16_t(clamped * 32767.0f)
+                               : int16_t(clamped * 32768.0f);
+      };
+      if (std::abs(script_axes[0]) > 0.02f) thumb_lx = to_i16(script_axes[0]);
+      if (std::abs(script_axes[1]) > 0.02f) thumb_ly = to_i16(script_axes[1]);
+      if (std::abs(script_axes[2]) > 0.02f) thumb_rx = to_i16(script_axes[2]);
+      if (std::abs(script_axes[3]) > 0.02f) thumb_ry = to_i16(script_axes[3]);
+      if (script_axes[4] > 0.02f) {
+        left_trigger = uint8_t(std::clamp(script_axes[4], 0.0f, 1.0f) * 255.0f);
+      }
+      if (script_axes[5] > 0.02f) {
+        right_trigger = uint8_t(std::clamp(script_axes[5], 0.0f, 1.0f) * 255.0f);
+      }
+    } else {
+      xendroid::PadRecordObserve(buttons, thumb_lx, thumb_ly, thumb_rx,
+                                 thumb_ry, left_trigger, right_trigger);
     }
   }
 

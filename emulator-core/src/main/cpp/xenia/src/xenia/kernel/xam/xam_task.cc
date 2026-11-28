@@ -45,25 +45,46 @@ dword_result_t XamTaskSchedule_entry(lpvoid_t callback,
                                      dword_t optional_ptr, lpdword_t handle_ptr,
                                      const ppc_context_t& ctx) {
   // TODO(gibbed): figure out what this is for
-  *handle_ptr = 12345;
-
-  if (optional_ptr) {
-    auto option = ctx->TranslateVirtual<XAM_TASK_ARGS*>(optional_ptr);
-
-    auto v1 = option->flags;
-    auto v2 = option->value2;  // typically 0?
-
-    XELOGI("Got xam task args: v1 = {:08X}, v2 = {:08X}", v1.get(), v2.get());
+  if (handle_ptr) {
+    *handle_ptr = 12345;
   }
 
-  uint32_t stack_size = kernel_state()->GetExecutableModule()->stack_size();
+  uint32_t task_flags = 0;
+  if (optional_ptr) {
+    auto option = ctx->TranslateVirtual<XAM_TASK_ARGS*>(optional_ptr);
+    if (option) {
+      task_flags = option->flags;
+      auto v2 = option->value2;  // typically 0?
+
+      XELOGI("Got xam task args: v1 = {:08X}, v2 = {:08X}", task_flags,
+             v2.get());
+    }
+  }
+
+  auto exe_module = kernel_state()->GetExecutableModule();
+  uint32_t stack_size = exe_module ? exe_module->stack_size() : 0x4000;
 
   // Stack must be aligned to 16kb pages
   stack_size = std::max((uint32_t)0x4000, ((stack_size + 0xFFF) & 0xFFFFF000));
 
+  uint32_t system_flags = 0;
+  if (exe_module) {
+    exe_module->GetOptHeader(XEX_HEADER_SYSTEM_FLAGS, &system_flags);
+  }
+  const bool foreground_task =
+      ((task_flags & 2u) != 0) ||
+      ((system_flags & XEX_SYSTEM_FOREGROUND_TASKS) != 0);
+
+  // Schedule XAM tasks on CPU 5 (AffinityCpu5 = 0x20000000). Create suspended
+  // when promoting to title priority so the thread does not start at system
+  // priority before its priority class and base priority are updated.
+  constexpr uint32_t kXamTaskCpu5Flag = 0x20000000u;
+  const uint32_t creation_flags =
+      kXamTaskCpu5Flag | (foreground_task ? X_CREATE_SUSPENDED : 0u);
+
   auto thread = object_ref<XThread>(new XThread(
-      kernel_state(), stack_size, 0, callback, message.guest_address(), 0, true,
-      false, kernel_state()->GetSystemProcess()));
+      kernel_state(), stack_size, 0, callback, message.guest_address(),
+      creation_flags, true, false, kernel_state()->GetSystemProcess()));
 
   X_STATUS result = thread->Create();
 
@@ -71,6 +92,32 @@ dword_result_t XamTaskSchedule_entry(lpvoid_t callback,
     // Failed!
     XELOGE("XAM task creation failed: {:08X}", result);
     return result;
+  }
+
+  if (foreground_task) {
+    const uint32_t title_process_addr = kernel_state()->GetTitleProcess();
+    auto* title_process =
+        title_process_addr
+            ? kernel_state()->memory()->TranslateVirtual<X_KPROCESS*>(
+                  title_process_addr)
+            : nullptr;
+    auto* kthread = thread->guest_object<X_KTHREAD>();
+    if (title_process && kthread) {
+      kthread->process_priority_class = title_process->process_priority_class;
+      kthread->base_priority_copy = title_process->default_thread_priority;
+      kthread->max_dynamic_priority = title_process->max_dynamic_priority;
+      kthread->creation_flags = kXamTaskCpu5Flag;
+      thread->SetBasePriority(0);
+    } else {
+      XELOGW(
+          "XamTaskSchedule: skipping foreground priority promotion "
+          "(title_process={:08X}, kthread={})",
+          title_process_addr, static_cast<const void*>(kthread));
+      if (kthread) {
+        kthread->creation_flags = kXamTaskCpu5Flag;
+      }
+    }
+    thread->Resume();
   }
 
   XELOGD("XAM task ({:08X}) scheduled asynchronously",

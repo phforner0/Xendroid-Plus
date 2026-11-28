@@ -27,10 +27,28 @@ constexpr uint32_t CNTVCT_EL0 = ARM64_SYSREG(3, 3, 14, 0, 2);
 #endif
 
 namespace xe {
+namespace {
+uint64_t CachedCntfrqEl0() {
+  static const uint64_t freq = xe_cpu_mrs(CNTFRQ_EL0);
+  return freq;
+}
+}  // namespace
+
 XE_NOINLINE
-uint64_t Clock::host_tick_frequency_raw() { return xe_cpu_mrs(CNTFRQ_EL0); }
+uint64_t Clock::host_tick_frequency_raw() {
+  const uint64_t freq = CachedCntfrqEl0();
+  if (!freq) {
+    return host_tick_frequency_platform();
+  }
+  return freq;
+}
 XE_NOINLINE
-uint64_t Clock::host_tick_count_raw() { return xe_cpu_mrs(CNTVCT_EL0); }
+uint64_t Clock::host_tick_count_raw() {
+  if (!CachedCntfrqEl0()) {
+    return host_tick_count_platform();
+  }
+  return xe_cpu_mrs(CNTVCT_EL0);
+}
 
 }  // namespace xe
 

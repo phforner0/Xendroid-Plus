@@ -17,7 +17,9 @@
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/gpu/gpu_flags.h"
+#include "xenia/gpu/shader_storage.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
+#include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 #include "xenia/ui/vulkan/vulkan_instance.h"
 
 #include "xenia/base/cvar.h"
@@ -108,7 +110,8 @@ void DeferredCommandBuffer::EndSegment() {
   active_segment_placeholder_ = kNoSegmentPlaceholder;
 }
 
-void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer,
+                                    VulkanPipelineCache* pipeline_cache) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -118,12 +121,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
   }
   bool guest_graphics_pipeline_unready = false;
   ExecuteStream(command_buffer, command_stream_.data(), command_stream_size_,
-                guest_graphics_pipeline_unready);
+                guest_graphics_pipeline_unready, pipeline_cache);
 }
 
 void DeferredCommandBuffer::ExecuteStream(
     VkCommandBuffer command_buffer, const uintmax_t* stream,
-    size_t stream_remaining, bool& guest_graphics_pipeline_unready) {
+    size_t stream_remaining, bool& guest_graphics_pipeline_unready,
+    VulkanPipelineCache* pipeline_cache) {
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
   const bool count_replay = cvars::vulkan_replay_stats;
@@ -142,6 +146,12 @@ void DeferredCommandBuffer::ExecuteStream(
               *reinterpret_cast<const ArgsVkBindDescriptorSets*>(stream);
           key |= (uint64_t(args.pipeline_bind_point) << 8) | args.first_set;
           replay_stats_.descriptor_sets += args.descriptor_set_count;
+        } break;
+        case Command::kVkPushDescriptorSetKHR: {
+          auto& args =
+              *reinterpret_cast<const ArgsVkPushDescriptorSetKHR*>(stream);
+          key |= (uint64_t(args.pipeline_bind_point) << 8) | args.set;
+          replay_stats_.descriptor_sets += 1;
         } break;
         case Command::kVkPushConstants: {
           auto& args = *reinterpret_cast<const ArgsVkPushConstants*>(stream);
@@ -209,6 +219,34 @@ void DeferredCommandBuffer::ExecuteStream(
                                     args.dynamic_offset_count, dynamic_offsets);
       } break;
 
+      case Command::kVkPushDescriptorSetKHR: {
+        auto& args =
+            *reinterpret_cast<const ArgsVkPushDescriptorSetKHR*>(stream);
+        constexpr size_t header_size = xe::align(
+            sizeof(ArgsVkPushDescriptorSetKHR), alignof(VkDescriptorBufferInfo));
+        const VkDescriptorBufferInfo* buffer_infos =
+            reinterpret_cast<const VkDescriptorBufferInfo*>(
+                reinterpret_cast<const uint8_t*>(stream) + header_size);
+        assert_true(args.buffer_count <= 8);
+        VkWriteDescriptorSet writes[8];
+        for (uint32_t i = 0; i < args.buffer_count; ++i) {
+          VkWriteDescriptorSet& write = writes[i];
+          write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          write.pNext = nullptr;
+          write.dstSet = VK_NULL_HANDLE;
+          write.dstBinding = i;
+          write.dstArrayElement = 0;
+          write.descriptorCount = 1;
+          write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+          write.pImageInfo = nullptr;
+          write.pBufferInfo = &buffer_infos[i];
+          write.pTexelBufferView = nullptr;
+        }
+        dfn.vkCmdPushDescriptorSetKHR(command_buffer, args.pipeline_bind_point,
+                                      args.layout, args.set, args.buffer_count,
+                                      writes);
+      } break;
+
       case Command::kVkBindIndexBuffer: {
         auto& args = *reinterpret_cast<const ArgsVkBindIndexBuffer*>(stream);
         dfn.vkCmdBindIndexBuffer(command_buffer, args.buffer, args.offset,
@@ -227,15 +265,18 @@ void DeferredCommandBuffer::ExecuteStream(
       case Command::kVkBindPipelineDeferred: {
         auto& args =
             *reinterpret_cast<const ArgsVkBindPipelineDeferred*>(stream);
-        if (args.pipeline != VK_NULL_HANDLE) {
+        VkPipeline resolved_pipeline = args.pipeline;
+        if (args.pipeline_slot != nullptr && pipeline_cache != nullptr) {
+          resolved_pipeline = pipeline_cache->ResolvePipelineForReplay(
+              static_cast<VulkanPipelineCache::Pipeline*>(args.pipeline_slot),
+              args.replay_wait_ms, args.expedite_on_replay);
+        }
+        if (EvaluateReplayPipelineBind(args.pipeline_slot != nullptr,
+                                       resolved_pipeline != VK_NULL_HANDLE,
+                                       guest_graphics_pipeline_unready) ==
+            ReplayPipelineBindOutcome::kBind) {
           dfn.vkCmdBindPipeline(command_buffer, args.pipeline_bind_point,
-                                args.pipeline);
-          guest_graphics_pipeline_unready = false;
-        } else {
-          // The asynchronous creation had not completed when the draws were
-          // recorded, so their descriptor bindings cover only the interim
-          // pipeline layout - drop them, even if the pipeline exists by now.
-          guest_graphics_pipeline_unready = true;
+                                resolved_pipeline);
         }
       } break;
 
@@ -699,7 +740,8 @@ void DeferredCommandBuffer::ExecuteStream(
                       segment_stream_size_);
           ExecuteStream(command_buffer,
                         segment_stream_.data() + args.start_elements,
-                        args.size_elements, guest_graphics_pipeline_unready);
+                        args.size_elements, guest_graphics_pipeline_unready,
+                        pipeline_cache);
         }
       } break;
 
@@ -1117,6 +1159,7 @@ void DeferredCommandBuffer::CountReplayedCommand(uint32_t command,
     case Command::kVkSetAlphaToOneEnableEXT:
     case Command::kVkSetLogicOpEnableEXT:
     case Command::kVkSetDepthBoundsTestEnable:
+    case Command::kVkPushDescriptorSetKHR:
       break;
     default:
       return;
@@ -1165,6 +1208,7 @@ const char* DeferredCommandBuffer::GetReplayStatCommandName(size_t index) {
       "SetRasterizationSamplesEXT", "SetSampleMaskEXT",
       "SetAlphaToCoverageEnableEXT", "SetAlphaToOneEnableEXT",
       "SetLogicOpEnableEXT", "SetDepthBoundsTestEnable",
+      "PushDescriptorSetKHR",
   };
   static_assert(xe::countof(kNames) == kReplayStatCommandCount);
   return index < kReplayStatCommandCount ? kNames[index] : "?";

@@ -38,6 +38,8 @@ data class ControlOptions(
     val gyroSensitivity: GyroSensitivity = GyroSensitivity.NORMAL,
     val unbufferedInput: Boolean = true,
     val rumble: RumbleIntensity = RumbleIntensity.MEDIUM,
+    val leftStickOuterDeadzone: Float = 0f,
+    val rightStickOuterDeadzone: Float = 0f,
 ) {
     companion object {
         /** What older builds kept in the game process's own preferences (only ever read now). */
@@ -59,6 +61,8 @@ data class ControlOptionsDto(
     val gyroSensitivity: String? = null,
     val unbufferedInput: Boolean? = null,
     val rumble: String? = null,
+    val leftStickOuterDeadzone: Float? = null,
+    val rightStickOuterDeadzone: Float? = null,
 ) {
     fun resolve(legacy: ControlOptions): ControlOptions = ControlOptions(
         touchCamera = touchCamera ?: legacy.touchCamera,
@@ -67,11 +71,17 @@ data class ControlOptionsDto(
         gyroSensitivity = gyroSensitivity?.let(GyroSensitivity::parse) ?: legacy.gyroSensitivity,
         unbufferedInput = unbufferedInput ?: legacy.unbufferedInput,
         rumble = rumble?.let(RumbleIntensity::parse) ?: legacy.rumble,
+        leftStickOuterDeadzone = StickRange.sanitizeOuterDeadzone(leftStickOuterDeadzone ?: legacy.leftStickOuterDeadzone),
+        rightStickOuterDeadzone = StickRange.sanitizeOuterDeadzone(rightStickOuterDeadzone ?: legacy.rightStickOuterDeadzone),
     )
 
     companion object {
-        fun of(o: ControlOptions) = ControlOptionsDto(o.touchCamera, o.gyroCamera, o.gyroAim.name, o.gyroSensitivity.name,
-            o.unbufferedInput, o.rumble.name)
+        fun of(o: ControlOptions) = ControlOptionsDto(
+            o.touchCamera, o.gyroCamera, o.gyroAim.name, o.gyroSensitivity.name,
+            o.unbufferedInput, o.rumble.name,
+            StickRange.sanitizeOuterDeadzone(o.leftStickOuterDeadzone),
+            StickRange.sanitizeOuterDeadzone(o.rightStickOuterDeadzone),
+        )
     }
 }
 

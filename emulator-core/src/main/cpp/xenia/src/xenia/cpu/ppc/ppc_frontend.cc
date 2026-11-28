@@ -14,6 +14,7 @@
 #include "xenia/base/mutex.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_emit.h"
+#include "xenia/cpu/ppc/ppc_hle_memory.h"
 #include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/ppc/ppc_translator.h"
 #include "xenia/cpu/processor.h"
@@ -104,6 +105,12 @@ bool PPCFrontend::Initialize() {
       processor_->DefineBuiltin("LeaveGlobalLock", LeaveGlobalLock, arg0, arg1);
   builtins_.syscall_handler = processor_->DefineBuiltin(
       "SyscallHandler", SyscallHandler, nullptr, nullptr);
+  builtins_.hle_memcpy =
+      processor_->DefineBuiltin("HleMemcpy", HleMemcpy, nullptr, nullptr);
+  builtins_.hle_memset =
+      processor_->DefineBuiltin("HleMemset", HleMemset, nullptr, nullptr);
+  builtins_.hle_memmove =
+      processor_->DefineBuiltin("HleMemmove", HleMemmove, nullptr, nullptr);
   return true;
 }
 

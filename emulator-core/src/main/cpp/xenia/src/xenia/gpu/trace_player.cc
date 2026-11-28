@@ -54,6 +54,19 @@ void TracePlayer::SeekFrame(int target_frame) {
             TracePlaybackMode::kBreakOnSwap, false);
 }
 
+void TracePlayer::ReplayFrame(int target_frame, bool clear_caches) {
+  if (target_frame < 0 || target_frame >= frame_count()) {
+    return;
+  }
+  current_frame_index_ = target_frame;
+  auto frame = current_frame();
+  current_command_index_ = int(frame->commands.size()) - 1;
+
+  assert_true(frame->start_ptr <= frame->end_ptr);
+  PlayTrace(frame->start_ptr, frame->end_ptr - frame->start_ptr,
+            TracePlaybackMode::kUntilEnd, clear_caches);
+}
+
 void TracePlayer::SeekCommand(int target_command) {
   if (current_command_index_ == target_command) {
     return;
@@ -162,6 +175,7 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data,
         }
         if (pending_break) {
           playing_trace_ = false;
+          playback_event_->Set();
           return;
         }
         break;

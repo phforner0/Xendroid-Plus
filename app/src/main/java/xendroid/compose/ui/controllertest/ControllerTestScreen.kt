@@ -38,6 +38,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,8 +53,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import kotlin.math.abs
 import kotlin.math.hypot
+import kotlinx.coroutines.launch
 import xendroid.compose.R
 import xendroid.compose.gamepad.AnalogTriggers
 import xendroid.compose.gamepad.ControlOptions
@@ -63,6 +64,7 @@ import xendroid.compose.gamepad.ControllerUse
 import xendroid.compose.gamepad.GamepadCapture
 import xendroid.compose.gamepad.PadAxes
 import xendroid.compose.gamepad.RumbleIntensity
+import xendroid.compose.gamepad.StickRange
 import xendroid.compose.gamepad.TestedDevice
 import xendroid.compose.settings.Setting
 import xendroid.compose.settings.SettingsSchema
@@ -121,6 +123,7 @@ fun ControllerTestScreen(
     val rumble = rememberPadRumble()
     val optionsStore = remember { ControlOptionsStore(context.applicationContext) }
     val options by optionsStore.options.collectAsStateWithLifecycle(initialValue = ControlOptions())
+    val scope = rememberCoroutineScope()
     fun publish() { devices = model.all; events = model.events }
 
     if (listen) DisposableEffect(Unit) {
@@ -206,7 +209,22 @@ fun ControllerTestScreen(
             if (devices.isEmpty()) XdCard(Modifier.fillMaxWidth()) { Text(stringResource(R.string.ct_none), style = XdText.body, color = Xd.colors.fg) }
             val slots = ControllerTestModel.playerSlots(devices, ControllerUse.descriptors)
             devices.forEach { device ->
-                DeviceCard(device, slots[device.id], gyro[device.id], rumble, options.rumble, editing)
+                DeviceCard(
+                    device = device,
+                    slot = slots[device.id],
+                    gyro = gyro[device.id],
+                    rumble = rumble,
+                    options = options,
+                    editing = editing,
+                    onOuterDeadzoneChange = { leftStick, next ->
+                        scope.launch {
+                            optionsStore.update {
+                                if (leftStick) it.copy(leftStickOuterDeadzone = next)
+                                else it.copy(rightStickOuterDeadzone = next)
+                            }
+                        }
+                    },
+                )
             }
             if (events.isNotEmpty()) XdCard(Modifier.fillMaxWidth(), title = stringResource(R.string.ct_connections), icon = XdIcons.timeline) {
                 events.take(10).forEach { Text(eventText(it), style = XdText.bodySm, color = Xd.colors.fg2) }
@@ -246,14 +264,22 @@ private val CHECK_OF = mapOf(
 private fun deadZone(editing: GlobalSettingsEditing?, s: Setting?): Float =
     maxOf(APP_DEADZONE, s?.let { editing?.raw(it)?.toFloatOrNull() } ?: 0f)
 
-private fun gets(v: Float, dz: Float) = if (!v.isFinite() || abs(v) < dz) 0f else v.coerceIn(-1f, 1f)
+private fun gets(v: Float, dz: Float, outer: Float = 0f) = StickRange.scaleAxis(v, dz, outer)
 
 private fun n2(v: Float): String = "%.2f".format(v)
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun DeviceCard(device: TestedDevice, slot: Int?, gyro: FloatArray?, rumble: PadRumbleState, default: RumbleIntensity,
-                       editing: GlobalSettingsEditing?) {
+private fun DeviceCard(
+    device: TestedDevice,
+    slot: Int?,
+    gyro: FloatArray?,
+    rumble: PadRumbleState,
+    options: ControlOptions,
+    editing: GlobalSettingsEditing?,
+    onOuterDeadzoneChange: (Boolean, Float) -> Unit,
+) {
+    val default = options.rumble
     val c = Xd.colors
     val left = SettingsSchema.byKey["HID|left_stick_deadzone_percentage"]
     val right = SettingsSchema.byKey["HID|right_stick_deadzone_percentage"]
@@ -298,12 +324,12 @@ private fun DeviceCard(device: TestedDevice, slot: Int?, gyro: FloatArray?, rumb
             val readings: @Composable () -> Unit = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Stick(device.axes.lx, device.axes.ly, dzLeft, stringResource(R.string.xd_ct_left))
-                        Stick(device.axes.rx, device.axes.ry, dzRight, stringResource(R.string.xd_ct_right))
+                        Stick(device.axes.lx, device.axes.ly, dzLeft, options.leftStickOuterDeadzone, stringResource(R.string.xd_ct_left))
+                        Stick(device.axes.rx, device.axes.ry, dzRight, options.rightStickOuterDeadzone, stringResource(R.string.xd_ct_right))
                         Column(Modifier.weight(1f)) {
                             Text(stringResource(R.string.xd_ct_game_gets), style = XdText.small, color = c.fg3)
-                            Text("E ${n2(gets(device.axes.lx, dzLeft))}; ${n2(gets(device.axes.ly, dzLeft))}", style = XdText.mono.copy(fontSize = 12.sp), color = c.fg)
-                            Text("D ${n2(gets(device.axes.rx, dzRight))}; ${n2(gets(device.axes.ry, dzRight))}", style = XdText.mono.copy(fontSize = 12.sp), color = c.fg)
+                            Text("E ${n2(gets(device.axes.lx, dzLeft, options.leftStickOuterDeadzone))}; ${n2(gets(device.axes.ly, dzLeft, options.leftStickOuterDeadzone))}", style = XdText.mono.copy(fontSize = 12.sp), color = c.fg)
+                            Text("D ${n2(gets(device.axes.rx, dzRight, options.rightStickOuterDeadzone))}; ${n2(gets(device.axes.ry, dzRight, options.rightStickOuterDeadzone))}", style = XdText.mono.copy(fontSize = 12.sp), color = c.fg)
                         }
                     }
                     Trigger("LT", device.axes.lt)
@@ -315,6 +341,17 @@ private fun DeviceCard(device: TestedDevice, slot: Int?, gyro: FloatArray?, rumb
                             DeadZoneRow(stringResource(R.string.xd_ct_left), left, editing)
                             DeadZoneRow(stringResource(R.string.xd_ct_right), right, editing)
                         }
+                    }
+                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(c.s2).padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(stringResource(R.string.xd_ct_outer_dz), style = XdText.labelSm, color = c.fg)
+                        OuterDeadZoneRow(stringResource(R.string.xd_ct_left), options.leftStickOuterDeadzone) {
+                            onOuterDeadzoneChange(true, it)
+                        }
+                        OuterDeadZoneRow(stringResource(R.string.xd_ct_right), options.rightStickOuterDeadzone) {
+                            onOuterDeadzoneChange(false, it)
+                        }
+                        Text(stringResource(R.string.xd_ct_outer_dz_hint), style = XdText.small, color = c.fg3)
                     }
                     if (device.hasGyro) Text(gyro?.let { stringResource(R.string.ct_gyro, it[0], it[1], it[2]) } ?: stringResource(R.string.ct_gyro_wait),
                         style = XdText.mono.copy(fontSize = 12.sp), color = c.fg2)
@@ -382,6 +419,23 @@ private fun DeadZoneRow(side: String, s: Setting, editing: GlobalSettingsEditing
 }
 
 @Composable
+private fun OuterDeadZoneRow(side: String, value: Float, onChange: (Float) -> Unit) {
+    val clean = StickRange.sanitizeOuterDeadzone(value)
+    val label = if (clean <= 0f) stringResource(R.string.set_option_off) else StickRange.formatPercent(clean)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(side, style = XdText.bodySm, color = Xd.colors.fg2, modifier = Modifier.weight(1f))
+        XdStepper(
+            label,
+            { onChange(StickRange.stepOuterDeadzone(clean, -1)) },
+            { onChange(StickRange.stepOuterDeadzone(clean, 1)) },
+            canPrevious = clean > 0f,
+            canNext = clean < StickRange.MAX_OUTER_DEADZONE - 1e-4f,
+            minLabelWidth = 56.dp,
+        )
+    }
+}
+
+@Composable
 private fun eventText(event: ControllerTestModel.Event): String = stringResource(when (event.kind) {
     ControllerTestModel.Event.Kind.CONNECTED -> R.string.ct_event_connected
     ControllerTestModel.Event.Kind.RECONNECTED -> R.string.ct_event_reconnected
@@ -390,14 +444,18 @@ private fun eventText(event: ControllerTestModel.Event): String = stringResource
 
 /** The stick's raw position over its dead zone: inside the inner circle the game gets nothing. */
 @Composable
-private fun Stick(x: Float, y: Float, deadZone: Float, label: String) {
+private fun Stick(x: Float, y: Float, deadZone: Float, outerDeadZone: Float, label: String) {
     val c = Xd.colors
+    val outer = StickRange.sanitizeOuterDeadzone(outerDeadZone)
     val dead = hypot(x, y) < deadZone
     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Canvas(Modifier.size(78.dp)) {
             val radius = size.minDimension / 2f
             drawCircle(Color(0xFF1B211F), radius)
             drawCircle(Color.White.copy(alpha = 0.14f), radius, style = Stroke(2f))
+            if (outer > 0f) {
+                drawCircle(c.acc.copy(alpha = 0.45f), radius * (1f - outer).coerceIn(0f, 1f), style = Stroke(1.5f))
+            }
             drawCircle(Color(0xFFE9A23B).copy(alpha = 0.25f), radius * deadZone.coerceIn(0f, 1f))
             drawCircle(Color(0xFFE9A23B).copy(alpha = 0.6f), radius * deadZone.coerceIn(0f, 1f), style = Stroke(1.5f))
             drawCircle(if (dead) c.fg3 else c.acc, 7.dp.toPx(), center + Offset(x.coerceIn(-1f, 1f) * radius, y.coerceIn(-1f, 1f) * radius))

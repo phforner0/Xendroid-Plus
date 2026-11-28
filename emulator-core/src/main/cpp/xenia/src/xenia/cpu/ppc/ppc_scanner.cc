@@ -9,13 +9,24 @@
 
 #include "xenia/cpu/ppc/ppc_scanner.h"
 
+#include <algorithm>
+#include <vector>
+
+#include "xenia/base/byte_order.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
+#include "xenia/cpu/ppc/ppc_jump_table.h"
 #include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/cpu/xex_module.h"
+
+DEFINE_bool(ppc_scanner_jump_tables, true,
+            "Recover static MSVC jump tables (mtctr/bctr) in PPCScanner.",
+            "CPU");
 
 #if 0
 #define LOGPPC(fmt, ...) XELOGCORE('p', fmt, ##__VA_ARGS__)
@@ -29,6 +40,112 @@ namespace xe {
 namespace cpu {
 namespace ppc {
 
+namespace {
+
+struct JumpTableReaderContext {
+  Memory* memory;
+  Module* module;
+  XexModule* xex_module;
+};
+
+bool CanReadJumpTableAddress(const JumpTableReaderContext* ctx, uint32_t addr,
+                             uint32_t size, const uint8_t** out_ptr) {
+  if (!ctx || !ctx->memory || !ctx->module || !out_ptr) {
+    return false;
+  }
+  if (size == 0 || addr > UINT32_MAX - (size - 1u)) {
+    return false;
+  }
+  const uint32_t end_addr = addr + (size - 1u);
+  if ((addr >= 0x7FC00000u && addr < 0x80000000u) ||
+      (end_addr >= 0x7FC00000u && end_addr < 0x80000000u)) {
+    return false;
+  }
+  if (ctx->memory->LookupVirtualMappedRange(addr) ||
+      ctx->memory->LookupVirtualMappedRange(end_addr)) {
+    return false;
+  }
+  BaseHeap* start_heap = ctx->memory->LookupHeap(addr);
+  BaseHeap* end_heap = ctx->memory->LookupHeap(end_addr);
+  if (!start_heap || start_heap != end_heap) {
+    return false;
+  }
+  const auto access = start_heap->QueryRangeAccess(addr, end_addr);
+  if (access == xe::memory::PageAccess::kNoAccess) {
+    return false;
+  }
+  if (ctx->xex_module) {
+    const bool in_module = ctx->xex_module->ContainsAddress(addr) &&
+                           ctx->xex_module->ContainsAddress(end_addr);
+    if (!in_module && access != xe::memory::PageAccess::kReadOnly) {
+      return false;
+    }
+  }
+  if (start_heap->heap_type() == HeapType::kGuestPhysical) {
+    auto* phys_heap = static_cast<PhysicalHeap*>(start_heap);
+    const uint32_t phys_start = phys_heap->GetPhysicalAddress(addr);
+    const uint32_t phys_end = phys_heap->GetPhysicalAddress(end_addr);
+    if (phys_start == UINT32_MAX || phys_end == UINT32_MAX ||
+        phys_end - phys_start != size - 1u) {
+      return false;
+    }
+    *out_ptr = ctx->memory->TranslatePhysical(phys_start);
+    return *out_ptr != nullptr;
+  }
+  *out_ptr = ctx->memory->TranslateVirtual<const uint8_t*>(addr);
+  return *out_ptr != nullptr;
+}
+
+bool JumpTableReadU8(void* raw_ctx, uint32_t addr, uint8_t* out) {
+  const auto* ctx = static_cast<const JumpTableReaderContext*>(raw_ctx);
+  const uint8_t* ptr = nullptr;
+  if (!out || !CanReadJumpTableAddress(ctx, addr, 1u, &ptr)) {
+    return false;
+  }
+  *out = *ptr;
+  return true;
+}
+
+bool JumpTableReadU16BE(void* raw_ctx, uint32_t addr, uint16_t* out) {
+  const auto* ctx = static_cast<const JumpTableReaderContext*>(raw_ctx);
+  const uint8_t* ptr = nullptr;
+  if (!out || !CanReadJumpTableAddress(ctx, addr, 2u, &ptr)) {
+    return false;
+  }
+  *out = xe::load_and_swap<uint16_t>(ptr);
+  return true;
+}
+
+bool JumpTableReadU32BE(void* raw_ctx, uint32_t addr, uint32_t* out) {
+  const auto* ctx = static_cast<const JumpTableReaderContext*>(raw_ctx);
+  const uint8_t* ptr = nullptr;
+  if (!out || !CanReadJumpTableAddress(ctx, addr, 4u, &ptr)) {
+    return false;
+  }
+  *out = xe::load_and_swap<uint32_t>(ptr);
+  return true;
+}
+
+bool JumpTableIsValidCodeTarget(void* raw_ctx, uint32_t target_addr) {
+  const auto* ctx = static_cast<const JumpTableReaderContext*>(raw_ctx);
+  if (!ctx || !ctx->module) {
+    return false;
+  }
+  if (ctx->xex_module) {
+    if (!ctx->xex_module->ContainsAddress(target_addr)) {
+      return false;
+    }
+    xex2_section_type section_type{};
+    if (!ctx->xex_module->GetPageSectionType(target_addr, &section_type)) {
+      return false;
+    }
+    return section_type == XEX_SECTION_CODE;
+  }
+  return ctx->module->ContainsAddress(target_addr);
+}
+
+}  // namespace
+
 PPCScanner::PPCScanner(PPCFrontend* frontend) : frontend_(frontend) {}
 
 PPCScanner::~PPCScanner() {}
@@ -36,6 +153,68 @@ PPCScanner::~PPCScanner() {}
 bool PPCScanner::IsRestGprLr(uint32_t address) {
   auto function = frontend_->processor()->QueryFunction(address);
   return function && function->behavior() == Function::Behavior::kEpilogReturn;
+}
+
+void PPCScanner::TryRecoverJumpTableAt(GuestFunction* function,
+                                       uint32_t start_address,
+                                       uint32_t bctr_address,
+                                       uint32_t* furthest_target) {
+  if (!cvars::ppc_scanner_jump_tables) {
+    return;
+  }
+  Module* module = function->module();
+  if (!module || frontend_->processor()->IsDynamicCodeModule(module)) {
+    return;
+  }
+
+  const uint32_t max_window_bytes = (kMaxJumpTableBacktrackInsns - 1u) * 4u;
+  const uint32_t window_start =
+      (bctr_address > start_address &&
+       (bctr_address - start_address) > max_window_bytes)
+          ? (bctr_address - max_window_bytes)
+          : start_address;
+
+  std::vector<uint32_t> window;
+  window.reserve(kMaxJumpTableBacktrackInsns);
+  for (uint32_t a = window_start; a <= bctr_address; a += 4u) {
+    const uint8_t* ptr = module->TranslateCode(a);
+    if (!ptr) {
+      return;
+    }
+    window.push_back(xe::load_and_swap<uint32_t>(ptr));
+  }
+  if (window.empty()) {
+    return;
+  }
+
+  JumpTableReaderContext reader_ctx{
+      module->memory(),
+      module,
+      dynamic_cast<XexModule*>(module),
+  };
+  JumpTableMemoryReader reader{
+      &reader_ctx,
+      &JumpTableReadU8,
+      &JumpTableReadU16BE,
+      &JumpTableReadU32BE,
+      &JumpTableIsValidCodeTarget,
+  };
+
+  JumpTableInfo table;
+  if (!TryRecoverJumpTable(start_address, bctr_address, window.data(),
+                           window.size(), reader, &table)) {
+    return;
+  }
+
+  std::vector<uint32_t> unique_targets = std::move(table.targets);
+  std::sort(unique_targets.begin(), unique_targets.end());
+  unique_targets.erase(
+      std::unique(unique_targets.begin(), unique_targets.end()),
+      unique_targets.end());
+  for (uint32_t target : unique_targets) {
+    *furthest_target = std::max(*furthest_target, target);
+  }
+  function->AddJumpTable(bctr_address, std::move(unique_targets));
 }
 
 bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
@@ -47,6 +226,7 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
   // split up and the second half is treated as another function.
 
   Module* module = function->module();
+  function->ClearJumpTables();
 
   LOGPPC("Analyzing function {:08X}...", function->address());
 
@@ -135,7 +315,7 @@ bool PPCScanner::Scan(GuestFunction* function, FunctionDebugInfo* debug_info) {
       // bctr -- unconditional branch to CTR.
       // This is generally a jump to a function pointer (non-return).
       // This is almost always a jump table.
-      // TODO(benvanik): decode jump tables.
+      TryRecoverJumpTableAt(function, start_address, address, &furthest_target);
       if (furthest_target > address) {
         // Remaining targets within function, not end.
         LOGPPC("ignoring bctr {:08X} (branch to {:08X})", address,

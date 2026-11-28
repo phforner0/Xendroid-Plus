@@ -13,6 +13,8 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
+#include "xenia/gpu/vulkan/vulkan_driver_quirks.h"
+#include "xenia/ui/vulkan/vulkan_present_timing.h"
 #include "xenia/ui/vulkan/zerofg_config.h"
 
 #include <algorithm>
@@ -26,6 +28,7 @@
 
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
 #include <dirent.h>
+#include <sys/system_properties.h>
 #include "third_party/libadrenotools/include/adrenotools/bcenabler.h"
 #include "third_party/libadrenotools/include/adrenotools/driver.h"
 #endif
@@ -62,9 +65,60 @@ DEFINE_bool(
     "startup.",
     "Vulkan");
 
+DEFINE_bool(
+    vulkan_present_timing_ext, true,
+    "Prefer VK_EXT_present_timing (spec v3) over VK_GOOGLE_display_timing "
+    "when advertised by the device and surface, with clean automatic fallback "
+    "to VK_GOOGLE_display_timing and untimed presentation.",
+    "Vulkan");
+
 namespace xe {
 namespace ui {
 namespace vulkan {
+
+namespace {
+
+bool IsPresentTimingExtRequested() {
+#if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
+  static std::once_flag prop_once;
+  static bool has_prop_override = false;
+  static bool prop_override_value = false;
+  std::call_once(prop_once, []() {
+    char prop[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.xendroid.present_timing_ext", prop) > 0) {
+      bool parsed = false;
+      if (ParseStrictBoolProperty(prop, parsed)) {
+        has_prop_override = true;
+        prop_override_value = parsed;
+      }
+    }
+  });
+  if (has_prop_override) {
+    return prop_override_value;
+  }
+#endif
+  return cvars::vulkan_present_timing_ext;
+}
+
+bool ReadBoolCvarOrDefault(const char* name, bool default_value) {
+  if (!cvar::ConfigVars) {
+    return default_value;
+  }
+  auto it = cvar::ConfigVars->find(name);
+  if (it == cvar::ConfigVars->end() || !it->second) {
+    return default_value;
+  }
+  const std::string val = it->second->effective_value();
+  if (val == "true" || val == "1") {
+    return true;
+  }
+  if (val == "false" || val == "0") {
+    return false;
+  }
+  return default_value;
+}
+
+}  // namespace
 
 template <typename Structure, VkStructureType StructureType>
 struct VulkanFeatures {
@@ -384,6 +438,29 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
     requested_extensions.emplace(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
                                  &ext_GOOGLE_display_timing);
+#ifdef VK_EXT_present_timing
+    const bool present_timing_ext_requested =
+        get_physical_device_properties2_supported &&
+        IsPresentTimingExtRequested();
+    if (present_timing_ext_requested &&
+        vulkan_instance->extensions().ext_KHR_get_surface_capabilities2) {
+      requested_extensions.emplace(VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
+                                   &device->extensions_.ext_EXT_present_timing);
+#ifdef VK_KHR_calibrated_timestamps
+      requested_extensions.emplace(
+          VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+          &device->extensions_.ext_KHR_calibrated_timestamps);
+#endif
+#ifdef VK_KHR_present_id2
+      requested_extensions.emplace(VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+                                   &device->extensions_.ext_KHR_present_id2);
+#endif
+#ifdef VK_KHR_present_id
+      requested_extensions.emplace(VK_KHR_PRESENT_ID_EXTENSION_NAME,
+                                   &device->extensions_.ext_KHR_present_id);
+#endif
+    }
+#endif
 #if XE_PLATFORM_WIN32
     // #256. Windows-only extension to control fullscreen exclusive behavior.
     // Used to prevent HDR state corruption during fullscreen transitions.
@@ -467,6 +544,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // #291 + #321. Graphics pipeline libraries for fast partial linking.
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_library)
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_graphics_pipeline_library)
+      // #81. Push descriptors (gated by vulkan_use_push_descriptors and strict
+      // driver blacklist in VulkanCommandProcessor).
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_push_descriptor)
       // #483. Shader objects for zero-PSO draw binding with dynamic rendering.
       if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
         XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_object)
@@ -506,10 +586,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         cvars::vulkan_pipeline_statistics) {
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_executable_properties)
     }
-    // #227. Only for the coarse shading option.
+    // #227. Only for the coarse shading option or thermal Auto-VRS.
     if (get_physical_device_properties2_supported &&
         properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
-        cvars::vulkan_fragment_shading_rate) {
+        (cvars::vulkan_fragment_shading_rate ||
+         ReadBoolCvarOrDefault("vulkan_auto_vrs_thermal", false))) {
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_fragment_shading_rate)
     }
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
@@ -649,6 +730,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     device->extensions_.ext_EXT_graphics_pipeline_library = false;
     erase_enabled_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
   }
+#ifdef VK_EXT_present_timing
+  // VK_EXT_present_timing (spec v3) requires VK_KHR_calibrated_timestamps and
+  // VK_KHR_present_id2 (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
+  if (device->extensions_.ext_EXT_present_timing &&
+      (!device->extensions_.ext_KHR_calibrated_timestamps ||
+       !device->extensions_.ext_KHR_present_id2)) {
+    device->extensions_.ext_EXT_present_timing = false;
+    erase_enabled_extension(VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
+  }
+#endif
   // VK_EXT_shader_object requires VK_KHR_dynamic_rendering (or Vulkan 1.3).
   if (device->extensions_.ext_EXT_shader_object &&
       properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0) &&
@@ -824,6 +915,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT
       properties_EXT_graphics_pipeline_library = {
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+  VkPhysicalDevicePushDescriptorPropertiesKHR
+      properties_KHR_push_descriptor = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+#ifdef VK_EXT_present_timing
+  VulkanFeatures<VkPhysicalDevicePresentTimingFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT>
+      features_EXT_present_timing;
+#endif
+#ifdef VK_KHR_present_id2
+  VulkanFeatures<VkPhysicalDevicePresentId2FeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR>
+      features_KHR_present_id2;
+#endif
+#ifdef VK_KHR_present_id
+  VulkanFeatures<VkPhysicalDevicePresentIdFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR>
+      features_KHR_present_id;
+#endif
 
   // All QCOM probe structures are linked for supported queries only. v2,
   // cubic weights/clamp are never linked to device creation in this batch.
@@ -1009,6 +1118,31 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       properties_EXT_graphics_pipeline_library.pNext = properties_2.pNext;
       properties_2.pNext = &properties_EXT_graphics_pipeline_library;
     }
+    if (device->extensions_.ext_KHR_push_descriptor) {
+      properties_KHR_push_descriptor.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_KHR_push_descriptor;
+    }
+#ifdef VK_EXT_present_timing
+    if (device->extensions_.ext_EXT_present_timing) {
+      // Query support only first; link .enabled into device_create_info.pNext
+      // only after feature checks succeed so pruned extensions never leave
+      // dangling feature structs in VkDeviceCreateInfo::pNext.
+      features_EXT_present_timing.supported.pNext = supported_features_2.pNext;
+      supported_features_2.pNext = &features_EXT_present_timing.supported;
+    }
+#endif
+#ifdef VK_KHR_present_id2
+    if (device->extensions_.ext_KHR_present_id2) {
+      features_KHR_present_id2.supported.pNext = supported_features_2.pNext;
+      supported_features_2.pNext = &features_KHR_present_id2.supported;
+    }
+#endif
+#ifdef VK_KHR_present_id
+    if (device->extensions_.ext_KHR_present_id) {
+      features_KHR_present_id.supported.pNext = supported_features_2.pNext;
+      supported_features_2.pNext = &features_KHR_present_id.supported;
+    }
+#endif
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
     if (device->extensions_.ext_KHR_fragment_shading_rate) {
@@ -1030,6 +1164,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
             fsr.fragmentShadingRateWithShaderSampleMask != VK_FALSE;
         device->properties_.maxFragmentShadingRateRasterizationSamples =
             fsr.maxFragmentShadingRateRasterizationSamples;
+        device->properties_.maxFragmentSize = fsr.maxFragmentSize;
         XELOGI(
             "Vulkan fragment shading rate: max fragment size {}x{}, max "
             "samples {}, with shader depth/stencil writes {}, with sample mask "
@@ -1067,6 +1202,79 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     features_EXT_device_fault.enabled.deviceFault =
         features_EXT_device_fault.supported.deviceFault;
+#ifdef VK_KHR_present_id2
+    if (device->extensions_.ext_KHR_present_id2) {
+      features_KHR_present_id2.enabled.presentId2 =
+          features_KHR_present_id2.supported.presentId2;
+      device->properties_.presentId2 =
+          features_KHR_present_id2.enabled.presentId2 != VK_FALSE;
+      if (device->properties_.presentId2) {
+        features_KHR_present_id2.enabled.pNext =
+            const_cast<void*>(device_create_info.pNext);
+        device_create_info.pNext = &features_KHR_present_id2.enabled;
+      } else {
+        device->extensions_.ext_KHR_present_id2 = false;
+        erase_enabled_extension(VK_KHR_PRESENT_ID_2_EXTENSION_NAME);
+      }
+    }
+#endif
+#ifdef VK_KHR_present_id
+    if (device->extensions_.ext_KHR_present_id) {
+      features_KHR_present_id.enabled.presentId =
+          features_KHR_present_id.supported.presentId;
+      device->properties_.presentId =
+          features_KHR_present_id.enabled.presentId != VK_FALSE;
+      if (device->properties_.presentId) {
+        features_KHR_present_id.enabled.pNext =
+            const_cast<void*>(device_create_info.pNext);
+        device_create_info.pNext = &features_KHR_present_id.enabled;
+      } else {
+        device->extensions_.ext_KHR_present_id = false;
+        erase_enabled_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+      }
+    }
+#endif
+#ifdef VK_EXT_present_timing
+    if (device->extensions_.ext_EXT_present_timing) {
+      if (CanEnablePresentTimingExtOnDeviceV3(
+              device->extensions_.ext_EXT_present_timing,
+              device->extensions_.ext_KHR_calibrated_timestamps,
+              device->extensions_.ext_KHR_present_id2,
+              features_EXT_present_timing.supported.presentTiming != VK_FALSE,
+              device->properties_.presentId2)) {
+        features_EXT_present_timing.enabled.presentTiming = VK_TRUE;
+        features_EXT_present_timing.enabled.presentAtAbsoluteTime =
+            features_EXT_present_timing.supported.presentAtAbsoluteTime;
+        features_EXT_present_timing.enabled.presentAtRelativeTime =
+            features_EXT_present_timing.supported.presentAtRelativeTime;
+        features_EXT_present_timing.enabled.pNext =
+            const_cast<void*>(device_create_info.pNext);
+        device_create_info.pNext = &features_EXT_present_timing.enabled;
+        device->properties_.presentTiming = true;
+        device->properties_.presentAtAbsoluteTime =
+            features_EXT_present_timing.enabled.presentAtAbsoluteTime !=
+            VK_FALSE;
+        device->properties_.presentAtRelativeTime =
+            features_EXT_present_timing.enabled.presentAtRelativeTime !=
+            VK_FALSE;
+      } else {
+        device->extensions_.ext_EXT_present_timing = false;
+        device->properties_.presentTiming = false;
+        device->properties_.presentAtAbsoluteTime = false;
+        device->properties_.presentAtRelativeTime = false;
+        erase_enabled_extension(VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
+#ifdef VK_KHR_calibrated_timestamps
+        if (device->extensions_.ext_KHR_calibrated_timestamps) {
+          device->extensions_.ext_KHR_calibrated_timestamps = false;
+          erase_enabled_extension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        }
+#endif
+      }
+    }
+#endif
+    device_create_info.enabledExtensionCount =
+        uint32_t(enabled_extensions.size());
+    device_create_info.ppEnabledExtensionNames = enabled_extensions.data();
   }
 
   uint32_t queue_family_count = 0;
@@ -1352,10 +1560,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (ext_1_2_KHR_driver_properties) {
     XE_UI_VULKAN_ENUM_PROPERTY_2(properties_1_2_KHR_driver_properties, driverID,
                                  DriverId);
-    XELOGI("* driverName: {}", properties_1_2_KHR_driver_properties.driverName);
-    if (properties_1_2_KHR_driver_properties.driverInfo[0]) {
-      XELOGI("* driverInfo: {}",
-             properties_1_2_KHR_driver_properties.driverInfo);
+    std::memcpy(device->properties_.driverName,
+                properties_1_2_KHR_driver_properties.driverName,
+                sizeof(device->properties_.driverName));
+    device->properties_.driverName[VK_MAX_DRIVER_NAME_SIZE - 1] = '\0';
+    std::memcpy(device->properties_.driverInfo,
+                properties_1_2_KHR_driver_properties.driverInfo,
+                sizeof(device->properties_.driverInfo));
+    device->properties_.driverInfo[VK_MAX_DRIVER_INFO_SIZE - 1] = '\0';
+    XELOGI("* driverName: {}", device->properties_.driverName);
+    if (device->properties_.driverInfo[0]) {
+      XELOGI("* driverInfo: {}", device->properties_.driverInfo);
     }
     XELOGI("* conformanceVersion: {}.{}.{}.{}",
            properties_1_2_KHR_driver_properties.conformanceVersion.major,
@@ -1412,44 +1627,57 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(optimalBufferCopyRowPitchAlignment)
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
 
-  // Parse Arm Mali proprietary driver version (r<M>p<N>) for the SDEN-3735689
-  // errata table across Valhall / CSF / Immortalis generations (r32..r52+).
-  bool is_arm_proprietary =
-      device->properties_.driverID == VK_DRIVER_ID_ARM_PROPRIETARY ||
-      (device->properties_.driverID == VkDriverId(0) &&
-       properties.vendorID == 0x13B5);
-  if (is_arm_proprietary || !cvars::vulkan_mali_driver_override.empty()) {
+  // Classify driver identity (PanVK / malisx2, Arm Mali proprietary r<M>p<N>,
+  // armsx2-turnip) via centralized pure quirks helpers so PanVK-on-kbase
+  // wrappers reporting driverID == 0 are never treated as proprietary Mali.
+  const xe::gpu::vulkan::DriverClassification driver_classification =
+      xe::gpu::vulkan::ClassifyVulkanDriver(
+          properties.vendorID, uint32_t(device->properties_.driverID),
+          device->properties_.driverName, device->properties_.driverInfo,
+          cvars::vulkan_mali_driver_override.empty()
+              ? nullptr
+              : cvars::vulkan_mali_driver_override.c_str());
+  device->properties_.isPanvk = driver_classification.is_panvk;
+  device->properties_.isMalisx2 = driver_classification.is_malisx2;
+  device->properties_.isArmsx2Turnip = driver_classification.is_armsx2_turnip;
+  device->properties_.maliDriverMajor = driver_classification.mali_driver_major;
+  device->properties_.maliDriverMinor = driver_classification.mali_driver_minor;
+  device->properties_.maliDriverMajorR =
+      int32_t(driver_classification.mali_driver_major);
+  device->properties_.maliDriverMinorP =
+      int32_t(driver_classification.mali_driver_minor);
+  const bool is_arm_proprietary = driver_classification.is_arm_proprietary;
+  const bool mali_job_manager = device->properties_.maxDrawIndirectCount <= 1;
+  const xe::gpu::vulkan::MaliDriverQuirks mali_quirks =
+      xe::gpu::vulkan::ComputeMaliQuirks(
+          is_arm_proprietary, device->properties_.isPanvk,
+          device->properties_.maliDriverMajor,
+          device->properties_.maliDriverMinor, mali_job_manager);
+  if (device->properties_.isPanvk) {
+    XELOGI("* PanVK driver detected (malisx2={}, proprietary Mali quirks off)",
+           device->properties_.isMalisx2 ? "true" : "false");
+  }
+  if (device->properties_.isArmsx2Turnip) {
+    XELOGI("* armsx2-turnip custom Turnip driver detected");
+  }
+  if (is_arm_proprietary) {
     const char* version_source =
         !cvars::vulkan_mali_driver_override.empty()
             ? cvars::vulkan_mali_driver_override.c_str()
-            : properties_1_2_KHR_driver_properties.driverInfo;
-    int32_t mali_major_r = 0;
-    int32_t mali_minor_p = 0;
-    for (const char* p = version_source; p && *p; ++p) {
-      if (*p == 'r' && p[1] >= '0' && p[1] <= '9') {
-        unsigned int r_val = 0;
-        unsigned int p_val = 0;
-        if (std::sscanf(p, "r%up%u", &r_val, &p_val) == 2) {
-          mali_major_r = int32_t(r_val);
-          mali_minor_p = int32_t(p_val);
-          break;
-        }
-      }
-    }
-    device->properties_.maliDriverMajorR = mali_major_r;
-    device->properties_.maliDriverMinorP = mali_minor_p;
-    if (!cvars::vulkan_mali_driver_override.empty()) {
-      is_arm_proprietary = true;
-    }
-    XELOGI("* Mali driver version: r{}p{} (raw='{}')", mali_major_r,
-           mali_minor_p, version_source ? version_source : "");
-    if (with_gpu_emulation && (mali_major_r <= 0 || mali_major_r < 47)) {
-      device->properties_.maliCapSpirv13 = true;
-      device->properties_.maliRewriteScalarSelect = true;
+            : device->properties_.driverInfo;
+    XELOGI("* Mali driver version: r{}p{} (raw='{}')",
+           device->properties_.maliDriverMajor,
+           device->properties_.maliDriverMinor,
+           version_source ? version_source : "");
+    if (with_gpu_emulation && mali_quirks.cap_spirv_13) {
+      device->properties_.maliCapSpirv13 = mali_quirks.cap_spirv_13;
+      device->properties_.maliRewriteScalarSelect =
+          mali_quirks.rewrite_scalar_select;
       XELOGI(
           "* Mali errata (r{}p{} < r47p0): capping guest SPIR-V to 1.3 and "
           "rewriting scalar OpSelect",
-          mali_major_r, mali_minor_p);
+          device->properties_.maliDriverMajor,
+          device->properties_.maliDriverMinor);
     }
   }
 
@@ -1560,9 +1788,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   // occlusion query, and depth/stencil suspension bugs across r32..r51; keep
   // Mali < r52 on classic VkRenderPass so AFBC + subpass tile fusion stay safe.
   const bool mali_block_dynamic_rendering =
-      is_arm_proprietary &&
-      (device->properties_.maliDriverMajorR <= 0 ||
-       device->properties_.maliDriverMajorR < 52);
+      !mali_quirks.allow_dynamic_rendering;
   if (mali_block_dynamic_rendering && with_gpu_emulation) {
     XELOGI(
         "* Mali errata (r{}p{} < r52p0): disabling dynamicRendering in favor "
@@ -1745,15 +1971,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   // actually makes dynamic into the enabled struct (leaving the rest disabled
   // avoids requesting unsupported sub-features at device creation).
   if (with_gpu_emulation) {
-    const int32_t mali_rp = device->properties_.maliDriverMajorR * 100 +
-                            device->properties_.maliDriverMinorP;
-    const bool mali_job_manager = device->properties_.maxDrawIndirectCount <= 1;
-    const bool mali_block_eds =
-        is_arm_proprietary &&
-        (device->properties_.maliDriverMajorR <= 0 || mali_rp < 4401 ||
-         device->properties_.maliDriverMajorR == 44 ||
-         (mali_job_manager && device->properties_.maliDriverMajorR >= 46 &&
-          device->properties_.maliDriverMajorR <= 50));
+    const bool mali_block_eds = !mali_quirks.allow_extended_dynamic_state;
     device->properties_.extendedDynamicState =
         properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0) &&
         !mali_block_eds;
@@ -1849,6 +2067,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   } else {
     device->extensions_.ext_EXT_shader_object = false;
+  }
+
+  // VK_KHR_push_descriptor (#81): expose reported maxPushDescriptors; the
+  // command processor applies the driver blacklist and Eden clamp.
+  if (device->extensions_.ext_KHR_push_descriptor && with_gpu_emulation) {
+    XE_UI_VULKAN_PROPERTY_2(properties_KHR_push_descriptor, maxPushDescriptors);
+  } else {
+    device->extensions_.ext_KHR_push_descriptor = false;
+    device->properties_.maxPushDescriptors = 0;
   }
 
 #undef XE_UI_VULKAN_LIMIT
@@ -2267,6 +2494,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  // Optional VK_KHR_push_descriptor (#81) entry point (non-fatal).
+  if (device->extensions_.ext_KHR_push_descriptor) {
+    bool push_descriptor_loaded = true;
+#define XE_UI_VULKAN_FUNCTION(name)                                       \
+  push_descriptor_loaded &= (dfn.name = PFN_##name(ifn.vkGetDeviceProcAddr( \
+                                 device->device_, #name))) != nullptr;
+#include "xenia/ui/vulkan/functions/device_khr_push_descriptor.inc"
+#undef XE_UI_VULKAN_FUNCTION
+    if (!push_descriptor_loaded) {
+      XELOGW(
+          "VulkanDevice: VK_KHR_push_descriptor entry point missing on '{}', "
+          "disabling push descriptors",
+          properties.deviceName);
+      device->extensions_.ext_KHR_push_descriptor = false;
+      device->properties_.maxPushDescriptors = 0;
+    }
+  }
+
   // Optional VK_EXT_shader_object (#483) and its required dynamic state
   // setters (core 1.3 entry points with EXT fallbacks).
   if (device->properties_.shaderObject) {
@@ -2358,6 +2603,45 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       device->vkGetPastPresentationTimingGOOGLE_ = nullptr;
     }
   }
+  if (vulkan_instance->extensions().ext_KHR_get_surface_capabilities2) {
+    device->vkGetPhysicalDeviceSurfaceCapabilities2KHR_ =
+        PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR(
+            ifn.vkGetInstanceProcAddr(
+                vulkan_instance->instance(),
+                "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
+  }
+#ifdef VK_EXT_present_timing
+  if (device->extensions_.ext_EXT_present_timing &&
+      device->properties_.presentTiming) {
+    device->vkSetSwapchainPresentTimingQueueSizeEXT_ =
+        PFN_vkSetSwapchainPresentTimingQueueSizeEXT(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkSetSwapchainPresentTimingQueueSizeEXT"));
+    device->vkGetSwapchainTimingPropertiesEXT_ =
+        PFN_vkGetSwapchainTimingPropertiesEXT(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetSwapchainTimingPropertiesEXT"));
+    device->vkGetSwapchainTimeDomainPropertiesEXT_ =
+        PFN_vkGetSwapchainTimeDomainPropertiesEXT(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetSwapchainTimeDomainPropertiesEXT"));
+    device->vkGetPastPresentationTimingEXT_ =
+        PFN_vkGetPastPresentationTimingEXT(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetPastPresentationTimingEXT"));
+    if (!device->HasPresentTimingExtPfns()) {
+      device->vkSetSwapchainPresentTimingQueueSizeEXT_ = nullptr;
+      device->vkGetSwapchainTimingPropertiesEXT_ = nullptr;
+      device->vkGetSwapchainTimeDomainPropertiesEXT_ = nullptr;
+      device->vkGetPastPresentationTimingEXT_ = nullptr;
+      device->extensions_.ext_EXT_present_timing = false;
+      device->properties_.presentTiming = false;
+    } else {
+      XELOGI(
+          "VulkanDevice: VK_EXT_present_timing enabled (abs={} rel={} id2={} "
+          "id1={})",
+          device->properties_.presentAtAbsoluteTime,
+          device->properties_.presentAtRelativeTime,
+          device->properties_.presentId2, device->properties_.presentId);
+    }
+  }
+#endif
 
   // Optional diagnostic entry points. Failure here disables statistics only:
   // it must not join the generic device function-loading failure authority.

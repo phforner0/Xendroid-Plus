@@ -37,6 +37,8 @@ class PPCScanner {
 
  private:
   bool IsRestGprLr(uint32_t address);
+  void TryRecoverJumpTableAt(GuestFunction* function, uint32_t start_address,
+                             uint32_t bctr_address, uint32_t* furthest_target);
 
   PPCFrontend* frontend_ = nullptr;
 };

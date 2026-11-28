@@ -13,13 +13,22 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_rtl.h"
 
 #include "xenia/base/atomic.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/pe_image.h"
+#include "xenia/cpu/backend/a64/a64_hle_sync_layout.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xboxkrnl/critical_section_spin.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 #include "xenia/kernel/xthread.h"
+
+DEFINE_uint32(
+    critical_section_max_spin, 64,
+    "Maximum spin iterations in RtlEnterCriticalSection before blocking (0 "
+    "disables the cap and uses the guest's spin count up to 65280).",
+    "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -553,6 +562,12 @@ struct X_RTL_CRITICAL_SECTION {
 };
 #pragma pack(pop)
 static_assert_size(X_RTL_CRITICAL_SECTION, 28);
+static_assert(offsetof(X_RTL_CRITICAL_SECTION, lock_count) ==
+              cpu::backend::a64::kRtlCsLockCountOffset);
+static_assert(offsetof(X_RTL_CRITICAL_SECTION, recursion_count) ==
+              cpu::backend::a64::kRtlCsRecursionCountOffset);
+static_assert(offsetof(X_RTL_CRITICAL_SECTION, owning_thread) ==
+              cpu::backend::a64::kRtlCsOwningThreadOffset);
 
 void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs,
                                     uint32_t cs_ptr) {
@@ -612,7 +627,8 @@ void RtlEnterCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
   }
   CriticalSectionPrefetchW(&cs->lock_count);
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
-  uint32_t spin_count = cs->header.absolute * 256;
+  uint32_t spin_count = ComputeCriticalSectionSpinLimit(
+      uint32_t(cs->header.absolute) * 256u, cvars::critical_section_max_spin);
 
   if (cs->owning_thread == cur_thread) {
     // We already own the lock.
@@ -623,12 +639,14 @@ void RtlEnterCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
 
   // Spin loop
   while (spin_count--) {
-    if (xe::atomic_cas(-1, 0, &cs->lock_count)) {
+    if (xe::atomic_load_relaxed(&cs->lock_count) == -1 &&
+        xe::atomic_cas(-1, 0, &cs->lock_count)) {
       // Acquired.
       cs->owning_thread = cur_thread;
       cs->recursion_count = 1;
       return;
     }
+    PauseCriticalSectionSpin();
   }
 
   if (xe::atomic_inc(&cs->lock_count) != 0) {
@@ -706,6 +724,15 @@ void RtlLeaveCriticalSection_entry(pointer_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 DECLARE_XBOXKRNL_EXPORT2(RtlLeaveCriticalSection, kNone, kImplemented,
                          kHighFrequency);
+
+void xeRtlLeaveCriticalSectionWakeTrampoline(cpu::ppc::PPCContext* ctx) {
+  const uint32_t cs_guest = static_cast<uint32_t>(ctx->r[3]);
+  if (!cs_guest) {
+    return;
+  }
+  auto* cs = ctx->TranslateVirtual<X_RTL_CRITICAL_SECTION*>(cs_guest);
+  xeKeSetEvent(reinterpret_cast<X_KEVENT*>(cs), 1, 0);
+}
 
 struct X_TIME_FIELDS {
   xe::be<uint16_t> year;

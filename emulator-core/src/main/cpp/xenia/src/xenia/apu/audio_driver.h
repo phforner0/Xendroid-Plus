@@ -39,6 +39,9 @@ class AudioDriver {
   virtual size_t GetQueuedFrameCount() { return 0; }
   // Whether GetQueuedFrameCount is the real depth, not the default 0.
   virtual bool ReportsQueuedFrameCount() const { return false; }
+  // Hint from AudioSystem for adaptive queue depth target in blocks so
+  // driver-side dynamic rate catch-up does not drain ahead of it.
+  virtual void SetTargetQueueDepth(size_t /*blocks*/) {}
 };
 
 }  // namespace apu

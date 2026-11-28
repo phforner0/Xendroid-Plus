@@ -218,6 +218,13 @@ class VulkanDevice {
     // VK_KHR_driver_properties (#197, promoted to 1.2)
 
     VkDriverId driverID = VkDriverId(0);
+    char driverName[VK_MAX_DRIVER_NAME_SIZE] = {};
+    char driverInfo[VK_MAX_DRIVER_INFO_SIZE] = {};
+    uint32_t maliDriverMajor = 0;
+    uint32_t maliDriverMinor = 0;
+    bool isPanvk = false;
+    bool isMalisx2 = false;
+    bool isArmsx2Turnip = false;
 
     // VK_KHR_shader_float_controls (#198, promoted to 1.2)
 
@@ -305,12 +312,20 @@ class VulkanDevice {
     bool fragmentShadingRateWithShaderSampleMask = false;
     VkSampleCountFlagBits maxFragmentShadingRateRasterizationSamples =
         VK_SAMPLE_COUNT_1_BIT;
+    VkExtent2D maxFragmentSize = {1, 1};
 
     // Optional RC1 Test diagnostics on device B. Advertisement, supported
     // feature and enabled feature are separate facts; none is an RC1 gate.
     bool pipelineExecutablePropertiesAdvertised = false;
     bool pipelineExecutableInfoSupported = false;
     bool pipelineExecutableInfo = false;
+
+    // VK_EXT_present_timing (#209) + VK_KHR_present_id2 / VK_KHR_present_id.
+    bool presentTiming = false;
+    bool presentAtAbsoluteTime = false;
+    bool presentAtRelativeTime = false;
+    bool presentId2 = false;
+    bool presentId = false;
 
     // VK_KHR_buffer_device_address (#245, promoted to 1.2)
     bool bufferDeviceAddress = false;
@@ -334,6 +349,9 @@ class VulkanDevice {
     bool graphicsPipelineLibraryFastLinking = false;
     bool graphicsPipelineLibraryIndependentInterpolationDecoration = false;
 
+    // VK_KHR_push_descriptor (#81, promoted to 1.4)
+    uint32_t maxPushDescriptors = 0;
+
     // Arm Mali driver version (r<M>p<N>) & errata flags (SDEN-3735689)
     int32_t maliDriverMajorR = 0;
     int32_t maliDriverMinorP = 0;
@@ -354,6 +372,10 @@ class VulkanDevice {
   struct Extensions {
     bool ext_KHR_pipeline_executable_properties = false;
     bool ext_KHR_swapchain = false;                     // #2
+    bool ext_EXT_present_timing = false;                // #209
+    bool ext_KHR_calibrated_timestamps = false;         // #185
+    bool ext_KHR_present_id2 = false;                   // #480
+    bool ext_KHR_present_id = false;                    // #295
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
@@ -411,6 +433,8 @@ class VulkanDevice {
     // VK_KHR_pipeline_library (#291) & VK_EXT_graphics_pipeline_library (#321)
     bool ext_KHR_pipeline_library = false;
     bool ext_EXT_graphics_pipeline_library = false;
+    // VK_KHR_push_descriptor (#81, promoted to 1.4)
+    bool ext_KHR_push_descriptor = false;
 #if XE_PLATFORM_ANDROID || XE_PLATFORM_xendroid
     // ZeroFG independent Android presenter support. These are enabled only
     // when a ZeroFG session requests them and remain optional capability gates.
@@ -448,6 +472,35 @@ class VulkanDevice {
       const {
     return vkGetPastPresentationTimingGOOGLE_;
   }
+  PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR
+  vkGetPhysicalDeviceSurfaceCapabilities2KHR() const {
+    return vkGetPhysicalDeviceSurfaceCapabilities2KHR_;
+  }
+#ifdef VK_EXT_present_timing
+  PFN_vkSetSwapchainPresentTimingQueueSizeEXT
+  vkSetSwapchainPresentTimingQueueSizeEXT() const {
+    return vkSetSwapchainPresentTimingQueueSizeEXT_;
+  }
+  PFN_vkGetSwapchainTimingPropertiesEXT vkGetSwapchainTimingPropertiesEXT()
+      const {
+    return vkGetSwapchainTimingPropertiesEXT_;
+  }
+  PFN_vkGetSwapchainTimeDomainPropertiesEXT
+  vkGetSwapchainTimeDomainPropertiesEXT() const {
+    return vkGetSwapchainTimeDomainPropertiesEXT_;
+  }
+  PFN_vkGetPastPresentationTimingEXT vkGetPastPresentationTimingEXT() const {
+    return vkGetPastPresentationTimingEXT_;
+  }
+  bool HasPresentTimingExtPfns() const {
+    return vkSetSwapchainPresentTimingQueueSizeEXT_ &&
+           vkGetSwapchainTimingPropertiesEXT_ &&
+           vkGetSwapchainTimeDomainPropertiesEXT_ &&
+           vkGetPastPresentationTimingEXT_;
+  }
+#else
+  bool HasPresentTimingExtPfns() const { return false; }
+#endif
   PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue() const {
     return vkGetSemaphoreCounterValue_;
   }
@@ -510,6 +563,8 @@ class VulkanDevice {
     // VK_EXT_extended_dynamic_state3 (#456) - never promoted, always loaded by
     // EXT name and only when the extension is present (optional, non-fatal).
 #include "xenia/ui/vulkan/functions/device_ext_extended_dynamic_state3.inc"
+    // VK_KHR_push_descriptor (#81, optional, non-fatal).
+#include "xenia/ui/vulkan/functions/device_khr_push_descriptor.inc"
 #undef XE_UI_VULKAN_FUNCTION
     // Stage 0 optional extension entry points (loaded by VulkanDevice when enabled).
     PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress = nullptr;
@@ -724,6 +779,17 @@ class VulkanDevice {
       nullptr;
   PFN_vkGetPastPresentationTimingGOOGLE vkGetPastPresentationTimingGOOGLE_ =
       nullptr;
+  PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR
+      vkGetPhysicalDeviceSurfaceCapabilities2KHR_ = nullptr;
+#ifdef VK_EXT_present_timing
+  PFN_vkSetSwapchainPresentTimingQueueSizeEXT
+      vkSetSwapchainPresentTimingQueueSizeEXT_ = nullptr;
+  PFN_vkGetSwapchainTimingPropertiesEXT vkGetSwapchainTimingPropertiesEXT_ =
+      nullptr;
+  PFN_vkGetSwapchainTimeDomainPropertiesEXT
+      vkGetSwapchainTimeDomainPropertiesEXT_ = nullptr;
+  PFN_vkGetPastPresentationTimingEXT vkGetPastPresentationTimingEXT_ = nullptr;
+#endif
   PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue_ = nullptr;
   PFN_vkWaitSemaphores vkWaitSemaphores_ = nullptr;
   PFN_vkCmdPipelineBarrier2 vkCmdPipelineBarrier2_ = nullptr;

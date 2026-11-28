@@ -53,6 +53,9 @@ DEFINE_uint32(
     "CPU");
 UPDATE_from_uint32(inline_leaf_max_instructions, 2026, 10, 5, 12, 16);
 
+DECLARE_bool(ppc_hle_memory_ops);
+DECLARE_uint32(ppc_hle_memory_min_bytes);
+
 namespace xe {
 namespace cpu {
 namespace ppc {
@@ -98,11 +101,17 @@ void PPCHIRBuilder::Reset() {
   instr_offset_list_ = NULL;
   label_list_ = NULL;
   with_debug_info_ = false;
+  track_fpscr_status_ = false;
+  vscr_sat_observable_ = true;
   HIRBuilder::Reset();
 }
 
-bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
+bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags,
+                         HleMemoryOp hle_memory_op) {
   SCOPE_profile_cpu_f("cpu");
+
+  track_fpscr_status_ = cvars::accurate_fpscr_status;
+  vscr_sat_observable_ = frontend_->processor()->vscr_sat_observable();
 
   Module* module = function->module();
   if (frontend_->processor()->KeepsContextStores(module)) {
@@ -141,6 +150,47 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
 
   // Always mark entry with label.
   label_list_[0] = NewLabel();
+
+  Function* hle_builtin = nullptr;
+  if (hle_memory_op != HleMemoryOp::kNone && cvars::ppc_hle_memory_ops &&
+      !frontend_->processor()->IsDynamicCodeModule(module)) {
+    switch (hle_memory_op) {
+      case HleMemoryOp::kMemcpy:
+        hle_builtin = builtins()->hle_memcpy;
+        break;
+      case HleMemoryOp::kMemset:
+        hle_builtin = builtins()->hle_memset;
+        break;
+      case HleMemoryOp::kMemmove:
+        hle_builtin = builtins()->hle_memmove;
+        break;
+      case HleMemoryOp::kNone:
+      default:
+        break;
+    }
+  }
+
+  Label* hle_done = nullptr;
+  if (hle_builtin) {
+    // Non-recursive entry guard: branch to ppc_body (label_list_[0]) on
+    // small counts or fallback so internal PPC loops jumping to start_address
+    // never re-enter the HLE guard.
+    Label* ppc_body = label_list_[0];
+    hle_done = NewLabel();
+    if (with_debug_info_) {
+      CommentFormat("HLE memory guard ({})", HleMemoryOpName(hle_memory_op));
+    }
+    if (cvars::ppc_hle_memory_min_bytes > 0) {
+      Value* len = Truncate(LoadGPR(5), INT32_TYPE);
+      BranchTrue(
+          CompareULT(len, LoadConstantUint32(cvars::ppc_hle_memory_min_bytes)),
+          ppc_body);
+    }
+    CallExtern(hle_builtin);
+    Value* ok = LoadContext(offsetof(PPCContext, scratch), INT64_TYPE);
+    BranchTrue(ok, hle_done);
+    Branch(ppc_body);
+  }
 
   uint32_t start_address = function_->address();
   uint32_t end_address = function_->end_address();
@@ -221,6 +271,11 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
 
   if (false) {
     DumpAllOpcodeCounts();
+  }
+
+  if (hle_done) {
+    MarkLabel(hle_done);
+    Return();
   }
 
   return Finalize();
@@ -598,6 +653,13 @@ void PPCHIRBuilder::StoreFPSCR(Value* value) {
 }
 
 void PPCHIRBuilder::UpdateFPSCR(Value* result, bool update_cr1) {
+  if (!track_fpscr_status_) {
+    if (update_cr1) {
+      CopyFPSCRToCR1();
+    }
+    return;
+  }
+
   // TODO(benvanik): detect overflow and nan cases.
   // fx and vx are the most important.
   /*
@@ -697,6 +759,9 @@ Value* PPCHIRBuilder::LoadSAT() {
 }
 
 void PPCHIRBuilder::StoreSAT(Value* value) {
+  if (!vscr_sat_observable_) {
+    return;
+  }
   value = Truncate(value, INT8_TYPE);
   StoreContext(offsetof(PPCContext, vscr_sat), value);
 

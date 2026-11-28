@@ -43,6 +43,7 @@ class TracePlayer : public TraceReader {
 
   void SeekFrame(int target_frame);
   void SeekCommand(int target_command);
+  void ReplayFrame(int target_frame, bool clear_caches = false);
 
   void WaitOnPlayback();
 

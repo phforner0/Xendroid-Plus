@@ -55,6 +55,7 @@ DECLARE_double(occlusion_query_saturation);
 uint32_t GetGuestVblankRateHz();
 
 DECLARE_int32(anisotropic_override);
+DECLARE_int32(gpu_texture_lod_bias);
 
 DECLARE_bool(disassemble_pm4);
 

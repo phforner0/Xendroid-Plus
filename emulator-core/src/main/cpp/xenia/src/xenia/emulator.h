@@ -11,6 +11,7 @@
 #define XENIA_EMULATOR_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -19,6 +20,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "xenia/apu/audio_media_player.h"
@@ -472,6 +474,9 @@ class Emulator {
   X_STATUS CompleteLaunch(const std::filesystem::path& path,
                           const std::string_view module_path);
 
+  void StartJitProfileSession(kernel::UserModule* module);
+  void StopJitProfileSession(bool flush);
+
   std::filesystem::path command_line_;
   std::filesystem::path last_launch_path_;  // persists across relaunch
   DiscProvider disc_provider_;
@@ -527,6 +532,17 @@ class Emulator {
   LaunchNewTitleCallback on_launch_new_title_;
   ExitToDashboardCallback on_exit_to_dashboard_;
   DiscSwapCallback on_disc_swap_;
+
+  std::mutex jprof_session_mutex_;
+  std::condition_variable jprof_session_cv_;
+  std::atomic<bool> jprof_stop_requested_{false};
+  bool jprof_session_active_ = false;
+  bool jprof_dirty_ = false;
+  std::thread jprof_thread_;
+  std::filesystem::path jprof_path_;
+  uint32_t jprof_title_id_ = 0;
+  uint64_t jprof_module_hash_ = 0;
+  std::vector<uint32_t> jprof_known_addresses_;
 };
 
 }  // namespace xe

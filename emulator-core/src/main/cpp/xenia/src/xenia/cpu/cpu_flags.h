@@ -34,6 +34,7 @@ DECLARE_bool(trace_function_data);
 DECLARE_uint32(cpu_trace_mask);
 
 DECLARE_bool(validate_hir);
+DECLARE_bool(accurate_fpscr_status);
 
 DECLARE_uint64(pvr);
 
@@ -45,6 +46,11 @@ DECLARE_string(break_condition_op);
 DECLARE_bool(break_condition_truncate);
 
 DECLARE_bool(break_on_debugbreak);
+DECLARE_bool(adpf_cpu_performance_hint);
+DECLARE_bool(jit_warmup_jprof);
+DECLARE_uint32(jit_warmup_jprof_threads);
+DECLARE_uint32(jit_warmup_jprof_save_interval_ms);
+DECLARE_uint32(jit_warmup_jprof_save_batch);
 
 namespace xe {
 namespace cpu {
