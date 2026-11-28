@@ -2484,32 +2484,27 @@ void VulkanPresenter::PollNativeLatency() {
   }
   const auto process_past_timing = [this](uint64_t present_id,
                                           uint64_t actual_present_time_ns,
-                                          uint64_t observation_ns) {
+                                          uint64_t observation_ns,
+                                          bool is_64bit_id) {
     // Repaints of the same Real are untagged. Only tagged Reals enter the
     // measurement; a default ID zero is not an unmatched tagged Real.
     if (!present_id) return;
-    bool matched = false;
-    for (NativeLatencyRecord& record : native_latency_records_) {
-      if (record.present_id && record.present_id == present_id) {
-        matched = true;
-        if (record.source_id && record.issue_ns &&
-            actual_present_time_ns > record.issue_ns &&
-            actual_present_time_ns <= observation_ns) {
-          if (native_latency_samples_ns_.size() < kNativeLatencySampleLimit) {
-            native_latency_samples_ns_.push_back(actual_present_time_ns -
-                                                 record.issue_ns);
-          } else {
-            ++native_latency_overflow_samples_;
-          }
-        } else {
-          ++native_latency_invalid_samples_;
-        }
-        record = {};
-        break;
-      }
-    }
-    if (!matched) {
+    const NativeLatencyPollResult poll_result =
+        MatchAndRetireNativeLatencyRecord(
+            native_latency_records_.data(), native_latency_records_.size(),
+            present_id, actual_present_time_ns, observation_ns, is_64bit_id);
+    if (!poll_result.matched) {
       ++native_latency_unmatched_timings_;
+      return;
+    }
+    if (poll_result.sample_valid) {
+      if (native_latency_samples_ns_.size() < kNativeLatencySampleLimit) {
+        native_latency_samples_ns_.push_back(poll_result.latency_ns);
+      } else {
+        ++native_latency_overflow_samples_;
+      }
+    } else {
+      ++native_latency_invalid_samples_;
     }
   };
 #ifdef VK_EXT_present_timing
@@ -2565,7 +2560,7 @@ void VulkanPresenter::PollNativeLatency() {
       if (IsCompleteMonotonicPastPresentationTiming(
               conv, paint_context_.swapchain_timing.time_domain)) {
         process_past_timing(conv.present_id, conv.actual_present_time_ns,
-                            observation_ns);
+                            observation_ns, /*is_64bit_id=*/true);
       }
     }
   } else
@@ -2589,9 +2584,10 @@ void VulkanPresenter::PollNativeLatency() {
       ++native_latency_invalid_samples_;
       return;
     }
+    count = std::min(count, uint32_t(timings.size()));
     for (uint32_t i = 0; i < count; ++i) {
       process_past_timing(timings[i].presentID, timings[i].actualPresentTime,
-                          observation_ns);
+                          observation_ns, /*is_64bit_id=*/false);
     }
   }
   const uint64_t now_ns = GetZeroFGMonotonicTimeNs();
@@ -3545,12 +3541,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
        paint_context_.swapchain_timing.present_at_absolute_time &&
        TimeDomainMatchesSteadyClock(
            paint_context_.swapchain_timing.time_domain));
-  // Native late-swap keeps scheduled_target_ns for early FIFO frames when the
-  // backend supports absolute targets, and emits 0 (immediate) for overdue
-  // frames so the compositor never pushes them to vsync + 1 (always bypassed
-  // when ZeroFG is active).
+  // Native FIFO path has no VSync-lattice quantizer (unlike ZeroFG's
+  // QuantizeToVsync): sending an unquantized future desiredPresentTime
+  // (native_last_present_ns_ + refresh_ns) makes SurfaceFlinger retain early
+  // frames across VSync boundaries and drop them when a later overdue frame
+  // submits desiredPresentTime == 0. Keep native presentation ASAP (0) while
+  // preserving presentID telemetry and CommandProcessor throttle late-swap.
   const uint64_t effective_target_time_ns = ResolveNativePresentTargetTimeNs(
-      late_swap, paint_context_.swapchain_is_fifo, can_use_absolute_target);
+      late_swap, paint_context_.swapchain_is_fifo, can_use_absolute_target,
+      /*target_is_vsync_quantized=*/false);
 
   const bool want_latency_tag =
       paint_context_.swapchain_timing.backend != PresentTimingBackend::kNone &&

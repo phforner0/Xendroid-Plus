@@ -399,13 +399,16 @@ inline bool IsCompleteMonotonicPastPresentationTiming(
 }
 
 // Resolves the actual targetTime / desiredPresentTime passed to Vulkan on the
-// native presenter path. Keeps the scheduled target when late-swap pacing is
-// active and the frame is early (provided FIFO + absolute target support), and
-// emits 0 (immediate) for overdue frames or when late-swap is bypassed.
+// native presenter path. Without a VSync-lattice quantizer (such as ZeroFG's
+// QuantizeToVsync), passing an unquantized future timestamp (e.g.
+// native_last_present_ns_ + refresh_ns) on Android FIFO causes SurfaceFlinger
+// to retain early frames across VSync boundaries and drop them when a later
+// overdue frame submits desiredPresentTime == 0. Always emit 0 (ASAP) unless a
+// caller explicitly provides a VSync-quantized target.
 inline uint64_t ResolveNativePresentTargetTimeNs(
     const LateSwapDecision& decision, bool is_fifo,
-    bool can_use_absolute_target) {
-  if (!is_fifo || !can_use_absolute_target) {
+    bool can_use_absolute_target, bool target_is_vsync_quantized = false) {
+  if (!is_fifo || !can_use_absolute_target || !target_is_vsync_quantized) {
     return 0ull;
   }
   if (decision.action == LateSwapAction::kKeepScheduledTarget) {
@@ -434,6 +437,60 @@ inline bool IsOlderPresentId(uint64_t candidate_id, uint64_t reference_id,
   }
   return static_cast<int32_t>(static_cast<uint32_t>(candidate_id) -
                               static_cast<uint32_t>(reference_id)) < 0;
+}
+
+struct NativeLatencyTimingRecord {
+  uint64_t present_id = 0;
+  uint64_t source_id = 0;
+  uint64_t issue_ns = 0;
+};
+
+struct NativeLatencyPollResult {
+  bool matched = false;
+  bool sample_valid = false;
+  uint64_t latency_ns = 0;
+  size_t retired_older_count = 0;
+};
+
+// Matches a completed present timing against the native latency ring and
+// retires any strictly older unresolved records (wrap-safe via
+// IsOlderPresentId) that were dropped/superseded by the compositor so they do
+// not remain stuck in the ring until overwritten.
+template <typename RecordT>
+inline NativeLatencyPollResult MatchAndRetireNativeLatencyRecord(
+    RecordT* records, size_t record_count, uint64_t present_id,
+    uint64_t actual_present_time_ns, uint64_t observation_ns,
+    bool is_64bit_id) {
+  NativeLatencyPollResult result;
+  if (!records || record_count == 0 || !present_id) {
+    return result;
+  }
+  for (size_t i = 0; i < record_count; ++i) {
+    RecordT& record = records[i];
+    if (record.present_id && record.present_id == present_id) {
+      result.matched = true;
+      if (record.source_id && record.issue_ns &&
+          actual_present_time_ns > record.issue_ns &&
+          actual_present_time_ns <= observation_ns) {
+        result.sample_valid = true;
+        result.latency_ns = actual_present_time_ns - record.issue_ns;
+      }
+      record = {};
+      break;
+    }
+  }
+  if (!result.matched) {
+    return result;
+  }
+  for (size_t i = 0; i < record_count; ++i) {
+    RecordT& older = records[i];
+    if (older.present_id &&
+        IsOlderPresentId(older.present_id, present_id, is_64bit_id)) {
+      older = {};
+      ++result.retired_older_count;
+    }
+  }
+  return result;
 }
 
 // Maps a monotonically increasing 64-bit sequence ID to a non-zero 32-bit

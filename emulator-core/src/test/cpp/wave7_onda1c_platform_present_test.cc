@@ -184,8 +184,10 @@ void TestRisk4_NativeLateSwapTargetResolution() {
   constexpr uint64_t kRefresh60 = 16'666'667ull;
   constexpr uint64_t kTarget = 2'000'000'000ull;
 
-  // Early native FIFO frame with late-swap ON and absolute target supported ->
-  // MUST emit non-zero scheduled target (fixes 0ull -> 0ull no-op!).
+  // Early native FIFO frame with vulkan_late_swap_present=true and
+  // now < last_present_ns + refresh_ns: without ZeroFG's VSync quantizer,
+  // native path MUST keep desiredPresentTime == 0 (ASAP) to prevent
+  // SurfaceFlinger frame drops and +1 VSync jumps.
   const auto early =
       EvaluateLateSwapPresent(kTarget - 4'000'000ull, kTarget, kRefresh60,
                               /*zerofg_active=*/false,
@@ -193,18 +195,29 @@ void TestRisk4_NativeLateSwapTargetResolution() {
   W7_1C_CHECK(early.action == LateSwapAction::kKeepScheduledTarget);
   W7_1C_CHECK(ResolveNativePresentTargetTimeNs(early, /*is_fifo=*/true,
                                                /*can_use_absolute_target=*/true) ==
-              kTarget);
+              0ull);
+  W7_1C_CHECK(ResolveNativePresentTargetTimeNs(
+                  early, /*is_fifo=*/true, /*can_use_absolute_target=*/true,
+                  /*target_is_vsync_quantized=*/false) == 0ull);
+
+  // Only an explicitly VSync-quantized FIFO target with absolute target
+  // support may emit a non-zero targetTime.
+  W7_1C_CHECK(ResolveNativePresentTargetTimeNs(
+                  early, /*is_fifo=*/true, /*can_use_absolute_target=*/true,
+                  /*target_is_vsync_quantized=*/true) == kTarget);
 
   // Without absolute target capability (e.g. EXT without presentAtAbsoluteTime),
-  // must stay 0 (VUID safety).
+  // must stay 0 (VUID safety) even if quantized.
   W7_1C_CHECK(ResolveNativePresentTargetTimeNs(
                   early, /*is_fifo=*/true,
-                  /*can_use_absolute_target=*/false) == 0ull);
+                  /*can_use_absolute_target=*/false,
+                  /*target_is_vsync_quantized=*/true) == 0ull);
 
   // Non-FIFO (IMMEDIATE / MAILBOX) must stay 0 (never artificially hold frames).
-  W7_1C_CHECK(ResolveNativePresentTargetTimeNs(early, /*is_fifo=*/false,
-                                               /*can_use_absolute_target=*/true) ==
-              0ull);
+  W7_1C_CHECK(ResolveNativePresentTargetTimeNs(
+                  early, /*is_fifo=*/false,
+                  /*can_use_absolute_target=*/true,
+                  /*target_is_vsync_quantized=*/true) == 0ull);
 
   // Overdue frame -> immediate (0), never pushed to vsync + 1.
   const auto late =
@@ -213,6 +226,7 @@ void TestRisk4_NativeLateSwapTargetResolution() {
                               /*late_swap_enabled=*/true);
   W7_1C_CHECK(late.action == LateSwapAction::kPresentImmediate);
   W7_1C_CHECK(ResolveNativePresentTargetTimeNs(late, true, true) == 0ull);
+  W7_1C_CHECK(ResolveNativePresentTargetTimeNs(late, true, true, true) == 0ull);
 
   // ZeroFG active or late-swap disabled -> bypass (native path emits 0).
   const auto zfg =
@@ -221,6 +235,153 @@ void TestRisk4_NativeLateSwapTargetResolution() {
                               /*late_swap_enabled=*/true);
   W7_1C_CHECK(zfg.action == LateSwapAction::kBypassKeepPaced);
   W7_1C_CHECK(ResolveNativePresentTargetTimeNs(zfg, true, true) == 0ull);
+  W7_1C_CHECK(ResolveNativePresentTargetTimeNs(zfg, true, true, true) == 0ull);
+
+  const auto disabled =
+      EvaluateLateSwapPresent(kTarget - 4'000'000ull, kTarget, kRefresh60,
+                              /*zerofg_active=*/false,
+                              /*late_swap_enabled=*/false);
+  W7_1C_CHECK(disabled.action == LateSwapAction::kBypassKeepPaced);
+  W7_1C_CHECK(ResolveNativePresentTargetTimeNs(disabled, true, true) == 0ull);
+  W7_1C_CHECK(ResolveNativePresentTargetTimeNs(disabled, true, true, true) ==
+              0ull);
+}
+
+void TestNativeLatencyRingRetirement() {
+  using vkui::MatchAndRetireNativeLatencyRecord;
+  using vkui::NativeLatencyTimingRecord;
+  using vkui::NormalizeGooglePresentId32;
+
+  constexpr size_t kRingSize = 32;
+
+  // 1) Dropped frames are retired when a newer frame completes, leaving newer
+  //    in-flight records intact and preventing ring overwrites across >32
+  //    frames (overwritten == 0, reliable == true).
+  {
+    std::array<NativeLatencyTimingRecord, kRingSize> ring = {};
+    ring[0] = {10u, 100u, 1'000'000ull};  // dropped by SurfaceFlinger
+    ring[1] = {11u, 101u, 2'000'000ull};  // dropped by SurfaceFlinger
+    ring[2] = {12u, 102u, 3'000'000ull};  // displayed
+    ring[3] = {13u, 103u, 4'000'000ull};  // still in-flight
+
+    const auto res = MatchAndRetireNativeLatencyRecord(
+        ring.data(), ring.size(), /*present_id=*/12u,
+        /*actual_present_time_ns=*/23'000'000ull,
+        /*observation_ns=*/25'000'000ull, /*is_64bit_id=*/false);
+    W7_1C_CHECK(res.matched);
+    W7_1C_CHECK(res.sample_valid);
+    W7_1C_CHECK(res.latency_ns == 20'000'000ull);
+    W7_1C_CHECK(res.retired_older_count == 2u);
+    W7_1C_CHECK(ring[0].present_id == 0u);
+    W7_1C_CHECK(ring[1].present_id == 0u);
+    W7_1C_CHECK(ring[2].present_id == 0u);
+    W7_1C_CHECK(ring[3].present_id == 13u);
+
+    // Unmatched ID must not corrupt or retire live pending records.
+    const auto unmatched = MatchAndRetireNativeLatencyRecord(
+        ring.data(), ring.size(), /*present_id=*/999u,
+        /*actual_present_time_ns=*/26'000'000ull,
+        /*observation_ns=*/27'000'000ull, /*is_64bit_id=*/false);
+    W7_1C_CHECK(!unmatched.matched);
+    W7_1C_CHECK(unmatched.retired_older_count == 0u);
+    W7_1C_CHECK(ring[3].present_id == 13u);
+
+    // Untagged repaint (present_id == 0) is a clean no-op.
+    const auto untagged = MatchAndRetireNativeLatencyRecord(
+        ring.data(), ring.size(), /*present_id=*/0u,
+        /*actual_present_time_ns=*/26'000'000ull,
+        /*observation_ns=*/27'000'000ull, /*is_64bit_id=*/false);
+    W7_1C_CHECK(!untagged.matched);
+    W7_1C_CHECK(ring[3].present_id == 13u);
+  }
+
+  // 2) 32-bit VK_GOOGLE_display_timing wraparound (0xFFFFFFFE -> 0xFFFFFFFF ->
+  //    1 -> 2 -> 3): dropped pre-wrap frames are cleanly retired when post-wrap
+  //    id=2 completes, keeping id=3 alive and generating 0 overwrites.
+  {
+    std::array<NativeLatencyTimingRecord, kRingSize> ring = {};
+    ring[0] = {0xFFFFFFFEu, 500u, 10'000'000ull};  // dropped
+    ring[1] = {0xFFFFFFFFu, 501u, 20'000'000ull};  // dropped
+    ring[2] = {1u, 502u, 30'000'000ull};           // dropped
+    ring[3] = {2u, 503u, 40'000'000ull};           // displayed
+    ring[4] = {3u, 504u, 50'000'000ull};           // in-flight
+
+    const auto wrap_res = MatchAndRetireNativeLatencyRecord(
+        ring.data(), ring.size(), /*present_id=*/2u,
+        /*actual_present_time_ns=*/62'000'000ull,
+        /*observation_ns=*/65'000'000ull, /*is_64bit_id=*/false);
+    W7_1C_CHECK(wrap_res.matched);
+    W7_1C_CHECK(wrap_res.sample_valid);
+    W7_1C_CHECK(wrap_res.latency_ns == 22'000'000ull);
+    W7_1C_CHECK(wrap_res.retired_older_count == 3u);
+    W7_1C_CHECK(ring[0].present_id == 0u);
+    W7_1C_CHECK(ring[1].present_id == 0u);
+    W7_1C_CHECK(ring[2].present_id == 0u);
+    W7_1C_CHECK(ring[3].present_id == 0u);
+    W7_1C_CHECK(ring[4].present_id == 3u);
+  }
+
+  // 3) Sustained stream of 96 frames across 32-bit wraparound with 1-in-3
+  //    compositor drops: 0 overwritten slots, reliable stays true.
+  {
+    std::array<NativeLatencyTimingRecord, kRingSize> ring = {};
+    size_t next_slot = 0;
+    uint64_t seq = 0xFFFFFFFDull;
+    uint64_t overwritten = 0;
+    uint64_t samples = 0;
+    uint64_t retired_total = 0;
+    for (uint64_t frame = 1; frame <= 96; ++frame) {
+      ++seq;
+      if (static_cast<uint32_t>(seq) == 0u) {
+        ++seq;  // avoid duplicate id=1 at exact 2^32 roll-over
+      }
+      const uint32_t pid = NormalizeGooglePresentId32(seq);
+      const uint64_t issue_ns = frame * 16'000'000ull;
+      if (ring[next_slot].present_id != 0u) {
+        ++overwritten;
+      }
+      ring[next_slot] = {uint64_t(pid), frame, issue_ns};
+      next_slot = (next_slot + 1) % kRingSize;
+
+      // Simulate compositor dropping every 3rd frame (frame % 3 == 1).
+      if (frame % 3 != 1) {
+        const auto res = MatchAndRetireNativeLatencyRecord(
+            ring.data(), ring.size(), uint64_t(pid),
+            issue_ns + 20'000'000ull, issue_ns + 22'000'000ull,
+            /*is_64bit_id=*/false);
+        W7_1C_CHECK(res.matched && res.sample_valid);
+        W7_1C_CHECK(res.latency_ns == 20'000'000ull);
+        ++samples;
+        retired_total += res.retired_older_count;
+      }
+    }
+    W7_1C_CHECK(overwritten == 0u);
+    W7_1C_CHECK(samples == 64u);
+    W7_1C_CHECK(retired_total == 32u);
+  }
+
+  // 4) 64-bit VK_EXT_present_timing crossing UINT32_MAX retires older IDs
+  //    without 32-bit wrap confusion.
+  {
+    std::array<NativeLatencyTimingRecord, kRingSize> ring = {};
+    ring[0] = {0xFFFFFFFFull, 1u, 1'000'000ull};
+    ring[1] = {0x100000000ull, 2u, 2'000'000ull};
+    ring[2] = {0x100000001ull, 3u, 3'000'000ull};
+    ring[3] = {0x100000002ull, 4u, 4'000'000ull};
+
+    const auto ext_res = MatchAndRetireNativeLatencyRecord(
+        ring.data(), ring.size(), /*present_id=*/0x100000001ull,
+        /*actual_present_time_ns=*/19'000'000ull,
+        /*observation_ns=*/20'000'000ull, /*is_64bit_id=*/true);
+    W7_1C_CHECK(ext_res.matched);
+    W7_1C_CHECK(ext_res.sample_valid);
+    W7_1C_CHECK(ext_res.latency_ns == 16'000'000ull);
+    W7_1C_CHECK(ext_res.retired_older_count == 2u);
+    W7_1C_CHECK(ring[0].present_id == 0u);
+    W7_1C_CHECK(ring[1].present_id == 0u);
+    W7_1C_CHECK(ring[2].present_id == 0u);
+    W7_1C_CHECK(ring[3].present_id == 0x100000002ull);
+  }
 }
 
 void TestRisk5_QueueFullRetryNoTimingRecord() {
@@ -407,6 +568,10 @@ void TestSourceContracts(const fs::path& repo_root) {
   W7_1C_CHECK(pres_cc.find("std::call_once") != std::string::npos);
   W7_1C_CHECK(pres_cc.find("ResolveNativePresentTargetTimeNs") !=
               std::string::npos);
+  W7_1C_CHECK(pres_cc.find("/*target_is_vsync_quantized=*/false") !=
+              std::string::npos);
+  W7_1C_CHECK(pres_cc.find("MatchAndRetireNativeLatencyRecord") !=
+              std::string::npos);
   W7_1C_CHECK(pres_cc.find("ShouldEnqueueTimingRecord") != std::string::npos);
   W7_1C_CHECK(pres_cc.find("IsCompleteMonotonicPastPresentationTiming") !=
               std::string::npos);
@@ -458,6 +623,7 @@ int main(int argc, char** argv) {
   TestRisk2And4_SwapchainPreFlightGates();
   TestRisk3_ClockMonotonicDomainSeparation();
   TestRisk4_NativeLateSwapTargetResolution();
+  TestNativeLatencyRingRetirement();
   TestRisk5_QueueFullRetryNoTimingRecord();
   TestRisk6_CompleteReportAnd64BitPresentId();
   TestAndroid17BtiAnd16KbGeometry();
