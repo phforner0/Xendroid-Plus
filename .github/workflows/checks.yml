@@ -29,15 +29,18 @@ jobs:
       with:
         fetch-depth: 1
         # Patterns, not cones: the JNI check needs only the top-level C++ files,
-        # not the vendored xenia tree under the same directory.
+        # and CVar parity needs xenia/src, default_config.toml, and SettingsSchema.kt
+        # without checking out vendored xenia/third_party.
         sparse-checkout-cone-mode: false
         sparse-checkout: |
           /tools/
           /.github/
+          /app/src/main/java/xendroid/compose/settings/SettingsSchema.kt
+          /emulator-core/src/main/assets/config/default_config.toml
           /emulator-core/src/main/java/
           /emulator-core/src/main/cpp/*.cpp
           /emulator-core/src/main/cpp/*.h
-          /emulator-core/src/main/cpp/xenia/src/xenia/base/cvar.h
+          /emulator-core/src/main/cpp/xenia/src/
 
     - name: Python syntax
       run: python3 -m py_compile tools/*.py tools/ir3_offline/*.py
