@@ -537,6 +537,10 @@ static const Quirk kQuirks[] = {
     // unless all resolves are copied back to guest RAM (#114).
     {0x4541097B, "readback_resolve", "all",
      "indoor pitch surface renders with green/black colors without full readback"},
+    // Halo 3: software round-toward-zero in vertex shaders causes tree foliage
+    // and leaves to flicker between lit and dark shading every frame (#147).
+    {0x4D5307E6, "alu_round_toward_zero", false,
+     "vertex math with the host's rounding fixes foliage shading flicker (#147)"},
     // Naruto: Rise of a Ninja: its worker thread 0x18 starts (8265BB68) by
     // calling the routine at +0xEC of its object. When it ran on its
     // creator's CPU right after its creation, the object held the thread's id
@@ -546,6 +550,11 @@ static const Quirk kQuirks[] = {
     // session (POCO F7, 2026-10-29).
     {0x555307E5, "guest_scheduler", false,
      "a new thread calls its routine before its creator stores it"},
+    // Naruto: Rise of a Ninja: parking the poll loop at guest 822CBF18 causes
+    // repeated 90-second XObject::Wait stalls and unserviced XMA audio kicks
+    // (#78, confirmed freeze-free with park_memory_poll_loops = false).
+    {0x555307E5, "park_memory_poll_loops", false,
+     "parking memory poll loop at 822CBF18 causes repeated stalls (#78)"},
     // Fight Night Champion: Marketplace DLC packages stay locked even with
     // license_mask = -1 unless the signed-in profile reports SignedInToLive
     // with an online XUID and Live user flags/privileges (#132).

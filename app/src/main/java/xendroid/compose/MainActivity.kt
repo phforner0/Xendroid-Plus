@@ -147,7 +147,7 @@ class MainActivity : ComponentActivity() {
     private fun noteControllerUse(event: android.view.InputEvent) {
         val device = event.device ?: return
         if (xendroid.compose.ui.design.Gamepads.isController(device)) {
-            xendroid.compose.gamepad.ControllerUse.note(device.descriptor)
+            xendroid.compose.gamepad.ControllerUse.note(device.descriptor ?: "device:${device.id}")
         }
     }
 

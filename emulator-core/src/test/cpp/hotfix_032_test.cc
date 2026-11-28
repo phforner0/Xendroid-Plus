@@ -87,6 +87,24 @@ void TestArmv8BaselineInCmake(const std::filesystem::path& cpp_dir) {
   HOTFIX_CHECK(content.find("-march=armv8.2") == std::string::npos);
 }
 
+void TestGameQuirksFixes(const std::filesystem::path& cpp_dir) {
+  const auto quirks_path = cpp_dir / "xenia" / "src" / "xenia" / "game_quirks.cc";
+  std::ifstream in(quirks_path);
+  HOTFIX_CHECK(in.good());
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  const std::string content = ss.str();
+
+  // #147: Halo 3 foliage shading flicker fix via alu_round_toward_zero = false.
+  HOTFIX_CHECK(content.find("{0x4D5307E6, \"alu_round_toward_zero\", false,") !=
+               std::string::npos);
+  // #78: Naruto: Rise of a Ninja freeze fix via park_memory_poll_loops = false.
+  HOTFIX_CHECK(content.find("{0x555307E5, \"guest_scheduler\", false,") !=
+               std::string::npos);
+  HOTFIX_CHECK(content.find("{0x555307E5, \"park_memory_poll_loops\", false,") !=
+               std::string::npos);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -94,6 +112,7 @@ int main(int argc, char** argv) {
   TestNonTurnipMobileTiler();
   if (argc >= 2) {
     TestArmv8BaselineInCmake(argv[1]);
+    TestGameQuirksFixes(argv[1]);
   }
   std::puts("hotfix_032_test: PASS");
   return 0;

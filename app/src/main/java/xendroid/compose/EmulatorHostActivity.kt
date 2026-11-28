@@ -328,16 +328,18 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     private fun stopRumble() {
-        rumbleAmplitudes.keys.toList().forEach { id -> if ((rumbleAmplitudes[id] ?: 0) > 0) controllerVibrator(id)?.cancel() }
+        rumbleAmplitudes.keys.toList().forEach { id ->
+            if ((rumbleAmplitudes[id] ?: 0) > 0) runCatching { controllerVibrator(id)?.cancel() }
+        }
         rumbleAmplitudes.clear()
     }
 
-    private fun controllerVibrator(deviceId: Int): Vibrator? {
-        val device = InputDevice.getDevice(deviceId) ?: return null
+    private fun controllerVibrator(deviceId: Int): Vibrator? = runCatching {
+        val device = InputDevice.getDevice(deviceId) ?: return@runCatching null
         val vibrator = if (Build.VERSION.SDK_INT >= 31) device.vibratorManager.defaultVibrator
         else @Suppress("DEPRECATION") device.vibrator
-        return vibrator.takeIf { it.hasVibrator() }
-    }
+        vibrator.takeIf { it.hasVibrator() }
+    }.getOrNull()
     private val thermalListener = android.os.PowerManager.OnThermalStatusChangedListener { noteThermal(it) }
     private val inputDeviceListener = object : android.hardware.input.InputManager.InputDeviceListener {
         override fun onInputDeviceAdded(deviceId: Int) = noteController(deviceId, "connected")
@@ -2721,14 +2723,16 @@ class EmulatorHostActivity : ComponentActivity(), SurfaceHolder.Callback {
      *  less latency (Bannerlator 3b08d65e); Android 11+. Key presses are never batched. */
     private fun applyUnbufferedInput() {
         if (Build.VERSION.SDK_INT >= 30) {
-            window.decorView.requestUnbufferedDispatch(if (unbufferedInput.value) InputDevice.SOURCE_CLASS_JOYSTICK else 0)
+            runCatching {
+                window?.decorView?.requestUnbufferedDispatch(if (unbufferedInput.value) InputDevice.SOURCE_CLASS_JOYSTICK else 0)
+            }.onFailure { Log.w(TAG, "Unbuffered joystick dispatch unavailable", it) }
         }
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         // Each touch gesture unbatched too, for the on-screen controls.
         if (unbufferedInput.value && event.actionMasked == MotionEvent.ACTION_DOWN) {
-            window.decorView.requestUnbufferedDispatch(event)
+            runCatching { window?.decorView?.requestUnbufferedDispatch(event) }
         }
         return super.dispatchTouchEvent(event)
     }
